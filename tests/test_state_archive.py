@@ -1,5 +1,6 @@
 """Checks the state archive export, inspection and import round trip."""
 
+import contextlib
 import hashlib
 import io
 import json
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import archive, roster, store
+from agent_parley import archive, lanes, roster, store
 from agent_parley.cli import Bridge, main
 from agent_parley.state import BridgeError, write_json
 
@@ -283,6 +284,39 @@ def test_project_scopes_the_export(bridge, repo, tmp_path):
         bridge.home / "projects" / "ffff" / "project.json",
         {"root": "/elsewhere", "base": "main", "participants": {}},
     )
+    with store.connect(bridge.home, write=True) as db:
+        lanes.ensure(db)
+        other = db.execute(
+            "SELECT id FROM projects WHERE human_key='/elsewhere'"
+        ).fetchone()[0]
+        agent = db.execute(
+            "SELECT id FROM agents WHERE project_id=? AND name='codex'",
+            (other,),
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO reservation_refusals(project_id,agent_id,holder,"
+            "path_pattern,refused_ts) VALUES (?,?,'claude','vault/keys',1.0)",
+            (other, agent),
+        )
+        db.execute(
+            "INSERT INTO lane_states(project,lane,state,since,updated) "
+            "VALUES ('/elsewhere','codex','idle',1.0,1.0)"
+        )
+        db.execute(
+            "INSERT INTO lane_events(project,lane,kind,source,target,ts) "
+            "VALUES ('/elsewhere','codex','wake','test','codex',1.0)"
+        )
+        db.execute(
+            "INSERT INTO lane_accounts(project,lane,observed,idle,"
+            "unaccountable,idle_causes,unaccountable_causes,state,has_work,"
+            "owns,accounted) VALUES "
+            "('/elsewhere','codex',1.0,0.0,0.0,'','','idle',0,0,1.0)"
+        )
+        db.execute(
+            "INSERT INTO lane_wakes(project,lane,at,attempts,backlog,"
+            "superseded,result,activity,blocked) VALUES "
+            "('/elsewhere','codex',1.0,1,'',0,'sent','idle','')"
+        )
     output = tmp_path / "one.tar.gz"
     manifest = archive.export(bridge.home, output, directory)
     assert [entry["root"] for entry in manifest["projects"]] == [root]
@@ -299,7 +333,298 @@ def test_project_scopes_the_export(bridge, repo, tmp_path):
             row[0] for row in db.execute("SELECT human_key FROM projects")
         ] == [root]
         assert db.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 1
+        for leaked in (
+            "reservation_refusals",
+            "lane_states",
+            "lane_events",
+            "lane_accounts",
+            "lane_wakes",
+        ):
+            count = db.execute(f"SELECT COUNT(*) FROM {leaked}").fetchone()
+            assert count[0] == 0, leaked
     with pytest.raises(BridgeError, match="already exists"):
         archive.export(bridge.home, output, directory)
     with pytest.raises(BridgeError, match="no project rooted"):
         archive.import_archive(tmp_path / "empty", output, "/elsewhere")
+
+
+def test_an_imported_attachment_follows_its_renumbered_message(
+    bridge, repo, tmp_path
+):
+    directory = registered(bridge, repo)
+    root = str(bridge.project(repo)[0])
+    bridge.add_participant(repo, "codex", "codex")
+    store.register(bridge.home, root, "codex")
+    token = json.loads((directory / "claude-identity.json").read_text())[
+        "registration_token"
+    ]
+    body = "original evidence\n" * 400
+    sent = store.call(
+        bridge.home,
+        store.authenticate(bridge.home, token),
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Big",
+            "body_md": body,
+            "idempotency_key": "big-1",
+        },
+    )
+    assert sent["attachment"] == f"message-{sent['id']}"
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("DELETE FROM messages WHERE id<?", (sent["id"],))
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    archive.import_archive(home, output)
+    with store.connect(home) as db:
+        stored = db.execute("SELECT id, body_md FROM messages").fetchall()
+    assert [row[0] for row in stored] == [1]
+    assert stored[0][1].endswith(
+        f"[attachment message-1: {len(body.encode())} bytes]"
+    )
+    folder = home / "projects" / directory.name / "attachments"
+    assert (folder / "message-1.md").read_text() == body
+    meta = json.loads((folder / "message-1.json").read_text())
+    assert meta["reference"] == "message-1"
+    assert not (folder / f"message-{sent['id']}.md").exists()
+    assert not list(folder.glob(".renumber-*"))
+
+    stale = directory / "attachments" / "message-1.md"
+    stale.write_text("unrelated\n")
+    clash = tmp_path / "clash.tar.gz"
+    archive.export(bridge.home, clash)
+    other = tmp_path / "other"
+    other.mkdir(mode=0o700)
+    with pytest.raises(BridgeError, match="overwrite"):
+        archive.import_archive(other, clash)
+    assert not (other / "projects" / directory.name).exists()
+
+
+def test_a_project_export_keeps_no_other_projects_search_words(
+    bridge, repo, tmp_path
+):
+    directory = registered(bridge, repo)
+    root = str(bridge.project(repo)[0])
+    token = json.loads((directory / "claude-identity.json").read_text())[
+        "registration_token"
+    ]
+    store.register(bridge.home, root, "codex")
+    (bridge.home / "projects" / "ffff").mkdir()
+    write_json(
+        bridge.home / "projects" / "ffff" / "project.json",
+        {"root": "/elsewhere", "base": "main", "participants": {}},
+    )
+    sender = store.register(bridge.home, "/elsewhere", "codex")
+    store.register(bridge.home, "/elsewhere", "gemini")
+
+    def spill(identity: dict, recipient: str, tail: str) -> dict:
+        return store.call(
+            bridge.home,
+            identity,
+            "send_message",
+            {
+                "to": [recipient],
+                "subject": "Big",
+                "body_md": "padding words\n" * 400 + tail,
+                "idempotency_key": tail,
+            },
+        )
+
+    other = spill(
+        store.authenticate(bridge.home, sender["registration_token"]),
+        "gemini",
+        "zephyrquartz",
+    )
+    kept = spill(store.authenticate(bridge.home, token), "codex", "ochremarble")
+    assert other["attachment"] and kept["attachment"]
+
+    output = tmp_path / "one.tar.gz"
+    archive.export(bridge.home, output, directory)
+    database = members(output)[archive.STORE_MEMBER]
+    assert b"zephyrquartz" not in database
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / store.DATABASE).write_bytes(database)
+    with sqlite3.connect(snapshot / store.DATABASE) as db:
+        assert not db.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'message_search%'"
+            " OR type='trigger'"
+        ).fetchall()
+
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    archive.import_archive(home, output)
+    with store.connect(home) as db:
+        found = db.execute(
+            "SELECT rowid FROM message_search WHERE message_search MATCH ?",
+            ("ochremarble",),
+        ).fetchall()
+        assert [row[0] for row in found] == [
+            row[0]
+            for row in db.execute(
+                "SELECT id FROM messages WHERE body_md LIKE 'padding words%'"
+            )
+        ]
+
+
+def test_an_unscoped_table_fails_the_export_instead_of_leaking(
+    bridge, repo, tmp_path
+):
+    registered(bridge, repo)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("CREATE TABLE stray (id INTEGER PRIMARY KEY, note TEXT)")
+        db.execute("INSERT INTO stray(note) VALUES ('unscoped')")
+    output = tmp_path / "stray.tar.gz"
+    with pytest.raises(BridgeError, match="No export rule"):
+        archive.export(bridge.home, output)
+    assert not output.exists()
+
+
+def crafted(
+    source: Path, target: Path, projects: list, extra: dict[str, bytes]
+) -> Path:
+    """Repacks an archive with a new project list and correct digests."""
+    contents = {**members(source), **extra}
+    manifest = json.loads(contents.pop(archive.MANIFEST))
+    manifest["projects"] = projects
+    manifest["files"] = {
+        name: hashlib.sha256(data).hexdigest()
+        for name, data in contents.items()
+    }
+    contents[archive.MANIFEST] = json.dumps(manifest).encode()
+    with tarfile.open(target, "w") as tar:
+        for name, data in contents.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return target
+
+
+def test_a_manifest_project_key_outside_projects_is_refused(
+    bridge, repo, tmp_path
+):
+    directory = registered(bridge, repo)
+    root = str(bridge.project(repo)[0])
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+    planted = {"planted/project.json": json.dumps({"root": "/x"}).encode()}
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    for key in ("../planted", "a/b", "..", "", "a\\b"):
+        escape = crafted(
+            output,
+            tmp_path / "escape.tar",
+            [{"key": key, "root": "/x"}],
+            planted,
+        )
+        with pytest.raises(BridgeError, match="project key"):
+            archive.import_archive(home, escape)
+    for projects in (
+        ["oops"],
+        [{"root": "/x"}],
+        [{"key": "k", "root": "relative"}],
+        [{"key": "k", "root": "/x"}, {"key": "k", "root": "/y"}],
+        [{"key": "k", "root": "/x", "participants": ["claude"]}],
+    ):
+        malformed = crafted(output, tmp_path / "bad.tar", projects, {})
+        with pytest.raises(BridgeError):
+            archive.read_manifest(malformed)
+    assert list(home.iterdir()) == []
+
+    moved = crafted(
+        output,
+        tmp_path / "moved.tar",
+        [{"key": directory.name, "root": "/elsewhere"}],
+        {},
+    )
+    with pytest.raises(BridgeError, match="not rooted at /elsewhere"):
+        archive.import_archive(home, moved)
+    assert not (home / "projects" / directory.name).exists()
+    assert not (home / store.DATABASE).exists()
+    result = archive.import_archive(home, output)
+    assert [entry["root"] for entry in result["projects"]] == [root]
+
+
+def test_imported_providers_are_validated_and_never_replace_a_preset(
+    bridge, repo, tmp_path, capsys, monkeypatch
+):
+    registered(bridge, repo)
+    custom = {
+        "adapter": "claude",
+        "command": "claude",
+        "home_env": "CLAUDE_CONFIG_DIR",
+        "env": {"ANTHROPIC_BASE_URL": "https://example.test"},
+        "require_env": ["ANTHROPIC_AUTH_TOKEN"],
+        "budget": {"calls": 10},
+    }
+    write_json(
+        bridge.home / roster.PROVIDERS,
+        {
+            "version": 1,
+            "entries": {
+                "claude": {
+                    **custom,
+                    "command": "/tmp/not-claude",
+                    "env": {"LD_PRELOAD": "/tmp/x.so"},
+                },
+                "leaky": {**custom, "env": {"ANTHROPIC_API_KEY": "x"}},
+                "odd": {**custom, "adapter": "shell"},
+                "custom": custom,
+            },
+        },
+    )
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+
+    home = tmp_path / "restored"
+    home.mkdir(mode=0o700)
+    result = archive.import_archive(home, output)
+    assert roster.provider(home, "claude") == roster.PRESETS["claude"]
+    assert roster.provider(home, "custom") == custom
+    providers = result["providers"]
+    assert providers["added"] == ["custom"]
+    assert providers["skipped"] == ["claude"]
+    assert [entry["name"] for entry in providers["refused"]] == [
+        "leaky",
+        "odd",
+    ]
+    assert "credential" in providers["refused"][0]["reason"]
+    with pytest.raises(BridgeError, match="Unknown provider"):
+        roster.provider(home, "leaky")
+
+    merged = tmp_path / "merged"
+    merged.mkdir(mode=0o700)
+    roster.define_provider(merged, "mine", "codex", "codex", "", [], [])
+    argv = ["agent-parley", "--home", str(merged), "state", "import"]
+    monkeypatch.setattr(sys, "argv", argv + [str(output), "--merge"])
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "Providers added: custom" in out
+    assert "Providers kept as defined here: claude" in out
+    assert "Provider leaky refused" in out
+    assert roster.provider(merged, "custom") == custom
+    assert roster.provider(merged, "mine")["command"] == "codex"
+
+
+def test_the_export_reads_project_files_while_their_locks_are_held(
+    bridge, repo, tmp_path, monkeypatch
+):
+    directory = registered(bridge, repo)
+    ledger = directory / "issues.json"
+    held = ledger.read_bytes()
+    original = archive._project_locks
+
+    @contextlib.contextmanager
+    def writing_after_release(directories):
+        with original(directories):
+            yield
+        ledger.write_text('{"revision": 2, "issues": {}}\n')
+
+    monkeypatch.setattr(archive, "_project_locks", writing_after_release)
+    output = tmp_path / "state.tar.gz"
+    archive.export(bridge.home, output)
+    member = f"{archive.PROJECTS}/{directory.name}/issues.json"
+    assert members(output)[member] == held

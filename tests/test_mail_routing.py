@@ -1,6 +1,7 @@
 """Checks mail routing by relevance and the expiry of acknowledgement debt."""
 
 import asyncio
+import sqlite3
 import time
 from pathlib import Path
 
@@ -57,6 +58,41 @@ def test_a_merge_note_reaches_the_feed_and_no_mailbox(bridge, paired, lanes):
     assert mail(bridge, lanes)["unread"] == 0
     items = store.feed(bridge.home, lanes["root"])["items"]
     assert [item["subject"] for item in items] == ["Merged #12 into main"]
+
+
+def five_live_feed_entries(bridge, lanes):
+    """Posts a seed feed note, then five more, all live; returns the seed."""
+    seed = send(bridge, lanes, "merge-seed", "Merged #0 into main")
+    subjects = [f"Merged #{number} into main" for number in range(1, 6)]
+    for number, subject in enumerate(subjects):
+        send(bridge, lanes, f"merge-{number}", subject)
+    with sqlite3.connect(bridge.home / store.DATABASE) as db:
+        db.execute("UPDATE messages SET topic=subject WHERE feed=1")
+    return seed, subjects
+
+
+def test_the_feed_pages_every_entry_past_the_cursor(bridge, paired, lanes):
+    seed, subjects = five_live_feed_entries(bridge, lanes)
+
+    seen, cursor, omitted = [], seed["id"], []
+    for _ in range(3):
+        news = store.feed(bridge.home, lanes["root"], cursor)
+        if news["items"]:
+            cursor = news["items"][0]["id"]
+        seen.append([item["subject"] for item in news["items"]])
+        omitted.append(news["omitted"])
+
+    assert seen == [subjects[2::-1], subjects[:2:-1], []]
+    assert omitted == [2, 0, 0]
+
+
+def test_a_fresh_feed_read_shows_the_newest_page(bridge, paired, lanes):
+    _, subjects = five_live_feed_entries(bridge, lanes)
+
+    news = store.feed(bridge.home, lanes["root"])
+
+    assert [item["subject"] for item in news["items"]] == subjects[:1:-1]
+    assert (news["omitted"], news["superseded"]) == (0, 0)
 
 
 def test_a_broadcast_reaches_only_the_lanes_it_concerns(

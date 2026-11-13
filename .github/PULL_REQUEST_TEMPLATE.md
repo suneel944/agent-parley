@@ -1,8 +1,8 @@
 ## Problem and result
 
-Describe the concrete trigger and the resulting behavior. Add `Refs #N` or
-`Closes #N` for an existing repository issue. Assign an owner and a change-type
-label. Match the issue milestone when present; release PRs require a milestone.
+Describe the concrete trigger and the resulting behavior. Reference an existing
+repository issue with `Refs #N` or `Closes #N` (required). Use a Conventional
+Commit title such as `fix: ...`. Assign an owner and a change-type label. Match the issue milestone when present; release PRs require a milestone.
 
 ## Verification
 

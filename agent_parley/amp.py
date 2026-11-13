@@ -13,7 +13,6 @@ the guards those events carry.
 """
 
 import json
-import os
 import shlex
 from pathlib import Path
 
@@ -59,7 +58,8 @@ def configure(
         token: The lane's registration credential.
         hooks: Common checkpoint hook definitions.
         source_path: Settings file, or the directory holding one, selected
-            by the launch environment; Amp's default location when unset.
+            by the lane's credential profile; Amp's default location when
+            unset, whatever the caller's environment exports.
 
     Returns:
         Settings file for AMP_SETTINGS_FILE in this launch only.
@@ -68,13 +68,7 @@ def configure(
         BridgeError: If the user's settings cannot safely accept the lane
             server or hooks.
     """
-    source = Path(
-        source_path
-        or os.environ.get(
-            "AMP_SETTINGS_FILE",
-            str(Path.home() / ".config" / "amp" / SETTINGS),
-        )
-    )
+    source = Path(source_path or Path.home() / ".config" / "amp" / SETTINGS)
     if source.is_dir():
         source = source / SETTINGS
     settings = json.loads(source.read_text()) if source.exists() else {}

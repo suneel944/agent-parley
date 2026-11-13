@@ -1,0 +1,37 @@
+{
+  "description": "Implement, verify, push, open a pull request, fix red CI.",
+  "nodes": [
+    {
+      "name": "implement",
+      "kind": "agent",
+      "prompt": "Implement the claimed issue in this worktree and commit the change. If a failing step's output is attached, fix what it reports first. File a ready report when the work is committed, or a blocked report naming what stops you."
+    },
+    {
+      "name": "verify",
+      "kind": "run",
+      "command": ["{verify}"],
+      "on_failure": "implement",
+      "retries": 3
+    },
+    {"name": "push", "kind": "push", "retries": 1},
+    {"name": "pull-request", "kind": "pull-request", "retries": 1},
+    {
+      "name": "ci",
+      "kind": "wait-ci",
+      "next": "done",
+      "on_failure": "fix-ci",
+      "retries": 3
+    },
+    {
+      "name": "fix-ci",
+      "kind": "agent",
+      "prompt": "Required checks failed on the pull request; the failed step logs are attached. Fix the cause in this worktree and commit, then file a ready report, or a blocked report naming what stops you.",
+      "next": "verify"
+    },
+    {
+      "name": "done",
+      "kind": "report",
+      "message": "Verified, pushed, and the pull request checks are green."
+    }
+  ]
+}

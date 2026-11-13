@@ -1,5 +1,6 @@
 """Regression coverage for lane, configuration and inbox hardening."""
 
+import asyncio
 import json
 import os
 import signal
@@ -9,7 +10,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, cli, dashboard, process, roster
+from agent_parley import (
+    checkpoints,
+    cli,
+    dashboard,
+    process,
+    recovery,
+    roster,
+    store,
+)
 from agent_parley.state import BridgeError, write_json
 
 
@@ -44,6 +53,117 @@ def test_child_tool_events_guard_the_lane_without_changing_parent_activity(
         checkpoints.checkpoint(bridge.home, lane.parent, "codex", payload) == {}
     )
     assert json.loads(state_path.read_text()) == parent
+
+
+DAMAGED_RECORDS = ["", "{trunc", "null", "[]", "1"]
+
+
+@pytest.fixture
+def lane(bridge, paired):
+    """Returns the codex lane with its identity registered."""
+    path = Path(paired["lanes"]["codex"])
+    store.initialize(bridge.home)
+    data = json.loads((path.parent / "project.json").read_text())
+    asyncio.run(bridge.identity("codex", data))
+    return path
+
+
+def tool_payload(lane):
+    return {
+        "hook_event_name": "PreToolUse",
+        "session_id": "lane-session",
+        "cwd": str(lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+    }
+
+
+@pytest.mark.parametrize("damaged", DAMAGED_RECORDS)
+def test_a_damaged_activity_record_is_kept_aside_and_replaced(
+    bridge, lane, damaged
+):
+    directory = lane.parent
+    state_path = directory / "codex-activity.json"
+    state_path.write_text(damaged)
+    assert checkpoints.activity(directory, "codex") == {}
+    result = checkpoints.checkpoint(
+        bridge.home, directory, "codex", tool_payload(lane)
+    )
+    assert (result.get("hookSpecificOutput") or {}).get(
+        "permissionDecision"
+    ) != "deny"
+    assert isinstance(json.loads(state_path.read_text()), dict)
+    kept = list(directory.glob("codex-activity.json.corrupt-*"))
+    assert [path.read_text() for path in kept] == [damaged]
+    noted = [
+        json.loads(line)
+        for line in (directory / "codex-events.jsonl").read_text().splitlines()
+    ]
+    named = [
+        entry
+        for entry in noted
+        if entry["reason_class"] == checkpoints.Reason.STATE_UNREADABLE
+    ]
+    assert len(named) == 1
+    assert kept[0].name in named[0]["cause"]
+    checkpoints.checkpoint(bridge.home, directory, "codex", tool_payload(lane))
+    assert len(list(directory.glob("codex-activity.json.corrupt-*"))) == 1
+
+
+@pytest.mark.parametrize("damaged", DAMAGED_RECORDS)
+def test_a_damaged_activity_record_never_blocks_a_served_tool_call(
+    bridge, lane, damaged
+):
+    (lane.parent / "codex-activity.json").write_text(damaged)
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "payload": tool_payload(lane),
+    }
+    assert checkpoints.serve(bridge.home, request)["status"] == 0
+
+
+@pytest.mark.parametrize("adapter", ["native", "gemini"])
+@pytest.mark.parametrize(
+    "field", [{"tool_name": 5}, {"hook_event_name": ["PreToolUse"]}]
+)
+def test_a_wrongly_typed_hook_field_is_refused_not_raised(
+    bridge, lane, adapter, field
+):
+    request = {
+        "directory": str(lane.parent),
+        "participant": "codex",
+        "adapter": adapter,
+        "payload": {**tool_payload(lane), **field},
+    }
+    served = checkpoints.serve(bridge.home, request)
+    assert served["status"] == 2
+    assert "not text" in served["stderr"]
+    assert checkpoints.deadline_refusal(request) is None
+
+
+@pytest.mark.parametrize("damaged", ["null", "[]", "1", "{trunc"])
+def test_writers_and_fence_reads_survive_a_non_object_record(lane, damaged):
+    directory = lane.parent
+    state_path = directory / "codex-activity.json"
+    state_path.write_text(damaged)
+    payload = tool_payload(lane)
+    assert recovery.stale_session(directory, "codex", payload) is None
+    pending = {"markers": {"cursor": 1}, "session_id": "lane-session"}
+    checkpoints.deliver(directory, "codex", pending)
+    state_path.write_text(damaged)
+    checkpoints.recover(directory, "codex", payload)
+    assert len(list(directory.glob("codex-activity.json.corrupt-*"))) == 2
+
+
+def test_a_damaged_identity_names_the_file_and_the_resume(bridge, lane):
+    identity = lane.parent / "codex-identity.json"
+    identity.write_text("{trunc")
+    with pytest.raises(BridgeError, match="run agent-parley run codex"):
+        checkpoints.checkpoint(
+            bridge.home, lane.parent, "codex", tool_payload(lane)
+        )
+    assert identity.read_text() == "{trunc"
 
 
 def test_copilot_preserves_custom_config_and_does_not_duplicate_hooks(tmp_path):
@@ -293,6 +413,46 @@ def test_portable_python_shutdown_keeps_pidfd_identity_check(monkeypatch):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux pidfd")
+@pytest.mark.parametrize("vanished", [True, False])
+def test_a_process_exiting_after_its_pin_ends_the_stop(monkeypatch, vanished):
+    with subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"]
+    ) as child:
+        try:
+            ticks = process.start_ticks(child.pid)
+            real = process.linux_start_ticks
+
+            def exited(pid):
+                child.kill()
+                child.wait(timeout=5)
+                return real(pid) if vanished else ticks
+
+            monkeypatch.setattr(process, "linux_start_ticks", exited)
+            process.linux_terminate(child.pid, ticks)
+            assert child.poll() is not None
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+
+def test_macos_names_the_most_recently_started_worktree_client(monkeypatch):
+    started = {101: "Mon Nov  2 10:00:00 2026", 102: "Sat Oct 31 09:00:00 2026"}
+    monkeypatch.setattr(
+        process,
+        "PLATFORM",
+        process.PLATFORM._replace(
+            worktree_clients=lambda lane, command: [101, 102],
+            start_ticks=started.__getitem__,
+        ),
+    )
+    monkeypatch.setattr(process, "alive", lambda pid, ticks: True)
+    assert process.worktree_client(Path("/"), "claude").pid == 101
+    assert process.start_order("1200") > process.start_order("999")
+    assert process.start_order("unreadable") == float("-inf")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux pidfd")
 def test_portable_python_pidfd_preserves_native_errors():
     with pytest.raises(ProcessLookupError):
         process.libc_pidfd("pidfd_open", 2**30, 0)
@@ -323,3 +483,23 @@ def test_the_hook_module_imports_without_launcher_only_dependencies():
         timeout=30,
     ).stdout.strip()
     assert loaded == "[]"
+
+
+def test_the_suite_reads_only_its_own_git_configuration(tmp_path):
+    listed = subprocess.run(
+        ["git", "config", "--show-scope", "--list"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout.splitlines()
+    assert sorted(listed) == [
+        "global\tcommit.gpgsign=false",
+        "global\tgc.auto=0",
+        "global\tinit.defaultbranch=main",
+        "global\tmaintenance.auto=false",
+        "global\ttag.gpgsign=false",
+        "global\tuser.email=test@example.com",
+        "global\tuser.name=Bridge Test",
+    ]

@@ -1,0 +1,35 @@
+{
+  "description": "Write a failing test, see it fail, implement, verify.",
+  "nodes": [
+    {
+      "name": "write-test",
+      "kind": "agent",
+      "prompt": "Add a test that reproduces the claimed issue and fails until it is fixed. Commit only the test, then file a ready report. If you are here again, the verification command passed, so the test does not fail yet: make it reproduce the issue."
+    },
+    {
+      "name": "red",
+      "kind": "run",
+      "command": ["{verify}"],
+      "next": "write-test",
+      "on_failure": "implement",
+      "retries": 3
+    },
+    {
+      "name": "implement",
+      "kind": "agent",
+      "prompt": "The new test fails as intended; its output is attached. Implement the fix in this worktree and commit it without weakening the test, then file a ready report, or a blocked report naming what stops you."
+    },
+    {
+      "name": "verify",
+      "kind": "run",
+      "command": ["{verify}"],
+      "on_failure": "implement",
+      "retries": 3
+    },
+    {
+      "name": "done",
+      "kind": "report",
+      "message": "The new test failed first and the verification command passes."
+    }
+  ]
+}

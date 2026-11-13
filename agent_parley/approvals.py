@@ -179,6 +179,12 @@ def _drift(recorded: dict, current: dict) -> str:
 def review(directory: Path, manifest: dict, name: str, head: str) -> dict:
     """Reads the operator decision standing against a lane's current work.
 
+    A ready report names the commit it describes. When the branch has moved
+    past that commit, the work awaits a new report whatever decision stands,
+    so no approval covers commits that no report described. A recorded
+    decision other than approved or rejected awaits a new one, so an
+    unknown value refuses rather than permits.
+
     Args:
         directory: Private state directory for the common repository.
         manifest: Project manifest holding the lane.
@@ -186,9 +192,9 @@ def review(directory: Path, manifest: dict, name: str, head: str) -> dict:
         head: Commit the lane's branch points at.
 
     Returns:
-        The decision state, the report it concerns, the binding the work has
-        now, the recorded decision if one exists, and a detail naming what
-        invalidated an earlier decision.
+        The decision state, the report it concerns and the commit it
+        describes, the binding the work has now, the recorded decision if one
+        exists, and a detail naming what invalidated an earlier decision.
 
     Raises:
         BridgeError: If the lane's log cannot be read, so that an unreadable
@@ -196,34 +202,43 @@ def review(directory: Path, manifest: dict, name: str, head: str) -> dict:
     """
     records = _log(directory, name)
     report = ""
+    commit = ""
     decision: dict | None = None
     for record in records:
         if record.get("kind") == "report":
-            report = (
-                str(record.get("id", ""))
-                if record.get("state") == "ready"
-                else ""
-            )
+            ready = record.get("state") == "ready"
+            report = str(record.get("id", "")) if ready else ""
+            commit = str(record.get("commit") or "") if ready else ""
         elif record.get("kind") == "approval":
             decision = record
     current = binding(manifest, name, head, report)
     reviewed = {
         "state": UNREPORTED,
         "report": report,
+        "commit": commit,
         "binding": current,
         "decision": decision,
         "detail": "",
     }
     if not report:
         return reviewed
+    if commit and commit != head:
+        return {
+            **reviewed,
+            "state": AWAITING,
+            "detail": f"the lane has committed since report {report}",
+        }
     recorded = (decision or {}).get("binding")
     if decision is None or not isinstance(recorded, dict):
         return {**reviewed, "state": AWAITING}
     if recorded != current:
         drift = _drift(recorded, current)
         return {**reviewed, "state": AWAITING, "detail": drift}
-    state = REJECTED if decision.get("decision") == REJECTED else APPROVED
-    return {**reviewed, "state": state}
+    choice = decision.get("decision")
+    if choice in (APPROVED, REJECTED):
+        return {**reviewed, "state": choice}
+    unknown = f"the recorded decision {choice!r} is not known"
+    return {**reviewed, "state": AWAITING, "detail": unknown}
 
 
 def refusal(name: str, step: str, reviewed: dict) -> str:

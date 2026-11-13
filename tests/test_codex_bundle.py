@@ -1,5 +1,6 @@
 """Checks the Codex directory archive and the manifest shape it depends on."""
 
+import argparse
 import json
 import shutil
 import zipfile
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_parley import cli
 from scripts import codex_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -135,6 +137,104 @@ def test_rejects_a_listing_without_capabilities(tmp_path):
     )
     assert codex_bundle.manifest_errors(root) == [
         "Codex manifest is missing interface.capabilities"
+    ]
+
+
+def test_rejects_a_category_the_portal_does_not_list(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root, lambda interface: interface.update(category="Coding")
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex interface.category must be one of the portal's categories"
+    ]
+
+
+def test_rejects_a_listing_that_names_another_assistant(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root,
+        lambda interface: interface.update(
+            longDescription="Runs beside ChatGPT and Gemini."
+        ),
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex listing names another AI assistant: chatgpt, gemini"
+    ]
+
+
+def test_archive_keywords_come_from_the_codex_manifest(tmp_path):
+    bundle = codex_bundle.build(ROOT, tmp_path)
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read(".claude-plugin/plugin.json"))
+    codex = json.loads(
+        (
+            ROOT / codex_bundle.PLUGIN_DIRECTORY / ".codex-plugin/plugin.json"
+        ).read_text()
+    )
+    assert manifest["keywords"] == codex["keywords"]
+
+
+def test_rejects_a_listing_without_policy_urls(tmp_path):
+    root = copy_repository(tmp_path)
+    rewrite_codex_manifest(
+        root, lambda interface: interface.pop("privacyPolicyURL")
+    )
+    assert codex_bundle.manifest_errors(root) == [
+        "Codex interface.privacyPolicyURL must be an https URL"
+    ]
+
+
+def test_archive_packs_the_listing_skill(tmp_path):
+    bundle = codex_bundle.build(ROOT, tmp_path)
+    listing = ROOT / codex_bundle.PLUGIN_DIRECTORY / codex_bundle.LISTING_SKILLS
+    with zipfile.ZipFile(bundle) as archive:
+        skill = archive.read("skills/coordinate/SKILL.md")
+    assert skill == (listing / "coordinate" / "SKILL.md").read_bytes()
+    for text in ("verify set", "participant merge", "pre-approved"):
+        assert text not in skill.decode()
+
+
+def test_both_skills_teach_every_report_state():
+    """Fails when a `report --state` choice is missing from either skill."""
+    parser, _ = cli.root_parser(None)
+    commands = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    state = next(
+        action
+        for action in commands.choices["report"]._actions
+        if "--state" in action.option_strings
+    )
+    plugin = ROOT / codex_bundle.PLUGIN_DIRECTORY
+    skills = (
+        plugin / "skills/coordinate/SKILL.md",
+        plugin / codex_bundle.LISTING_SKILLS / "coordinate/SKILL.md",
+    )
+    for path in skills:
+        text = path.read_text()
+        missing = [name for name in state.choices if name not in text]
+        assert missing == [], str(path)
+
+
+def test_rejects_a_listing_skill_that_drifts(tmp_path):
+    root = copy_repository(tmp_path)
+    skill = (
+        root
+        / codex_bundle.PLUGIN_DIRECTORY
+        / codex_bundle.LISTING_SKILLS
+        / "coordinate"
+        / "SKILL.md"
+    )
+    skill.write_text(skill.read_text().replace("Inspect", "Read", 1))
+    assert codex_bundle.manifest_errors(root) == [
+        "listing skill coordinate frontmatter differs"
+    ]
+    skill.unlink()
+    assert codex_bundle.manifest_errors(root) == [
+        "listing skill coordinate is missing or has no repository skill"
     ]
 
 

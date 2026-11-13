@@ -22,9 +22,65 @@ from agent_parley.core import BridgeCore
 if TYPE_CHECKING:
     import argparse
 
+ROTATION_OUTCOMES = ("ready", "blocked")
+READY_SHOWN_PATHS = 5
+
 
 class ReportsMixin(BridgeCore):
     """Lane reports, peer review, hook event export, archive and history."""
+
+    def task_plan(
+        self, repo: Path, steps: list[str], document: str = ""
+    ) -> dict:
+        """Replaces the calling lane's own task plan.
+
+        The lane is the roster entry whose worktree holds the checkout, found
+        the way `report` finds it, so a lane never names itself or another
+        lane. The plan goes to the lane's capped plan file beside its state
+        record, which only operator views read and no peer is sent.
+
+        Args:
+            repo: The lane's own checkout.
+            steps: Steps written ``STATUS:TEXT``, where the status is one of
+                `lanes.PLAN_STATUSES`.
+            document: The whole list as JSON, ``[{"step", "status"}]``, in
+                place of `steps`; empty when the steps came as arguments.
+
+        Returns:
+            The recorded plan: ``items``, ``source``, ``updated`` and
+            ``truncated``.
+
+        Raises:
+            BridgeError: If both forms or neither are given, the list is
+                malformed, or the checkout is not a lane.
+        """
+        import json
+
+        from agent_parley import lanes
+        from agent_parley.cli import git, roster
+
+        if bool(steps) == bool(document.strip()):
+            raise BridgeError(
+                "Give the plan as STATUS:TEXT arguments or as JSON with "
+                "--stdin, not both and not neither."
+            )
+        if document.strip():
+            try:
+                entries = json.loads(document)
+            except ValueError as error:
+                raise BridgeError(f"Plan JSON is not valid: {error}.") from None
+        else:
+            entries = []
+            for step in steps:
+                status, _, text = step.partition(":")
+                entries.append({"step": text, "status": status.strip()})
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
+        agent = roster.resolve(data, lane)
+        return lanes.record_plan(
+            directory, agent, entries, "step", lanes.PLAN_COMMAND
+        )
 
     def report(
         self,
@@ -37,6 +93,9 @@ class ReportsMixin(BridgeCore):
         issue: str = "",
         resume_on: str = "",
         backlog: int | None = None,
+        until: float = 0.0,
+        pid: int | None = None,
+        output: str = "",
     ) -> str:
         """Records an explicitly reported outcome independently of activity.
 
@@ -51,10 +110,38 @@ class ReportsMixin(BridgeCore):
         the holder still owes, so it acts in the same turn instead of waiting
         for the reminder to reach it on a later wake.
 
+        A waiting report declares what the lane waits on and until when
+        instead of moving its claim's execution phase, so `status` and `top`
+        show it as waiting on that reason with its next-check time rather
+        than a bare idle lane, and the supervisor defers waking it until that
+        time, capped by the project's `deadlines.wait` ceiling.
+
+        A report may name the process still doing its work and the file
+        that process writes. Both are recorded on the activity record by
+        `supervision.work_evidence`, and while `supervision.live_work` finds
+        that work running the supervisor holds the reported claim as it does
+        for a wait in force. Each report replaces the evidence the last one
+        named, so a report that names none clears it. The evidence is
+        validated before any attachment is stored, so a refused report
+        leaves none behind, and a retry whose key names a recorded report
+        returns that result without validating it again.
+
+        A ready or blocked report on a claim ends the lane's work on that
+        claim, so it records a rotation point on the activity record: the
+        next resume of the lane starts a fresh native session instead of
+        continuing this one, as `launch.rotation_task` describes.
+
+        A ready report records the lane's HEAD commit as the code its evidence
+        verified, so it is refused while any tracked file differs from that
+        commit: evidence gathered on uncommitted edits would describe code a
+        reviewer and the integration gate never see. Untracked files are not
+        considered, because lanes keep scratch state and build output there.
+
         Args:
             repo: Assigned agent worktree.
-            outcome: Partial, blocked, or ready-for-review state.
-            summary: Nonempty account of the result.
+            outcome: Partial, blocked, ready-for-review, or waiting state.
+            summary: Nonempty account of the result, or of what a waiting
+                report waits on.
             remaining: Required unfinished work for partial or blocked reports.
             evidence: Required verification evidence for ready reports.
             key: Idempotency key. A retried report carrying the key it first
@@ -66,6 +153,11 @@ class ReportsMixin(BridgeCore):
                 claim itself counts. Recording the count is what lets the
                 supervisor offer a split once this lane goes idle on it. None
                 leaves any recorded count as it stands.
+            until: Required seconds from now for a waiting report's next
+                check; unused otherwise.
+            pid: Process ID of work still running for this lane, or None.
+            output: File that running work writes, resolved against the
+                lane when relative, or empty.
 
         Returns:
             The completion the holder owes on an observed-complete claim for
@@ -106,6 +198,8 @@ class ReportsMixin(BridgeCore):
             raise BridgeError("Partial/blocked reports require --remaining.")
         if outcome == "ready" and not evidence.strip():
             raise BridgeError("Ready-for-review reports require --evidence.")
+        if outcome == "waiting" and until <= 0:
+            raise BridgeError("Waiting reports require --until seconds.")
         if resume_on and outcome != "blocked":
             raise BridgeError("--resume-on is valid only for blocked reports.")
         for field, value in (("summary", summary), ("remaining", remaining)):
@@ -115,16 +209,6 @@ class ReportsMixin(BridgeCore):
                     f"{metrics.MAX_REPORT_BYTES}-byte budget; put the detail "
                     "in --evidence, which is attached when it is longer."
                 )
-        identifier = uuid.uuid4().hex[:16]
-        evidence, attached = attachments.spill(
-            directory,
-            "report",
-            identifier,
-            evidence,
-            metrics.MAX_REPORT_BYTES,
-            agent,
-            [],
-        )
         scope = retries.scope(agent, "report", retries.validate(key))
         fingerprint = retries.digest(
             "report",
@@ -137,26 +221,69 @@ class ReportsMixin(BridgeCore):
                 "claim_id": claim["claim_id"],
                 "resume_on": resume_on,
                 "backlog": backlog,
+                "until": until,
+                "pid": pid,
+                "output": output,
             },
         )
         path = directory / f"{agent}-activity.json"
+        with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
+            state = json.loads(path.read_text()) if path.exists() else {}
+        if key and (recorded := state.get("retries", {}).get(scope)):
+            retries.replayed(recorded, "report", key, fingerprint)
+            return ""
+        if outcome == "ready" and (
+            changed := git(lane, "diff", "--name-only", "HEAD").splitlines()
+        ):
+            shown = ", ".join(changed[:READY_SHOWN_PATHS])
+            more = len(changed) - READY_SHOWN_PATHS
+            raise BridgeError(
+                f"A ready report records commit {commit[:12]}, but "
+                f"{len(changed)} tracked file(s) differ from it: {shown}"
+                + (f" and {more} more" if more > 0 else "")
+                + ". Commit or revert them first, so the evidence describes "
+                "the recorded commit."
+            )
+        ceiling = (data.get("deadlines") or {}).get(
+            "wait", supervision.DEFAULT_WAIT_CEILING
+        )
+        work = supervision.work_evidence(
+            lane,
+            pid,
+            output,
+            str(claim["issue"]) if claim["issue"] is not None else "",
+            claim["claim_id"] or "",
+            ceiling,
+            state.get("session_pid"),
+        )
+        identifier = uuid.uuid4().hex[:16]
+        evidence, attached = attachments.spill(
+            directory,
+            "report",
+            identifier,
+            evidence,
+            metrics.MAX_REPORT_BYTES,
+            agent,
+            [],
+        )
         with lock(directory / f"{agent}-report.lock", timeout=1):
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
                 if key and (recorded := state.get("retries", {}).get(scope)):
                     retries.replayed(recorded, "report", key, fingerprint)
                     return ""
-            lifecycle.record_report(
-                directory,
-                agent,
-                outcome,
-                commit,
-                remaining,
-                str(claim["issue"]) if claim["issue"] is not None else "",
-                claim["claim_id"] or "",
-                resume_on,
-                backlog,
-            )
+            if outcome != "waiting":
+                lifecycle.record_report(
+                    directory,
+                    agent,
+                    outcome,
+                    commit,
+                    remaining,
+                    str(claim["issue"]) if claim["issue"] is not None else "",
+                    claim["claim_id"] or "",
+                    resume_on,
+                    backlog,
+                )
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
                 arrived = outcome == "ready" and state.get("outcome") != "ready"
@@ -167,6 +294,17 @@ class ReportsMixin(BridgeCore):
                     evidence=evidence,
                     reported_at=time.time(),
                 )
+                if work:
+                    state["work"] = work
+                else:
+                    state.pop("work", None)
+                if outcome in ROTATION_OUTCOMES and claim["issue"] is not None:
+                    state["rotation"] = {
+                        "at": time.time(),
+                        "issue": str(claim["issue"]),
+                        "outcome": outcome,
+                        "session": str(state.get("session_id") or ""),
+                    }
                 if key:
                     retries.remember(
                         state,
@@ -176,6 +314,10 @@ class ReportsMixin(BridgeCore):
                         {"state": outcome},
                     )
                 write_json(path, state)
+        if outcome == "waiting":
+            supervision.record_wait(
+                directory, agent, summary, time.time() + until, ceiling
+            )
         metrics.record_report(
             directory,
             agent,
@@ -192,6 +334,24 @@ class ReportsMixin(BridgeCore):
                 "attachment": attached or None,
             },
         )
+        if outcome in ROTATION_OUTCOMES:
+            from agent_parley import children
+
+            try:
+                children.deliver(
+                    self.home,
+                    directory,
+                    agent,
+                    {
+                        "state": outcome,
+                        "commit": commit,
+                        "summary": summary,
+                        "remaining": remaining,
+                        "evidence": evidence,
+                    },
+                )
+            except BridgeError as exc:
+                print(f"Child result not relayed: {exc}", file=sys.stderr)
         owned = [str(claim["issue"])] if claim["issue"] is not None else []
         if outcome == "blocked":
             change_attempt(directory, agent, owned)
@@ -217,7 +377,8 @@ class ReportsMixin(BridgeCore):
             f"Issue #{number} is observed complete: its pull request ended "
             "during this claim. Complete it now: send the completion message "
             f"to {waiting} with the commit, verification and remaining work. "
-            f"The operator then ends the claim with `issue resolve {number}`."
+            "The service ends the claim once the forge shows a merged pull "
+            f"request; otherwise the operator runs `issue resolve {number}`."
         )
 
     def show_report(self, repo: Path, identifier: str, full: bool) -> dict:
@@ -439,6 +600,16 @@ class ReportsMixin(BridgeCore):
                 f"{entry['lane'] or 'no path recorded'}; recreate the "
                 "worktree before launching it."
             )
+        providers = result["providers"]
+        if providers["added"]:
+            lines.append("Providers added: " + ", ".join(providers["added"]))
+        if providers["skipped"]:
+            lines.append(
+                "Providers kept as defined here: "
+                + ", ".join(providers["skipped"])
+            )
+        for entry in providers["refused"]:
+            lines.append(f"Provider {entry['name']} refused: {entry['reason']}")
         return "\n".join(lines)
 
     def history(
@@ -473,7 +644,8 @@ class ReportsMixin(BridgeCore):
 
         Returns:
             The matching records, with the ownership generations of an issue
-            listing.
+            listing, and whether the row cap omitted older matching mail or
+            reservations.
 
         Raises:
             BridgeError: If the subject is unknown or the project has none.
@@ -492,24 +664,27 @@ class ReportsMixin(BridgeCore):
             if value not in data["participants"]:
                 raise BridgeError(
                     f"{value} is not a participant in this project; "
-                    "run agent-parley participant list."
+                    "run agent-parley participant list.",
+                    next_command="agent-parley participant list",
                 )
             participant = value
         elif subject == "claim":
             claim = value
+        reported, truncated = history.query(
+            self.home,
+            directory,
+            data,
+            kinds=kinds,
+            participant=participant,
+            provider=provider,
+            issue=issue,
+            claim=claim,
+            since=since,
+        )
         return {
             "subject": subject or "project",
             "value": value,
             "holdings": held,
-            "records": history.records(
-                self.home,
-                directory,
-                data,
-                kinds=kinds,
-                participant=participant,
-                provider=provider,
-                issue=issue,
-                claim=claim,
-                since=since,
-            ),
+            "records": reported,
+            "truncated": truncated,
         }

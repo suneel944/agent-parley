@@ -2,25 +2,11 @@
 
 import asyncio
 import json
-import threading
 from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, notify, server, store
-
-
-@pytest.fixture
-def service(bridge):
-    """Serves the bridge's configured loopback port on a thread."""
-    with server.Server(bridge.home, bridge.config) as instance:
-        thread = threading.Thread(target=instance.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield instance
-        finally:
-            instance.shutdown()
-            thread.join(timeout=2)
+from agent_parley import checkpoints, notify, store
 
 
 @pytest.fixture

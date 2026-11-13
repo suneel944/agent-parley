@@ -19,11 +19,13 @@ from pathlib import Path
 from types import FrameType
 
 from agent_parley import (
+    attachments,
     checkpoints,
     hook,
     metrics,
     protocol,
     recommend,
+    refusal,
     retries,
     roster,
     store,
@@ -32,8 +34,25 @@ from agent_parley import (
 from agent_parley.state import BridgeError, trim_log
 
 VERSIONS = ("2025-03-26", "2025-06-18", "2025-11-25")
-MAX_REQUEST_BYTES = 16384
+MAX_REQUEST_BYTES = 2 * attachments.MAX_ATTACHMENT_BYTES + 16384
 MAX_HOOK_BYTES = 1_048_576
+INVALID_REQUEST = {
+    "jsonrpc": "2.0",
+    "id": None,
+    "error": {"code": -32600, "message": "Invalid Request"},
+}
+OVERSIZED = {
+    "jsonrpc": "2.0",
+    "id": None,
+    "error": {
+        "code": -32600,
+        "message": (
+            f"Request exceeds {MAX_REQUEST_BYTES} bytes; send_message bodies "
+            f"above {store.MAX_BODY_BYTES} bytes spill to an attachment up to "
+            f"{attachments.MAX_ATTACHMENT_BYTES} bytes."
+        ),
+    },
+}
 HOOK_PATH = "/hook/"
 REVISION_SECONDS = 2.0
 LOG_NAME = "server.log"
@@ -41,6 +60,7 @@ WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
 SLOW_DECISION = DECISION_SECONDS / 2
 DELIVERY_SECONDS = 0.25
+RECEIPT_SECONDS = 0.5
 TEMPORARY_SECONDS = 60.0
 UNDECIDED_LIMIT = 1
 REFUSAL_SECONDS = 5.0
@@ -55,8 +75,8 @@ UNDECIDED = (
 SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 DRIFTED = (
     "Sources changed under the running service; it is answering from a "
-    "module set the checkout no longer holds and is stopping. "
-    + protocol.RELAUNCH
+    "module set the checkout no longer holds and is restarting on the "
+    "sources now on disk."
 )
 
 
@@ -131,21 +151,41 @@ def sweep(home: Path) -> int:
 def _tool(
     name: str, description: str, properties: dict, required: list[str]
 ) -> dict:
-    """Describes one narrow tool without repeating credentials or identity."""
+    """Describes one narrow tool without repeating credentials or identity.
+
+    Every lane pays for the serialized tool list in each session, so the
+    annotations state only what differs from the MCP defaults: a read-only
+    tool says so, and the spec ignores ``destructiveHint`` for it, while any
+    other tool declares that it destroys nothing. Neither reaches outside
+    the project. Reference detail lives in the coordinate skill's
+    ``reference.md``, not in these descriptions.
+
+    Args:
+        name: Tool name served in tools/list.
+        description: One short sentence on when to call the tool.
+        properties: JSON Schema of each accepted argument.
+        required: Arguments the call must carry. An empty list is left out,
+            since JSON Schema already requires nothing by default.
+
+    Returns:
+        The tools/list entry for the tool.
+    """
+    hints = (
+        {"readOnlyHint": True}
+        if name in store.READ_ONLY
+        else {"destructiveHint": False}
+    )
+    schema = {
+        "type": "object",
+        "properties": properties,
+        **({"required": required} if required else {}),
+        "additionalProperties": False,
+    }
     return {
         "name": name,
         "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-            "required": required,
-            "additionalProperties": False,
-        },
-        "annotations": {
-            "readOnlyHint": name in store.READ_ONLY,
-            "destructiveHint": False,
-            "openWorldHint": False,
-        },
+        "inputSchema": schema,
+        "annotations": {**hints, "openWorldHint": False},
     }
 
 
@@ -154,15 +194,11 @@ _INVALID = object()
 TEXT = {"type": "string"}
 INTEGER = {"type": "integer"}
 FLAG = {"type": "boolean"}
-RETRY_KEY = {
-    "type": "string",
-    "maxLength": retries.KEY_CHARACTERS,
-    "description": "Optional. Reuse on a retry; the repeat changes nothing.",
-}
+RETRY_KEY = {"type": "string", "maxLength": retries.KEY_CHARACTERS}
 TOOLS = [
     _tool(
         "send_message",
-        "Send a concise update. Reuse the key only on retries.",
+        "Send mail to peers.",
         {
             "to": {
                 "type": "array",
@@ -170,34 +206,24 @@ TOOLS = [
                 "maxItems": store.MAX_RECIPIENTS,
             },
             "subject": {**TEXT, "maxLength": 160},
-            "body_md": {**TEXT, "description": "At most 4096 UTF-8 bytes."},
+            "body_md": TEXT,
             "idempotency_key": {**TEXT, "maxLength": 80},
             "thread_id": {**TEXT, "maxLength": 80},
-            "reply_to": {
-                **INTEGER,
-                "description": "Message answered; joins its thread.",
-            },
+            "reply_to": INTEGER,
             "topic": TEXT,
             "ack_required": FLAG,
             "ack_within": {
                 "type": "number",
                 "minimum": 1,
                 "maximum": roster.MAX_DEADLINE,
-                "description": (
-                    "Seconds before it returns unanswered; omitted takes "
-                    "the default."
-                ),
             },
-            "decision": {
-                **FLAG,
-                "description": "Also record in the shared decision log.",
-            },
+            "decision": FLAG,
         },
         ["to", "subject", "body_md", "idempotency_key"],
     ),
     _tool(
         "fetch_inbox",
-        "Read incremental mail. Bodies opt-in; page long bodies.",
+        "Read new mail; bodies on request.",
         {
             "after_id": INTEGER,
             "limit": {**INTEGER, "minimum": 1, "maximum": 5},
@@ -210,14 +236,14 @@ TOOLS = [
     ),
     _tool(
         waits.TOOL,
-        "Await your next matching mail instead of polling or ending your "
-        "turn. Filters as fetch_inbox; an expired wait returns nothing.",
+        "Wait for mail instead of polling; long wait: set hand_off.",
         {
             "timeout_seconds": {
                 **INTEGER,
                 "minimum": 0,
                 "maximum": int(waits.MAX_SECONDS),
             },
+            "hand_off": {"enum": list(waits.HAND_OFF)},
             "thread_id": {**TEXT, "maxLength": 80},
             "after_id": INTEGER,
             "include_bodies": FLAG,
@@ -228,64 +254,33 @@ TOOLS = [
     ),
     _tool(
         "acknowledge_message",
-        "Explicitly acknowledge a reviewed message.",
+        "Acknowledge a reviewed message.",
         {"message_id": INTEGER, "idempotency_key": RETRY_KEY},
         ["message_id"],
     ),
     _tool(
         "mark_message_read",
-        "Mark an ordinary message reviewed; does not ack.",
+        "Mark a message read; not an ack.",
         {"message_id": INTEGER, "idempotency_key": RETRY_KEY},
         ["message_id"],
     ),
     _tool(
         "file_reservation_paths",
-        "Reserve repository-relative paths, or named resources written with a "
-        "scheme such as port:5432, db:local, suite:integration or "
-        "device:android-1, atomically; conflicts grant nothing and name the "
-        "blocking owner with that owner's reason.",
+        "Reserve paths or SCHEME:NAME keys; advisory.",
         {
-            "paths": {
-                "type": "array",
-                "items": TEXT,
-                "maxItems": 16,
-                "description": (
-                    "Repository-relative paths, or named resources written "
-                    "as SCHEME:NAME. A named resource conflicts on an exact "
-                    "match only."
-                ),
-            },
-            "ttl_seconds": {
-                **INTEGER,
-                "minimum": 30,
-                "maximum": 3600,
-                "description": (
-                    "Optional. Past it the lease reports stale and still "
-                    "holds; omit it and the lease never reports stale."
-                ),
-            },
+            "paths": {"type": "array", "items": TEXT, "maxItems": 16},
+            "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
             "exclusive": FLAG,
-            "reason": {
-                **TEXT,
-                "maxLength": 160,
-                "description": "Declared scope, shown to peers you block.",
-            },
+            "reason": {**TEXT, "maxLength": 160},
             "idempotency_key": RETRY_KEY,
         },
         ["paths"],
     ),
     _tool(
         "request_reservation",
-        "Reserve the same keys, and where a peer holds one, queue for it "
-        "instead of failing; the refusal names the holder and your place. "
-        "The holder's release grants it and sends you one notice.",
+        "Reserve keys; queue for held ones.",
         {
-            "paths": {
-                "type": "array",
-                "items": TEXT,
-                "maxItems": 16,
-                "description": "Keys as file_reservation_paths takes them.",
-            },
+            "paths": {"type": "array", "items": TEXT, "maxItems": 16},
             "ttl_seconds": {**INTEGER, "minimum": 30, "maximum": 3600},
             "exclusive": FLAG,
             "reason": {**TEXT, "maxLength": 160},
@@ -295,26 +290,25 @@ TOOLS = [
     ),
     _tool(
         "cancel_reservation_request",
-        "Withdraw one queued reservation request, or every one of yours.",
+        "Withdraw one queued request, or all.",
         {"request_id": INTEGER, "idempotency_key": RETRY_KEY},
         [],
     ),
     _tool(
         "release_file_reservations",
-        "Release your file reservations. A key another lane queued for is "
-        "granted to it here, and that lane is told in the same commit.",
+        "Release your reservations; queued lanes get them.",
         {"idempotency_key": RETRY_KEY},
         [],
     ),
     _tool(
         "list_participants",
-        "List the participants you can address in this project.",
+        "List addressable participants.",
         {},
         [],
     ),
     _tool(
         "read_thread",
-        "Read your mail in one thread, oldest first.",
+        "Read one mail thread, oldest first.",
         {
             "thread_id": {**TEXT, "maxLength": 80},
             "after_id": INTEGER,
@@ -328,7 +322,7 @@ TOOLS = [
     ),
     _tool(
         "search_messages",
-        "Search your mail by text, newest match first.",
+        "Search your mail by text.",
         {
             "query": {**TEXT, "maxLength": store.MAX_QUERY_BYTES},
             "limit": {
@@ -341,7 +335,7 @@ TOOLS = [
     ),
     _tool(
         "search_decisions",
-        "Search decisions any lane recorded. Empty query lists the newest.",
+        "Search the shared decision log.",
         {
             "query": {**TEXT, "maxLength": store.MAX_QUERY_BYTES},
             "limit": {
@@ -355,30 +349,23 @@ TOOLS = [
     ),
     _tool(
         "review_report",
-        "Record your verdict on a peer's report, never your own. A verdict "
-        "is your claim, not independent verification.",
+        "Record your verdict on a peer's report.",
         {
             "report_id": {**TEXT, "maxLength": 32},
             "verdict": {"type": "string", "enum": list(metrics.VERDICTS)},
-            "evidence": {
-                **TEXT,
-                "description": "What you checked; at most 4096 UTF-8 bytes.",
-            },
+            "evidence": TEXT,
         },
         ["report_id", "verdict", "evidence"],
     ),
     _tool(
         store.RETIRE,
-        "Retire this lane when nothing is left: releases your claims, "
-        "handoffs and keys, then ends your credential. Only the operator "
-        "re-admits you.",
+        "Retire when done; releases your claims and keys.",
         {},
         [],
     ),
     _tool(
         "next_issues",
-        "Rank unclaimed issues you could take next, with the reason for "
-        "each. Read this before claiming; it claims nothing.",
+        "Rank issues to claim next; claims nothing.",
         {
             "limit": {
                 **INTEGER,
@@ -414,9 +401,10 @@ class Server(ThreadingHTTPServer):
         self.checked = time.monotonic()
         self.reading = threading.Lock()
         self.stopping = threading.Event()
+        self.signalled = threading.Event()
         self.counting = threading.Lock()
         self.deciding: dict[tuple[str, str], int] = {}
-        self.recovering: dict[tuple[str, str], list[dict]] = {}
+        self.recovering: dict[tuple[str, str], dict | None] = {}
         self.repeats: dict[
             tuple[str, tuple[str, str]], tuple[float, int, str]
         ] = {}
@@ -467,6 +455,67 @@ class Server(ThreadingHTTPServer):
             self.stopping.set()
         threading.Thread(target=self.shutdown, daemon=True).start()
         log(self.home, "drifted", DRIFTED)
+        return True
+
+    def service_actions(self) -> None:
+        """Notices moved sources while no request is arriving.
+
+        `serve_forever` calls this once per poll interval. The drift reading
+        used to be taken only inside a request, so an idle service kept the
+        modules an upgrade had already replaced until the next hook, and an
+        estate with no lane active stayed on the old build for as long as it
+        stayed quiet. The reading is the same rate-limited comparison a
+        request makes, so an idle service pays one directory scan every
+        `REVISION_SECONDS` and nothing more.
+        """
+        self.drifted()
+
+    def relaunching(self) -> bool:
+        """Says whether this stop is followed by a re-execution.
+
+        Only a stop that drift started is. A signal is an operator's or a
+        launcher's instruction to go away, and a signal that arrives while a
+        drift stop is already under way is the same instruction arriving
+        during the hand-over, so the signal wins in either order.
+
+        Returns:
+            Whether the sources moved and no stop signal arrived.
+        """
+        return self.stopping.is_set() and not self.signalled.is_set()
+
+    def drain(self, deadline: float) -> bool:
+        """Waits for the requests in flight before the process is replaced.
+
+        A stop leaves its handler threads running while the listening socket
+        closes, which is right for an exit and wrong for a re-execution that
+        replaces the process image under them: a decision half-written would
+        be cut, and the hook behind it would read the cut as a failure rather
+        than the retry it gets when the connection is refused. Every wait
+        permit is taken first, because a wait holds no worker slot while it
+        sleeps and takes one again before it replies, so a wait still
+        sleeping would otherwise never get the slot it needs to finish. Then
+        every worker slot is taken, so returning means no handler holds one.
+        The deadline bounds the whole wait, because a request that outlives
+        it is cut the way a stop always cut it.
+
+        Args:
+            deadline: Monotonic time after which the wait gives up.
+
+        Returns:
+            Whether every wait and every worker finished before the deadline.
+        """
+        held: list[threading.BoundedSemaphore] = []
+        gates = ((self.waiters, waits.MAX_WAITERS), (self.slots, WORKERS))
+        try:
+            for gate, count in gates:
+                for _ in range(count):
+                    remaining = max(deadline - time.monotonic(), 0.0)
+                    if not gate.acquire(timeout=remaining):
+                        return False
+                    held.append(gate)
+        finally:
+            for gate in held:
+                gate.release()
         return True
 
     @contextlib.contextmanager
@@ -530,10 +579,16 @@ class Server(ThreadingHTTPServer):
         request: socket.socket | tuple[bytes, socket.socket],
         client_address: tuple,
     ) -> None:
-        """Rejects overload rather than creating unbounded worker threads."""
+        """Rejects overload rather than creating unbounded worker threads.
+
+        The refusal is recorded before the connection is closed, so the log
+        entry exists by the time the client observes the close.
+        """
         if not self.slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            self.refuse()
+            try:
+                self.refuse()
+            finally:
+                self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
@@ -582,31 +637,37 @@ class Server(ThreadingHTTPServer):
     def recover(self, lane: tuple[str, str], owed: dict) -> None:
         """Queues a recovery checkpoint to run after its hook was answered.
 
-        One thread per lane works its queue in arrival order, so the lane's
-        checkpoints stay ordered and a burst of events never starts more
-        than one Git capture for the same worktree at once. Every request is
-        kept, because a later one may carry no gate evidence and would lose
-        the passing command an earlier one recorded.
+        One thread per lane runs the lane's captures, so a burst of events
+        never starts more than one Git capture for the same worktree at
+        once. At most one request waits behind the running capture: a newer
+        request replaces it through `checkpoints.merge_recovery`, which
+        keeps the most recent gate evidence of the requests it replaces. A
+        burst therefore costs the running capture and one more, rather than
+        one capture per event holding the lane's locks for minutes.
 
         Args:
             lane: Project key and participant name the request is for.
             owed: The ``recovery`` request `checkpoints.serve` returned.
         """
         with self.counting:
-            queued = self.recovering.get(lane)
-            if queued is not None:
-                queued.append(owed)
+            if lane in self.recovering:
+                waiting = self.recovering[lane]
+                self.recovering[lane] = (
+                    owed
+                    if waiting is None
+                    else checkpoints.merge_recovery(waiting, owed)
+                )
                 return
-            self.recovering[lane] = []
+            self.recovering[lane] = None
         threading.Thread(
             target=self._recovering, args=(lane, owed), daemon=True
         ).start()
 
     def _recovering(self, lane: tuple[str, str], owed: dict) -> None:
-        """Runs one lane's queued recovery checkpoints until none are left.
+        """Runs one lane's recovery checkpoints until none is waiting.
 
         Args:
-            lane: Project key and participant name the queue belongs to.
+            lane: Project key and participant name the requests belong to.
             owed: First request to run.
         """
         while True:
@@ -616,20 +677,25 @@ class Server(ThreadingHTTPServer):
                     owed["participant"],
                     owed["payload"],
                     checkpoints.SETTLE_SECONDS,
+                    owed.get("evidence"),
                 )
             except Exception as exc:
+                from agent_parley import supervision
+
                 self.coalesce(
                     "unrecovered",
                     lane,
                     f"{lane[1]} recovery checkpoint not written; the next "
-                    f"event captures again: {type(exc).__name__}",
+                    f"event captures again: "
+                    f"{supervision.failure('recovery', exc)}",
                 )
             with self.counting:
-                queued = self.recovering.get(lane) or []
-                if not queued:
+                waiting = self.recovering.get(lane)
+                if waiting is None:
                     self.recovering.pop(lane, None)
                     return
-                owed = queued.pop(0)
+                self.recovering[lane] = None
+                owed = waiting
 
     def coalesce(self, event: str, lane: tuple[str, str], detail: str) -> None:
         """Records a per-lane repeat at most once per `REPEAT_SECONDS`.
@@ -736,6 +802,35 @@ class Server(ThreadingHTTPServer):
         log(self.home, "failed", "request handling\n" + traceback.format_exc())
 
 
+def argument_refusal(tool: dict, args: dict) -> str | None:
+    """Names what is wrong with the keys of one tool call, if anything.
+
+    An agent told only that its arguments were wrong re-sends the same
+    call, so the refusal names the tool, each unexpected key, each missing
+    required key and every accepted key. It names keys only and never
+    echoes an argument value, which may carry a message body, and it is
+    clipped so an oversized key cannot inflate the reply.
+
+    Args:
+        tool: Declared tool whose input schema the call must match.
+        args: Arguments object the caller sent.
+
+    Returns:
+        The refusal text, or None when the keys match the schema.
+    """
+    schema = tool["inputSchema"]
+    accepted = sorted(schema["properties"])
+    extra = sorted(set(args) - set(accepted))
+    missing = sorted(set(schema.get("required", [])) - set(args))
+    if not extra and not missing:
+        return None
+    parts = [f"unexpected {', '.join(extra)}" if extra else ""]
+    parts.append(f"missing {', '.join(missing)}" if missing else "")
+    named = "; ".join(part for part in parts if part)
+    text = f"{tool['name']}: {named}. Accepted: {', '.join(accepted)}."
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
 class Handler(BaseHTTPRequestHandler):
     """Implements the JSON-response subset of stateless Streamable HTTP."""
 
@@ -790,7 +885,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in ("/mcp/", HOOK_PATH):
             try:
                 actor = store.authenticate(self.server.home, token)
-            except sqlite3.Error:
+            except (sqlite3.Error, BridgeError):
                 self._reply(503)
                 return None
             if actor:
@@ -814,6 +909,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """Authenticates and handles one size-limited JSON-RPC request.
 
+        The request cap admits the largest ``send_message`` body the store
+        accepts, ``attachments.MAX_ATTACHMENT_BYTES``, at twice its size for
+        JSON escaping plus room for the envelope. A larger request is refused
+        with HTTP 413 and a JSON-RPC error naming those limits, so an agent
+        reads why the call failed and can shorten or split the message.
+
         A service whose sources have moved refuses before it reaches the code
         that would import them. The refusal is the status a client already
         treats as an outage, so a hook decides in-process on the same path a
@@ -836,7 +937,7 @@ class Handler(BaseHTTPRequestHandler):
         if version not in VERSIONS:
             self._reply(400)
             return
-        message = self._body(MAX_REQUEST_BYTES)
+        message = self._body(MAX_REQUEST_BYTES, OVERSIZED)
         if message is _REFUSED:
             return
         if message is _INVALID:
@@ -856,7 +957,7 @@ class Handler(BaseHTTPRequestHandler):
             or not isinstance(message.get("params", {}), dict)
             or ("id" in message and type(message["id"]) not in (int, str))
         ):
-            self._reply(400)
+            self._reply(400, INVALID_REQUEST)
             return
         method = message["method"]
         if "id" not in message:
@@ -881,16 +982,30 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "tools/list":
             response["result"] = {"tools": TOOLS}
         elif method == "tools/call":
-            response["result"] = self._call(actor, params)
+            try:
+                response["result"] = self._call(actor, params)
+            except Exception:
+                log(
+                    self.server.home,
+                    "failed",
+                    "tool call\n" + traceback.format_exc(),
+                )
+                response["error"] = {
+                    "code": -32603,
+                    "message": "Internal error",
+                }
         else:
             response["error"] = {"code": -32601, "message": "Method not found"}
         self._reply(200, response)
 
-    def _body(self, limit: int) -> object:
+    def _body(self, limit: int, oversized: dict | None = None) -> object:
         """Reads one bounded JSON body, or replies and returns ``_REFUSED``.
 
         Args:
             limit: Largest body accepted on this path, in bytes.
+            oversized: JSON body sent with the 413 refusal of a body over
+                ``limit``, so the caller can read the limit it crossed; an
+                empty refusal when omitted.
 
         Returns:
             The decoded JSON value, ``_INVALID`` when the body was not JSON,
@@ -912,7 +1027,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Transfer-Encoding"
             ):
                 self.rfile.read(length)
-            self._reply(413)
+            self._reply(413, oversized)
             return _REFUSED
         try:
             return json.loads(self.rfile.read(length))
@@ -984,23 +1099,60 @@ class Handler(BaseHTTPRequestHandler):
                 self._raw_hook(served)
             else:
                 self._reply(200, served)
-            if delivery:
+            received = self._received()
+            if delivery and received:
                 self._delivered(path, request["participant"], delivery)
+            elif delivery:
+                log(
+                    self.server.home,
+                    "undelivered",
+                    f"{self.path} {request['participant']} reply was not "
+                    "confirmed by the client; the next event repeats it",
+                )
         finally:
             if owed:
                 self.server.recover(lane, owed)
 
-    def _delivered(self, directory: Path, agent: str, delivery: dict) -> None:
-        """Marks a written reply's coordination as delivered to the lane.
+    def _received(self) -> bool:
+        """Waits for the client to confirm it read the whole reply.
 
-        The whole reply is written before this runs, and the connection
-        closes after it, so the client reads its end of stream only once the
-        lane's state says what it was given, as the in-process path does.
+        Writing a reply succeeds into the kernel's buffer even when the
+        client already stopped waiting for it and decided in-process, so a
+        written reply proves nothing about what the lane was given. A
+        client that announces `hook.RECEIPT_HEADER` sends `hook.RECEIPT`
+        once it read the reply to its declared length, and only that byte
+        arriving within `RECEIPT_SECONDS` counts as receipt. A client that
+        gave up has exited or is deciding in-process and never sends it.
+
+        A client that does not announce the header predates the receipt,
+        as a hook client written before an upgrade and not yet rewritten
+        by a lane launch does, and is treated as having read what was
+        written so its lane keeps the delivery it had.
+
+        Returns:
+            Whether the client holds the reply.
+        """
+        if self.headers.get(hook.RECEIPT_HEADER) != hook.RECEIPT:
+            return True
+        try:
+            self.request.settimeout(RECEIPT_SECONDS)
+            return self.rfile.read(1) == hook.RECEIPT.encode()
+        except OSError:
+            return False
+
+    def _delivered(self, directory: Path, agent: str, delivery: dict) -> None:
+        """Marks a confirmed reply's coordination as delivered to the lane.
+
+        The whole reply is written and its receipt confirmed before this
+        runs, and the connection closes after it, so the client reads its
+        end of stream only once the lane's state says what it was given,
+        as the in-process path does.
         The wait for the lane's checkpoint lock is `DELIVERY_SECONDS`, which
         keeps the close inside the client's read timeout. A reply the
-        client stopped reading raised before this point, and a decision the
-        client was answered `hook.DECIDING` for never reaches it, so both
-        leave their coordination to the lane's next event.
+        client stopped reading raised before this point, a reply it never
+        confirmed is not delivered, and a decision the client was answered
+        `hook.DECIDING` for never reaches it, so all three leave their
+        coordination to the lane's next event.
 
         Args:
             directory: Common project state directory of the lane.
@@ -1038,7 +1190,10 @@ class Handler(BaseHTTPRequestHandler):
         lock until one of them lost and denied a native call. Expiry is
         therefore answered with `hook.DECIDING`, which tells the client the
         decision is held here: it emits no context and exits successfully
-        rather than repeating the event.
+        rather than repeating the event. A tool call a guard refuses from
+        its command line and the roster alone is the exception: it is
+        answered with that denial, by `checkpoints.deadline_refusal`, so a
+        slow decision drops only coordination context, never a refusal.
 
         Only the decisions a lane abandoned are counted, keyed by the lane's
         project and name because one service serves every project and lane
@@ -1144,12 +1299,21 @@ class Handler(BaseHTTPRequestHandler):
         if finished and isinstance(late, dict):
             if owed := late.pop("recovery", None):
                 self.server.recover(lane, owed)
+        refused = checkpoints.deadline_refusal(request)
         log(
             self.server.home,
             "expired",
             f"{self.path} {participant} undecided after {spent:.3f} "
-            "seconds; answered as still deciding: " + stages.report(),
+            "seconds; answered as "
+            + (
+                "refused by a command guard: "
+                if refused
+                else "still deciding: "
+            )
+            + stages.report(),
         )
+        if refused is not None:
+            return refused
         self._reply(hook.DECIDING, {"detail": UNDECIDED})
         return None
 
@@ -1203,7 +1367,12 @@ class Handler(BaseHTTPRequestHandler):
         call it has always been, and a delivered message wakes the lanes
         waiting for one before the sender is answered. A release that grants
         a queued request delivers such a message, so it wakes them too, and so
-        does a retirement, which tells the lanes that handed it work.
+        does a retirement, which tells the lanes that handed it work. A wait
+        that names `hand_off` is handed to the service by `waits.hand_off`,
+        and any other call ends the caller's handed-off wait, because the
+        lane is taking a turn again. Any other failure escapes to the
+        caller, which logs its traceback and answers JSON-RPC ``-32603``
+        on the same connection.
         """
         try:
             declared = self._declared_protocol()
@@ -1216,18 +1385,24 @@ class Handler(BaseHTTPRequestHandler):
                 (t for t in TOOLS if t["name"] == params.get("name")), None
             )
             args = params.get("arguments", {})
-            if tool is None or not isinstance(args, dict):
-                raise BridgeError("Unknown tool or invalid arguments.")
-            schema = tool["inputSchema"]
-            if set(args) - set(schema["properties"]) or set(
-                schema["required"]
-            ) - set(args):
-                raise BridgeError("Unexpected or missing tool arguments.")
+            if tool is None:
+                raise BridgeError(
+                    f"Unknown tool {str(params.get('name'))[:80]!r}; "
+                    "tools/list names the available tools."
+                )
+            if not isinstance(args, dict):
+                raise BridgeError("arguments must be a JSON object.")
+            wrong = argument_refusal(tool, args)
+            if wrong is not None:
+                raise BridgeError(wrong)
             if roster.paused(self.server.home, actor["project"], actor["name"]):
                 raise BridgeError(roster.PAUSED_REASON)
+            if "hand_off" not in args:
+                waits.resumed(self.server.home, actor)
             if tool["name"] == waits.TOOL:
                 with self.server.waiting() as ceiling:
-                    result = waits.wait(
+                    serve = waits.hand_off if "hand_off" in args else waits.wait
+                    result = serve(
                         self.server.home,
                         actor,
                         args,
@@ -1254,7 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
         except BridgeError as exc:
             return {
                 "isError": True,
-                "content": [{"type": "text", "text": str(exc)}],
+                "content": [{"type": "text", "text": refusal(exc)}],
             }
         except sqlite3.OperationalError as exc:
             retryable = getattr(exc, "sqlite_errorcode", 0) & 0xFF in (
@@ -1298,6 +1473,7 @@ def stop_on_signal(home: Path, service: Server) -> None:
             number: Signal the process was sent.
             frame: Interrupted stack frame, which is not inspected.
         """
+        service.signalled.set()
         log(
             home,
             "signalled",
@@ -1309,15 +1485,61 @@ def stop_on_signal(home: Path, service: Server) -> None:
         signal.signal(number, received)
 
 
+def replace(home: Path, served: str) -> None:
+    """Re-executes this process on the sources now on disk.
+
+    `uv tool upgrade` replaces the package under a running service and
+    leaves the service to notice. Stopping and waiting for a hook to relaunch
+    it left an idle estate without a service, and left an operator to run
+    `down` and `up` by hand after every upgrade. The process re-executes
+    itself instead, with the interpreter, module and state root the launcher
+    started it with, so its process ID and creation identity, and with them
+    the published record every hook reads, stay valid across the hand-over;
+    the port and credential are read again from the same configuration. A
+    hook that arrives in the gap finds the recorded process alive, decides
+    in-process and does not ask for a second service.
+
+    The version replacing the served one is read from the installed package
+    metadata for the log entry only. The source fingerprint, not the version,
+    decided the restart, so a checkout edit restarts the service the same
+    way, and the new process takes a fresh fingerprint at start, so one
+    change restarts it once. A re-execution the kernel refuses is logged and
+    the process exits, which is the state the hook's relaunch recovers from.
+
+    Args:
+        home: Private bridge state root the service was started with.
+        served: Package version this process was serving.
+    """
+    from importlib import metadata
+
+    try:
+        installed = metadata.version("agent-parley")
+    except metadata.PackageNotFoundError:
+        installed = "unknown"
+    log(
+        home,
+        "relaunching",
+        f"version {served} re-executes as version {installed} on disk, "
+        f"pid {os.getpid()}",
+    )
+    try:
+        os.execv(
+            sys.executable,
+            [sys.executable, "-m", "agent_parley.server", "--home", str(home)],
+        )
+    except OSError as exc:
+        log(home, "relaunch", f"failed: {exc}")
+
+
 def main() -> None:
     """Runs the detached coordination service using its private config.
 
     The background workers are joined against one deadline rather than one
     deadline each, so the whole exit is bounded by `REVISION_SECONDS`. A
-    service that stopped because its sources moved is replaced by the hook
-    that finds its published record dead, and every native call until then
-    pays an in-process decision, so the interval that bounds the detection
-    also bounds the leaving.
+    service that stopped because its sources moved finishes the requests in
+    flight, bounded by the longest a decision may take, and re-executes
+    itself through `replace` once its workers have stopped, so the store is
+    not written by two module sets at once. A signalled stop exits.
 
     Wake sockets left behind by launchers that did not exit cleanly are
     removed at start, so each start begins with only the sockets a live
@@ -1347,12 +1569,22 @@ def main() -> None:
             stop_on_signal(args.home, server)
             server.serve_forever(poll_interval=0.2)
             server.flush_repeats()
+            if server.relaunching() and not server.drain(
+                time.monotonic() + DECISION_SECONDS
+            ):
+                log(
+                    args.home,
+                    "draining",
+                    "requests still running at the deadline; re-executing",
+                )
             log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()
         deadline = time.monotonic() + REVISION_SECONDS
         for worker in workers:
             worker.join(timeout=max(deadline - time.monotonic(), 0.0))
+    if server.relaunching():
+        replace(args.home, server.version)
 
 
 if __name__ == "__main__":

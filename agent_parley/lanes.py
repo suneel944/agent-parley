@@ -22,6 +22,10 @@ Every observation reaches the record through this module: a supervision
 poll's liveness sample through `sample`, and hook events, dialog reads and
 session changes through `submit`, which queues them in a spool the next
 poll applies in arrival order with `apply`.
+
+A lane's own task plan is kept beside the record as one capped file per
+lane, written from the native todo tool a hook observes or from the
+``plan update`` command, so the hook path never opens the store to keep it.
 """
 
 from __future__ import annotations
@@ -30,9 +34,11 @@ import contextlib
 import json
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
-from agent_parley.state import BridgeError, lock
+from agent_parley.roster import ADAPTERS
+from agent_parley.state import BridgeError, lock, write_json
 
 STARTING = "starting"
 WORKING = "working"
@@ -47,6 +53,7 @@ CAPACITY = "capacity"
 PROMPT = "prompt"
 APPROVAL = "approval"
 CAUSES = frozenset({DIALOG, CAPACITY, PROMPT, APPROVAL})
+PROVIDER_ERROR = "provider error"
 TRANSITIONS: dict[str, frozenset[str]] = {
     "": frozenset({STARTING, WORKING, IDLE, BLOCKED, STOPPED, DEAD}),
     STARTING: frozenset({STARTING, WORKING, IDLE, BLOCKED, STOPPED, DEAD}),
@@ -71,6 +78,8 @@ HOOK_STATES = {
     "Stop": IDLE,
     "SessionEnd": STOPPED,
 }
+INFERENCES = {"dialog": "dialog watcher", "liveness": "liveness"}
+"""Evidence sources that infer a lane state, with the name views print."""
 MAX_EVIDENCE = 200
 MAX_EVENTS = 2000
 SPOOL = "lane-evidence.jsonl"
@@ -131,6 +140,179 @@ ACCOUNT_FIELDS = (
     "owns",
     "accounted",
 )
+EXTRAS = "-wt"
+PLAN_FILE = "-plan.json"
+PLAN_COMMAND = "plan update"
+NATIVE_PLAN_TOOL = "TodoWrite"
+PLAN_STATUSES = ("pending", "in_progress", "completed")
+MAX_PLAN_BYTES = 4096
+MAX_PLAN_ITEMS = 30
+MAX_STEP_CHARACTERS = 200
+
+
+def plan_items(entries: object, key: str) -> tuple[list[dict], bool]:
+    """Normalizes a submitted task list into capped plan items.
+
+    Each step's text is folded onto one line and clipped, and items stop
+    at `MAX_PLAN_ITEMS` or where the encoded list would pass
+    `MAX_PLAN_BYTES`, so a plan never grows past what a view can show.
+
+    Args:
+        entries: Submitted list of mappings, each with text and a status.
+        key: Field naming the step's text, such as ``content`` or ``step``.
+
+    Returns:
+        The kept items as ``{"text", "status"}`` mappings, and whether any
+        item was dropped or clipped by a cap.
+
+    Raises:
+        BridgeError: If the list, an item, its text or its status is
+            malformed.
+    """
+    if not isinstance(entries, list):
+        raise BridgeError("plan must be a list of steps.")
+    items: list[dict] = []
+    clipped = False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise BridgeError("Each plan step must be an object.")
+        text = entry.get(key)
+        status = entry.get("status")
+        if not isinstance(text, str) or not text.strip():
+            raise BridgeError(f"Each plan step needs a non-empty {key}.")
+        if status not in PLAN_STATUSES:
+            raise BridgeError(
+                f"Plan status must be one of: {', '.join(PLAN_STATUSES)}."
+            )
+        folded = " ".join(text.split())
+        clipped = clipped or len(folded) > MAX_STEP_CHARACTERS
+        items.append({"text": folded[:MAX_STEP_CHARACTERS], "status": status})
+    kept: list[dict] = []
+    size = 2
+    for item in items[:MAX_PLAN_ITEMS]:
+        size += len(json.dumps(item, ensure_ascii=False).encode()) + 1
+        if size > MAX_PLAN_BYTES:
+            break
+        kept.append(item)
+    return kept, clipped or len(kept) < len(items)
+
+
+def record_plan(
+    directory: Path, agent: str, entries: object, key: str, source: str
+) -> dict:
+    """Replaces a lane's recorded task plan with the submitted list.
+
+    Args:
+        directory: Common project state directory.
+        agent: Lane name the plan belongs to.
+        entries: Submitted task list, as `plan_items` reads it.
+        key: Field naming each step's text.
+        source: Where the list came from, such as ``plan update``.
+
+    Returns:
+        The recorded plan: ``items``, ``source``, ``updated`` and
+        ``truncated``.
+
+    Raises:
+        BridgeError: If the list is malformed.
+        OSError: If the plan file cannot be written.
+    """
+    items, truncated = plan_items(entries, key)
+    plan = {
+        "items": items,
+        "source": source,
+        "updated": time.time(),
+        "truncated": truncated,
+    }
+    write_json(directory / f"{agent}{PLAN_FILE}", plan)
+    return plan
+
+
+def observe_plan(directory: Path, agent: str, payload: dict) -> None:
+    """Records the task list a native todo tool call carried, if any.
+
+    Only a completed ``TodoWrite`` call is read, from the hook payload the
+    lane already sent; no transcript is parsed and no model is asked. A
+    malformed list or a failed write is dropped, because a missing plan
+    must never fail the hook that observed it.
+
+    Args:
+        directory: Common project state directory.
+        agent: Lane the hook event belongs to.
+        payload: Native ``PostToolUse`` hook payload.
+    """
+    if payload.get("tool_name") != NATIVE_PLAN_TOOL:
+        return
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return
+    with contextlib.suppress(BridgeError, OSError):
+        record_plan(
+            directory,
+            agent,
+            tool_input.get("todos"),
+            "content",
+            NATIVE_PLAN_TOOL,
+        )
+
+
+def lane_task_plan(directory: Path, agent: str) -> dict | None:
+    """Reads the latest task plan a lane recorded.
+
+    The plan is the operator's reading of one lane and is never delivered
+    to another lane.
+
+    Args:
+        directory: Common project state directory.
+        agent: Lane name.
+
+    Returns:
+        ``items`` as ``{"text", "status"}`` mappings in the lane's order,
+        with ``source``, ``updated`` and ``truncated``, or None when the
+        lane recorded no readable plan.
+    """
+    try:
+        plan = json.loads((directory / f"{agent}{PLAN_FILE}").read_text())
+        items, clipped = plan_items(plan["items"], "text")
+        return {
+            "items": items,
+            "source": str(plan.get("source", "")),
+            "updated": float(plan.get("updated", 0)),
+            "truncated": bool(plan.get("truncated")) or clipped,
+        }
+    except (BridgeError, OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def plan_source(adapter: str) -> str:
+    """Names how a provider's lanes report their task plan.
+
+    Args:
+        adapter: Native CLI contract of the lane's provider.
+
+    Returns:
+        ``TodoWrite`` for the Claude contract, whose hook carries the
+        native list, ``plan update`` for every other known contract, and an
+        empty string when the provider has no path.
+    """
+    if adapter == "claude":
+        return NATIVE_PLAN_TOOL
+    return PLAN_COMMAND if adapter in ADAPTERS else ""
+
+
+def extras(lane: Path | str) -> Path:
+    """Names the one directory a lane keeps its extra worktrees in.
+
+    The lane hook and the reclaim sweep both read it, so it lives with the
+    lane record, which the hook already loads, rather than in the sweep.
+
+    Args:
+        lane: The lane's own worktree.
+
+    Returns:
+        The `<lane>-wt` directory beside the lane, in the same parent.
+    """
+    return Path(f"{lane}{EXTRAS}")
 
 
 def ensure(db: sqlite3.Connection) -> None:
@@ -209,16 +391,23 @@ def _event(
     detail: str = "",
     now: float,
 ) -> None:
-    """Appends one lane event and bounds the project's retained history."""
+    """Appends one lane event and bounds the project's retained history.
+
+    `accounting` events and every other kind are bounded separately, each
+    to `MAX_EVENTS` per project, so accounting rows written on every poll
+    never evict the transitions an operator reads as lane history.
+    """
     db.execute(
         "INSERT INTO lane_events(project,lane,kind,source,target,cause,"
         "evidence,detail,ts) VALUES (?,?,?,?,?,?,?,?,?)",
         (root, lane, kind, source, target, cause, evidence, detail, now),
     )
+    metered = int(kind == "accounting")
     db.execute(
-        "DELETE FROM lane_events WHERE project=? AND id<=(SELECT id FROM "
-        "lane_events WHERE project=? ORDER BY id DESC LIMIT 1 OFFSET ?)",
-        (root, root, MAX_EVENTS),
+        "DELETE FROM lane_events WHERE project=? AND (kind='accounting')=? "
+        "AND id<=(SELECT id FROM lane_events WHERE project=? "
+        "AND (kind='accounting')=? ORDER BY id DESC LIMIT 1 OFFSET ?)",
+        (root, metered, root, metered, MAX_EVENTS),
     )
 
 
@@ -681,13 +870,18 @@ def settled(directory: Path) -> None:
 def apply(db: sqlite3.Connection, root: str, items: list[dict]) -> int:
     """Applies queued evidence to the lane records in arrival order.
 
-    A hook seen from a lane recorded as dead or reclaimed proves a running
-    session, so the lane is started before the observed state is applied.
-    A new session identity is passed through, so a session change becomes
-    a transition that records both identities rather than a dropped hook.
-    An observation older than the record's last update, because it waited
-    in the spool while the store was busy, is applied at that update time
-    so a record's times never run backwards.
+    An observation taken before the lane entered its recorded state, such
+    as a tool hook still spooled when the launcher recorded `stopped`, is
+    older than that direct transition and moves nothing; it is recorded as
+    a `superseded` event instead. A reclaimed lane is left only by a launch,
+    so queued evidence never moves it either. A hook seen after a lane was
+    recorded dead proves a running session, so the lane is started before
+    the observed state is applied. A new session identity is passed
+    through, so a session change becomes a transition that records both
+    identities rather than a dropped hook. An observation that is newer
+    than the record's state but older than its last update, because it
+    waited in the spool while the store was busy, is applied at that update
+    time so a record's times never run backwards.
 
     Args:
         db: Open write transaction on the coordination store.
@@ -710,11 +904,27 @@ def apply(db: sqlite3.Connection, root: str, items: list[dict]) -> int:
         session = str(item.get("session", "")) or None
         current = read(db, root, lane)
         moment = float(item.get("ts") or time.time())
+        stale = current is not None and (
+            moment < float(current["since"]) or current["state"] == RECLAIMED
+        )
         if current is not None:
             moment = max(moment, float(current["updated"]))
+        if current is not None and stale:
+            _event(
+                db,
+                root,
+                lane,
+                "superseded",
+                current["state"],
+                target,
+                cause=cause,
+                evidence=evidence[:MAX_EVIDENCE],
+                now=moment,
+            )
+            continue
         if (
             current is not None
-            and current["state"] in (DEAD, RECLAIMED)
+            and current["state"] == DEAD
             and target in LIVE - {STARTING}
         ):
             transition(db, root, lane, STARTING, evidence=evidence, now=moment)
@@ -785,6 +995,7 @@ def account(
     *,
     has_work: bool,
     owns: bool,
+    idle_cause: str = "",
     now: float | None = None,
 ) -> dict | None:
     """Adds the time since the last poll to a lane's idle and claim totals.
@@ -792,7 +1003,11 @@ def account(
     Idle time is time the lane spent `idle`, `blocked`, `stopped` or `dead`
     while claimable or owned work existed. Unaccountable time is time the
     lane owned a claim while it was not `working`. Each total is kept per
-    state and cause, so the largest one can be named. The span since the
+    state and cause, so the largest one can be named. An idle lane records
+    no cause of its own, so the caller can name one it read elsewhere, such
+    as `PROVIDER_ERROR` for a turn that ended on a retryable provider
+    failure, and the gap is charged under `idle: provider error`. The span
+    since the
     last poll is split where the lane last changed state: the part before
     is charged to the state and work the last poll saw, the rest to the
     current ones. A span longer than `ACCOUNT_GAP`, a stopped service,
@@ -806,6 +1021,7 @@ def account(
         record: The lane's current state record, or None.
         has_work: Whether claimable or owned work exists for the lane.
         owns: Whether the lane owns an open claim.
+        idle_cause: Cause an idle lane's gap is charged under, or empty.
         now: Unix time of the poll, or None for the current time.
 
     Returns:
@@ -817,6 +1033,8 @@ def account(
     ensure(db)
     previous = read_accounts(db, root).get(lane)
     current = label(record)
+    if idle_cause and current == IDLE:
+        current = f"{IDLE}: {idle_cause}"
     totals: dict = {
         "observed": 0.0,
         "idle": 0.0,
@@ -1071,3 +1289,71 @@ def describe(record: dict, now: float | None = None) -> str:
         else (record["state"])
     )
     return f"{named} {held}"
+
+
+def provenance(
+    record: dict | None, unavailable: Iterable[str] = ()
+) -> dict | None:
+    """Names what put a lane in its recorded state and the hook it lacked.
+
+    Every observation reaches a record with its source as the evidence
+    prefix: `apply` writes the hook event, `dialog` for the terminal
+    watcher or `launch` for a launch deadline, and `sample` writes
+    `liveness`. A state the watcher or the liveness sample set is inferred,
+    because no hook of the native client confirmed it. The gap is the hook
+    events that would have confirmed that state when the lane's adapter
+    raises none of them, so a gap is only named where the client truly has
+    no hook for it, never for a state no hook of any client reports.
+
+    Args:
+        record: Lane state record as `read` returns it, or None.
+        unavailable: Hook events the lane's adapter cannot raise, as
+            `roster.unavailable_hooks` names them.
+
+    Returns:
+        The `source` (`hook`, a name in `INFERENCES`, or `supervision`),
+        whether the state is `inferred`, and the `gap` of hook events behind
+        an inferred state, or None when the lane has no record.
+    """
+    if record is None:
+        return None
+    prefix = str(record["evidence"]).partition(": ")[0]
+    inferred = prefix in INFERENCES
+    confirming = [
+        event
+        for event, state in HOOK_STATES.items()
+        if state == record["state"]
+        and (state != BLOCKED or record["cause"] == APPROVAL)
+    ]
+    missing = set(unavailable)
+    return {
+        "source": (
+            "hook"
+            if prefix in HOOK_STATES
+            else INFERENCES.get(prefix, "supervision")
+        ),
+        "inferred": inferred,
+        "gap": (
+            confirming
+            if inferred and confirming and missing.issuperset(confirming)
+            else []
+        ),
+    }
+
+
+def inference(seen: dict | None) -> str:
+    """Words an inferred lane state for the operator views.
+
+    Args:
+        seen: Provenance as `provenance` returns it, or None.
+
+    Returns:
+        Text such as ``inferred by dialog watcher, no PermissionRequest
+        hook``, or an empty string for a hook-confirmed or unrecorded state.
+    """
+    if not seen or not seen["inferred"]:
+        return ""
+    note = f"inferred by {seen['source']}"
+    if seen["gap"]:
+        note += f", no {'/'.join(seen['gap'])} hook"
+    return note

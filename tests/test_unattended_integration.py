@@ -3,8 +3,10 @@
 import json
 import shlex
 import sys
+import threading
 from pathlib import Path
 
+import httpx
 import pytest
 
 from agent_parley import (
@@ -13,8 +15,10 @@ from agent_parley import (
     lifecycle,
     merges,
     metrics,
+    problems,
     roster,
     store,
+    supervision,
     unattended,
 )
 from agent_parley.cli import git
@@ -153,6 +157,51 @@ def test_a_replay_merges_and_completes_nothing_again(bridge, repo, ready):
     ]
 
 
+def test_a_lane_holding_two_claims_integrates_its_ready_one(
+    bridge, repo, ready
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    bridge.issue(ready["lane"], "claim", "43")
+
+    unattended.integrate(bridge, repo, "codex")
+
+    assert (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert issues.snapshot(directory)["issues"]["43"]["owner"] == "codex"
+    assert execution(directory, "43")["state"] != lifecycle.COMPLETE
+
+
+def test_an_operator_merge_takes_the_only_ready_claim(bridge, repo, ready):
+    directory = ready["directory"]
+    bridge.issue(ready["lane"], "claim", "43")
+
+    bridge.merge(repo, "codex")
+
+    assert (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert execution(directory, "43")["state"] != lifecycle.COMPLETE
+
+
+def test_two_ready_claims_need_an_explicit_issue(bridge, repo, ready):
+    directory = ready["directory"]
+    bridge.issue(ready["lane"], "claim", "43")
+    commit(ready["lane"], "second.txt")
+    bridge.report(
+        ready["lane"], "ready", "Second", "", "make check: ok", issue="43"
+    )
+
+    with pytest.raises(BridgeError, match="#42, #43 are ready"):
+        bridge.merge(repo, "codex")
+    assert not (repo / "feature.txt").exists()
+
+    bridge.merge(repo, "codex", issue="43")
+
+    assert (repo / "second.txt").exists()
+    assert execution(directory, "43")["state"] == lifecycle.COMPLETE
+    assert execution(directory)["state"] == lifecycle.READY
+
+
 def test_an_old_integration_never_stands_in_for_a_new_claim(
     bridge, repo, ready
 ):
@@ -186,8 +235,11 @@ def test_a_claim_changed_after_evaluation_merges_nothing(
     def then_supersede(*arguments):
         outcome = evaluate(*arguments)
         monkeypatch.setattr(
-            "agent_parley.cli.exact_claim",
-            lambda directory, name: {"issue": 42, "claim_id": "superseded"},
+            "agent_parley.cli.merge_claim",
+            lambda directory, name, issue="": {
+                "issue": 42,
+                "claim_id": "superseded",
+            },
         )
         return outcome
 
@@ -272,8 +324,11 @@ def test_a_changed_claim_generation_is_refused(
 ):
     authorize(bridge, repo, ready)
     monkeypatch.setattr(
-        "agent_parley.cli.exact_claim",
-        lambda directory, name: {"issue": 42, "claim_id": "superseded"},
+        "agent_parley.cli.merge_claim",
+        lambda directory, name, issue="": {
+            "issue": 42,
+            "claim_id": "superseded",
+        },
     )
 
     with pytest.raises(BridgeError, match="changed claim generation"):
@@ -313,9 +368,12 @@ def test_a_peer_reservation_over_the_change_is_refused(bridge, repo, ready):
     assert not (repo / "feature.txt").exists()
 
 
-def test_a_held_merge_lock_serializes_the_attempt(bridge, repo, ready):
+def test_a_held_merge_lock_serializes_the_attempt(
+    bridge, repo, ready, monkeypatch
+):
     directory = ready["directory"]
     authorize(bridge, repo, ready)
+    monkeypatch.setattr(unattended, "MERGE_WAIT", 0.2)
 
     with lock(directory / "merge.lock"):
         with pytest.raises(BridgeError, match="Another merge"):
@@ -324,6 +382,27 @@ def test_a_held_merge_lock_serializes_the_attempt(bridge, repo, ready):
     assert not (repo / "feature.txt").exists()
     assert execution(directory)["state"] == lifecycle.READY
     unattended.integrate(bridge, repo, "codex")
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+
+
+def test_an_attempt_waits_for_a_held_setup_lock(bridge, repo, ready):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with lock(directory / "setup.lock"):
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    held.wait(10)
+    threading.Timer(0.3, release.set).start()
+    unattended.integrate(bridge, repo, "codex")
+    holder.join(10)
+
     assert execution(directory)["state"] == lifecycle.COMPLETE
 
 
@@ -408,6 +487,7 @@ def test_a_session_lock_still_excludes_a_live_lane(bridge, repo, ready):
         {"unattended": {"target": "main"}},
         {"unattended": {"target": "../main", "issues": ["42"]}},
         {"unattended": {"target": "main", "issues": ["42", "42"]}},
+        {"unattended": {"target": "main", "issues": ["42"], "auto": "yes"}},
         {"unattended": True},
         {"widen": {}},
         ["42"],
@@ -509,7 +589,314 @@ def test_the_command_line_sets_shows_and_clears_the_policy(
     assert f"into {ready['target']} for issues #9, #42" in shown
     assert "#9, #42" in run("unattended", "show", "--repo", str(repo))
     assert "Integrated unattended" in run(
-        "unattended", "run", "codex", "--repo", str(repo)
+        "unattended", "run", "codex", "--issue", "42", "--repo", str(repo)
     )
     assert "operator-only" in run("unattended", "set", "--repo", str(repo))
     assert roster.read(ready["directory"])["integration"] == {}
+    assert "on its own" in run(
+        "unattended",
+        "set",
+        "42",
+        "--target",
+        ready["target"],
+        "--auto",
+        "--repo",
+        str(repo),
+    )
+    assert unattended.policy(roster.read(ready["directory"]))["auto"] is True
+
+
+def quiet(bridge, ready):
+    """Registers both lanes and turns off the stages these tests skip."""
+    store.initialize(bridge.home)
+    root = roster.read(ready["directory"])["root"]
+    for name in ("claude", "codex"):
+        store.register(bridge.home, root, name)
+    write_json(
+        bridge.home / "supervision.json",
+        {"prompts": False, "wake": False, "reclaim": False},
+    )
+
+
+def tick(bridge, directory):
+    """Runs one supervision poll and waits for the attempts it started."""
+    supervision.poll(bridge.home, directory)
+    for thread in threading.enumerate():
+        if thread.name.startswith("agent-parley-unattended-"):
+            thread.join(timeout=120)
+
+
+def subjects(bridge, repo):
+    """Returns the subjects of the unattended mail the lane received."""
+    with store.connect(bridge.home) as db:
+        rows = db.execute(
+            "SELECT m.subject FROM messages m JOIN projects p "
+            "ON p.id=m.project_id WHERE p.human_key=? "
+            "AND m.subject LIKE 'Unattended integration%' ORDER BY m.id",
+            (str(repo.resolve()),),
+        ).fetchall()
+    return [row["subject"] for row in rows]
+
+
+def test_auto_integrates_an_eligible_lane_once_within_one_poll(
+    bridge, repo, ready
+):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    unattended.configure(bridge, repo, ready["target"], ["42"], auto=True)
+
+    tick(bridge, directory)
+
+    assert (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    [decision] = decisions(directory)
+    assert decision["outcome"] == unattended.INTEGRATED
+    assert decision["evidence"]["actor"] == unattended.SERVICE
+    integrated = git(repo, "rev-parse", "HEAD")
+    assert subjects(bridge, repo) == ["Unattended integration integrated"]
+
+    tick(bridge, directory)
+
+    assert git(repo, "rev-parse", "HEAD") == integrated
+    assert len(decisions(directory)) == 1
+    assert len(subjects(bridge, repo)) == 1
+
+
+def test_without_auto_the_service_integrates_nothing(bridge, repo, ready):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    authorize(bridge, repo, ready)
+
+    tick(bridge, directory)
+
+    assert not (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.READY
+    assert decisions(directory) == []
+    assert subjects(bridge, repo) == []
+
+
+def test_auto_records_an_unchanged_refusal_once(bridge, repo, ready):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    unattended.configure(bridge, repo, ready["target"], ["42"], auto=True)
+    git(repo, "switch", "-c", "elsewhere")
+
+    tick(bridge, directory)
+    tick(bridge, directory)
+
+    assert not (repo / "feature.txt").exists()
+    [refusal] = decisions(directory)
+    assert refusal["outcome"] == unattended.REFUSED
+    assert "not the policy target" in refusal["reason"]
+    assert subjects(bridge, repo) == ["Unattended integration refused"]
+
+
+def test_auto_records_a_failure_once_and_raises_a_problem(
+    bridge, repo, ready, tmp_path
+):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    bridge.verification(repo, gate(tmp_path, 1))
+    unattended.configure(bridge, repo, ready["target"], ["42"], auto=True)
+
+    tick(bridge, directory)
+    tick(bridge, directory)
+
+    assert not (repo / "feature.txt").exists()
+    [failure] = decisions(directory)
+    assert failure["outcome"] == unattended.FAILED
+    assert subjects(bridge, repo) == ["Unattended integration failed"]
+    [row] = [
+        row
+        for row in bridge.problems()
+        if row["condition"] == problems.UNATTENDED
+    ]
+    assert row["participant"] == "codex"
+    assert "unattended run codex --issue 42" in row["command"]
+
+
+def test_an_operator_failure_raises_no_problem(bridge, repo, ready, tmp_path):
+    bridge.verification(repo, gate(tmp_path, 1))
+    authorize(bridge, repo, ready)
+
+    with pytest.raises(BridgeError, match="recorded for recovery"):
+        unattended.integrate(bridge, repo, "codex")
+
+    assert not [
+        row
+        for row in bridge.problems()
+        if row["condition"] == problems.UNATTENDED
+    ]
+
+
+def logged_gate(tmp_path: Path) -> tuple[str, Path]:
+    """Writes a gate that logs its start and end.
+
+    Each run waits, for up to sixty seconds, until two runs have started,
+    so serialized gates log a start and an end before the second start.
+    """
+    log = tmp_path / "gate.log"
+    quoted = shlex.quote(str(log))
+    script = tmp_path / "logged-gate.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"echo start >> {quoted}\n"
+        "i=0\n"
+        f'while [ "$(grep -c start {quoted})" -lt 2 ] && [ "$i" -lt 300 ]; '
+        "do sleep 0.2; i=$((i + 1)); done\n"
+        f"echo end >> {quoted}\n"
+    )
+    script.chmod(0o755)
+    return shlex.quote(str(script)), log
+
+
+def picky_gate(tmp_path: Path) -> str:
+    """Writes a gate that fails on any tree carrying ``base-0.txt``."""
+    script = tmp_path / "picky-gate.sh"
+    script.write_text("#!/bin/sh\ntest ! -e base-0.txt\n")
+    script.chmod(0o755)
+    return shlex.quote(str(script))
+
+
+def served_subjects(service, token: str) -> list[str]:
+    """Reads a lane's unattended mail over the real local MCP transport."""
+    response = httpx.post(
+        f"http://127.0.0.1:{service.server_port}/mcp/",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "fetch_inbox", "arguments": {"limit": 5}},
+        },
+        trust_env=False,
+    )
+    result = response.json()["result"]
+    assert not result.get("isError")
+    return [
+        row["subject"]
+        for row in json.loads(result["content"][0]["text"])["messages"]
+        if row["subject"].startswith("Unattended integration")
+    ]
+
+
+def test_ready_lanes_gate_concurrently_and_merge_in_turn(
+    bridge, repo, ready, paired, service, tmp_path
+):
+    directory = ready["directory"]
+    quiet(bridge, ready)
+    command, log = logged_gate(tmp_path)
+    bridge.verification(repo, command)
+    peer = Path(paired["lanes"]["claude"])
+    bridge.issue(peer, "claim", "43")
+    commit(peer, "other.txt")
+    bridge.report(peer, "ready", "Peer result", "", "make check: 3 passed")
+    unattended.configure(bridge, repo, ready["target"], ["42", "43"], auto=True)
+
+    tick(bridge, directory)
+
+    runs = log.read_text().split()
+    assert runs[:2] == ["start", "start"]
+    assert len(runs) == 6
+    assert (repo / "feature.txt").exists()
+    assert (repo / "other.txt").exists()
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    assert execution(directory, "43")["state"] == lifecycle.COMPLETE
+    root = roster.read(directory)["root"]
+    bound = {}
+    for name in ("claude", "codex"):
+        [decision] = decisions(directory, name)
+        assert decision["outcome"] == unattended.INTEGRATED
+        bound[name] = decision["evidence"]
+        token = store.register(bridge.home, root, name)["registration_token"]
+        assert served_subjects(service, token) == [
+            "Unattended integration integrated"
+        ]
+    claude, codex = bound["claude"], bound["codex"]
+    assert (claude["target_commit"] == codex["integrated_commit"]) != (
+        codex["target_commit"] == claude["integrated_commit"]
+    )
+    listing = git(repo, "worktree", "list", "--porcelain")
+    assert listing.count("worktree ") == 3
+
+
+def moving(monkeypatch, repo, times: int) -> list[str]:
+    """Commits to the base after each of the first candidate gates."""
+    candidate = unattended._candidate
+    moved: list[str] = []
+
+    def then_move(*arguments):
+        tree = candidate(*arguments)
+        if len(moved) < times:
+            moved.append(commit(repo, f"base-{len(moved)}.txt"))
+        return tree
+
+    monkeypatch.setattr(unattended, "_candidate", then_move)
+    return moved
+
+
+def test_a_target_moved_during_the_gate_is_gated_again(
+    bridge, repo, ready, monkeypatch
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    moved = moving(monkeypatch, repo, 1)
+
+    unattended.integrate(bridge, repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD^1") == moved[0]
+    assert execution(directory)["state"] == lifecycle.COMPLETE
+    [decision] = decisions(directory)
+    assert decision["outcome"] == unattended.INTEGRATED
+    assert decision["evidence"]["target_commit"] == moved[0]
+
+
+def test_a_moved_target_never_lands_an_unverified_result(
+    bridge, repo, ready, monkeypatch, tmp_path
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    bridge.verification(repo, picky_gate(tmp_path))
+    moved = moving(monkeypatch, repo, 1)
+
+    with pytest.raises(BridgeError, match="recorded for recovery"):
+        unattended.integrate(bridge, repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD") == moved[0]
+    assert not (repo / "feature.txt").exists()
+    assert execution(directory)["state"] == lifecycle.READY
+    [failure] = decisions(directory)
+    assert failure["outcome"] == unattended.FAILED
+    assert failure["evidence"]["target_commit"] == moved[0]
+
+
+def test_a_target_that_keeps_moving_is_refused_for_the_next_attempt(
+    bridge, repo, ready, monkeypatch
+):
+    directory = ready["directory"]
+    authorize(bridge, repo, ready)
+    moved = moving(monkeypatch, repo, unattended.ROUNDS)
+
+    with pytest.raises(BridgeError, match="moved while each"):
+        unattended.integrate(bridge, repo, "codex")
+
+    assert git(repo, "rev-parse", "HEAD") == moved[-1]
+    assert not (repo / "feature.txt").exists()
+    [refusal] = decisions(directory)
+    assert refusal["outcome"] == unattended.REFUSED
+    key = ("42", refusal["claim_id"], ready["source"])
+    assert not unattended._decided(directory, "codex", key, moved[-1])
+
+
+def test_a_candidate_that_fails_its_gate_leaves_no_scratch_worktree(
+    bridge, repo, ready, tmp_path
+):
+    authorize(bridge, repo, ready)
+    bridge.verification(repo, gate(tmp_path, 3))
+
+    with pytest.raises(BridgeError, match="recorded for recovery"):
+        unattended.integrate(bridge, repo, "codex")
+
+    listing = git(repo, "worktree", "list", "--porcelain")
+    assert listing.count("worktree ") == 3
+    assert not list(ready["directory"].glob(".candidate-*"))

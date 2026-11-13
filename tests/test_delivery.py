@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, delivery, roster, store
+from agent_parley import checkpoints, delivery, issues, roster, store
 from agent_parley.state import lock, write_json
 
 SUBJECT = "Interface change"
@@ -41,17 +42,87 @@ def unread(bridge, data):
     return checkpoints.mailbox(bridge.home, data["root"], name)["unread"]
 
 
-def test_polled_mail_carries_the_digest_header_and_is_marked_read(
-    bridge, polled
-):
+def mark(bridge, data, ids):
+    """Marks mail read as the helper lane's mark_message_read would."""
+    directory = Path(data["lanes"]["helper"]).parent
+    name = roster.read(directory)["participants"]["helper"]["display"]
+    store.mark_read(bridge.home, data["root"], name, ids)
+
+
+def test_polled_mail_carries_the_digest_header_and_stays_unread(bridge, polled):
     directory = Path(polled["lanes"]["helper"]).parent
     assert unread(bridge, polled) == 1
 
     assert delivery.deliver(bridge.home, directory, "helper") > 0
 
     text = delivery.mail_file(directory, "helper").read_text()
+    assert text.startswith("## Batch 1, written ")
     assert "Mail: 1 of 1 unread, most relevant first; 0 superseded." in text
-    assert unread(bridge, polled) == 0
+    assert unread(bridge, polled) == 1
+
+
+def test_two_polls_before_a_read_keep_both_batches(bridge, polled):
+    directory = Path(polled["lanes"]["helper"]).parent
+    published = delivery.mail_file(directory, "helper")
+    delivery.deliver(bridge.home, directory, "helper")
+    first = checkpoints.activity(directory, "helper")["batches"][0]["ids"]
+    send(bridge, polled, "helper", "second", "Second batch")
+    delivery.deliver(bridge.home, directory, "helper")
+
+    text = published.read_text()
+    assert SUBJECT in text and "Second batch" in text
+    assert text.index("## Batch 1,") < text.index("## Batch 2,")
+
+    mark(bridge, polled, first)
+    assert delivery.deliver(bridge.home, directory, "helper") == 0
+    text = published.read_text()
+    assert "## Batch 1," not in text and "Second batch" in text
+
+    later = checkpoints.activity(directory, "helper")["batches"][0]["ids"]
+    mark(bridge, polled, later)
+    delivery.deliver(bridge.home, directory, "helper")
+    assert not published.exists()
+
+
+def test_a_notice_only_batch_stays_until_the_lane_acts(
+    bridge, polled, monkeypatch
+):
+    directory = Path(polled["lanes"]["helper"]).parent
+    published = delivery.mail_file(directory, "helper")
+    delivery.deliver(bridge.home, directory, "helper")
+    mark(
+        bridge,
+        polled,
+        checkpoints.activity(directory, "helper")["batches"][0]["ids"],
+    )
+    offer = "Take over issue #7 from claude."
+    write_json(
+        directory / "helper-work.json", {"offer": {"id": "o7", "text": offer}}
+    )
+    monkeypatch.setattr(
+        delivery.supervision,
+        "readings",
+        lambda home, manifest: ({"helper": ["src/app.py"]}, {}),
+    )
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    send(bridge, polled, "helper", "later", "Later mail")
+
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+
+    text = published.read_text()
+    assert offer in text and "Later mail" in text
+    assert "Operator edit on a path you reserved: src/app.py" in text
+
+    name = roster.read(directory)["participants"]["helper"]["display"]
+    with sqlite3.connect(bridge.home / store.DATABASE) as db:
+        db.execute(
+            "UPDATE agents SET last_active_ts=datetime('now', '+5 seconds') "
+            "WHERE name=?",
+            (name,),
+        )
+    delivery.deliver(bridge.home, directory, "helper")
+    text = published.read_text()
+    assert offer not in text and "Later mail" in text
 
 
 def test_polled_delivery_orders_mail_by_relevance(bridge, polled):
@@ -76,6 +147,28 @@ def test_polled_delivery_shows_the_project_feed_once(bridge, polled):
     assert delivery.deliver(bridge.home, directory, "helper") == 0
 
 
+def test_polled_delivery_pages_a_long_feed(bridge, polled):
+    directory = Path(polled["lanes"]["helper"]).parent
+    delivery.deliver(bridge.home, directory, "helper")
+    send(bridge, polled, "helper", "merge-seed", "Merged #0 into main")
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    subjects = [f"Merged #{number} into main" for number in range(1, 6)]
+    for number, subject in enumerate(subjects):
+        send(bridge, polled, "helper", f"merge-{number}", subject)
+    with sqlite3.connect(bridge.home / store.DATABASE) as db:
+        db.execute("UPDATE messages SET topic=subject WHERE feed=1")
+
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    first = checkpoints.activity(directory, "helper")["batches"][-1]["text"]
+    assert delivery.deliver(bridge.home, directory, "helper") > 0
+    second = checkpoints.activity(directory, "helper")["batches"][-1]["text"]
+
+    assert all(subject in first for subject in subjects[:3])
+    assert "Project feed, newest first, 2 newer pending: " in first
+    assert all(subject in second for subject in subjects[3:])
+    assert delivery.deliver(bridge.home, directory, "helper") == 0
+
+
 def test_polled_delivery_names_owed_acknowledgements_once(bridge, polled):
     directory = Path(polled["lanes"]["helper"]).parent
     asked = send(bridge, polled, "helper", "ask", "Sign off", ack_required=True)
@@ -87,6 +180,32 @@ def test_polled_delivery_names_owed_acknowledgements_once(bridge, polled):
     text = delivery.mail_file(directory, "helper").read_text()
     assert f"Acknowledgements owed: message {asked['id']} from" in text
     assert delivery.deliver(bridge.home, directory, "helper") == 0
+
+
+def test_a_standing_reminder_is_injected_at_most_the_ceiling(bridge, polled):
+    lane = Path(polled["lanes"]["helper"])
+    directory = lane.parent
+    bridge.issue(lane, "claim", "1")
+    reminder = "Issue #1: pull request ended. helper, send a completion note."
+    shown = 0
+    for _ in range(checkpoints.MAX_NOTICE_REPEATS + 3):
+        ledger = issues.snapshot(directory)
+        ledger["issues"]["1"]["handoff_prompt"] = {
+            "id": "1:0:pull request ended",
+            "holder": "helper",
+            "trigger": "pull request ended",
+            "created": time.time(),
+            "text": reminder,
+        }
+        ledger["revision"] += 1
+        write_json(directory / "issues.json", ledger)
+        assert delivery.deliver(bridge.home, directory, "helper") > 0
+        batch = checkpoints.activity(directory, "helper")["batches"][-1]
+        shown += reminder in batch["text"]
+    assert shown == checkpoints.MAX_NOTICE_REPEATS
+    assert checkpoints.activity(directory, "helper")["notice_repeats"] == {
+        "1:0:pull request ended": checkpoints.MAX_NOTICE_REPEATS
+    }
 
 
 @pytest.fixture
@@ -171,6 +290,7 @@ def test_a_delivery_composed_from_a_moved_state_is_dropped(
 def test_a_second_message_is_delivered_after_the_first(bridge, polled):
     directory = Path(polled["lanes"]["helper"]).parent
     assert delivery.deliver(bridge.home, directory, "helper") > 0
+    mark(bridge, polled, [checkpoints.activity(directory, "helper")["cursor"]])
     send(bridge, polled, "helper", key="delivery-2")
     assert delivery.deliver(bridge.home, directory, "helper") > 0
     published = delivery.mail_file(directory, "helper")
@@ -210,7 +330,7 @@ def test_provider_inspection_names_the_delivery_path(bridge, polled):
     assert "canonical project identifier is an identity" in prompt
     assert str(delivery.mail_file(directory, "helper")) in prompt
     assert "Reading it is\nnot acknowledgement" in prompt
-    command = shlex.join([sys.executable, "-m", "agent_parley.cli"])
+    command = shlex.join([sys.executable, "-P", "-m", "agent_parley.cli"])
     assert f"`{command} issue claim NUMBER`" in prompt
     assert f"`{command} issue release NUMBER`" in prompt
     assert "`agent-parley issue" not in prompt

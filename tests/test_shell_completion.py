@@ -2,12 +2,15 @@
 
 import argparse
 import json
+import os
+import shlex
 import shutil
 import subprocess
+import sys
 
 import pytest
 
-from agent_parley import completion
+from agent_parley import cli, completion
 from agent_parley.state import lock, write_json
 
 
@@ -81,10 +84,10 @@ def test_the_walk_collects_flags_without_the_help_option():
 
 def test_state_backed_options_map_to_their_candidate_kind():
     values = completion.value_flags(parser())
-    assert values["--to"] == "participants"
-    assert values["--issue"] == "issues"
-    assert values["--repo"] == "projects"
-    assert "--json" not in values
+    assert values["say --to"] == "participants"
+    assert values["issue claim --issue"] == "issues"
+    assert values["issue claim --repo"] == "projects"
+    assert "say --json" not in values
 
 
 def test_every_shell_emits_a_script_naming_the_hidden_callback():
@@ -281,3 +284,129 @@ def test_providers_and_credentials_come_from_the_registry(bridge):
 def test_the_manifest_reader_tolerates_an_absent_projects_directory(bridge):
     assert completion.candidates(bridge.home, "participants") == []
     assert json.dumps(completion.candidates(bridge.home, "issues")) == "[]"
+
+
+def test_positionals_name_what_each_command_slot_accepts():
+    slots = completion.positionals(cli.root_parser(None)[0])
+    assert slots["say#0"] == "@participants"
+    assert "say#1" not in slots
+    assert slots["completion#0"] == "bash zsh fish"
+    assert slots["participant restart#0"] == "@participants"
+    assert slots["provider show#0"] == "@providers"
+    assert slots["credentials show#0"] == "@credentials"
+    assert "participant add#0" not in slots
+
+
+def test_the_credentials_option_completes_profiles():
+    values = completion.value_flags(cli.root_parser(None)[0])
+    assert values["run --credentials"] == "credentials"
+
+
+def test_value_options_include_home_but_not_switches():
+    taking = completion.value_options(cli.root_parser(None)[0])
+    assert "--home" in taking
+    assert "run --credentials" in taking
+    assert "status --json" not in taking
+
+
+def test_option_values_and_kinds_belong_to_their_own_command():
+    root = cli.root_parser(None)[0]
+    taking = completion.value_options(root)
+    values = completion.value_flags(root)
+    assert "deadlines set --ack" in taking
+    assert "say --ack" not in taking
+    assert values["issue offer --to"] == "participants"
+    assert "gc --to" not in values
+
+
+def offered(shell, script, line, environment):
+    """Runs one shell's generated completion for a typed command line."""
+    words = ["agent-parley", *line.split(), ""]
+    quoted = " ".join(shlex.quote(word) for word in words)
+    if shell == "bash":
+        command = [
+            "bash",
+            "-c",
+            f"source {script}; COMP_WORDS=({quoted}); "
+            f"COMP_CWORD={len(words) - 1}; _agent_parley; "
+            'printf "%s\\n" "${COMPREPLY[@]}"',
+        ]
+    elif shell == "zsh":
+        command = [
+            "zsh",
+            "-f",
+            "-c",
+            "compdef() { :; }; _files() { :; }; "
+            'compadd() { [[ $1 == -- ]] && shift; print -l -- "$@"; }; '
+            f"source {script}; words=({quoted}); CURRENT={len(words)}; "
+            "_agent_parley",
+        ]
+    else:
+        typed = shlex.quote(f"agent-parley {line} ")
+        command = [
+            "fish",
+            "--no-config",
+            "-c",
+            f"source {script}; complete -C {typed}",
+        ]
+    finished = subprocess.run(
+        command,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    return {row.split("\t")[0] for row in finished.stdout.splitlines()}
+
+
+@pytest.mark.parametrize("shell", completion.SHELLS)
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    (
+        ("say", {"claude-2"}),
+        ("participant restart", {"claude-2"}),
+        ("completion", {"bash", "zsh", "fish"}),
+        ("--home elsewhere participant", {"restart", "list", "show"}),
+        ("run claude --credentials", {"work"}),
+        ("say --ack", {"claude-2"}),
+    ),
+)
+def test_a_live_shell_completes_positionals_and_values(
+    bridge, tmp_path, monkeypatch, shell, line, expected
+):
+    assert expected <= live(bridge, tmp_path, shell, line)
+
+
+@pytest.mark.parametrize("shell", completion.SHELLS)
+def test_a_live_shell_offers_no_lanes_for_a_path_option(
+    bridge, tmp_path, shell
+):
+    found = live(bridge, tmp_path, shell, "gc --restore claude-2 --to")
+    assert "claude-2" not in found
+
+
+def live(bridge, tmp_path, shell, line):
+    """Runs the real program's completion in one shell for a typed line."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    project(bridge, "/tmp/one", ["claude-2"])
+    write_json(
+        bridge.home / "credentials.json",
+        {"version": 1, "entries": {"work": {"config_home": ""}}},
+    )
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    stub = tools / "agent-parley"
+    stub.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m agent_parley "$@"\n'
+    )
+    stub.chmod(0o755)
+    script = tmp_path / f"completion.{shell}"
+    script.write_text(completion.script(cli.root_parser(None)[0], shell))
+    environment = {
+        **os.environ,
+        "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+        "AGENT_PARLEY_HOME": str(bridge.home),
+    }
+    return offered(shell, script, line, environment)

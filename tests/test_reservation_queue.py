@@ -153,6 +153,43 @@ def test_a_release_grants_and_notifies_the_first_queued_lane(
     assert request(bridge, peer, "src/engine.py")["granted"]
 
 
+@pytest.mark.parametrize("scoped", [False, True])
+def test_a_transferred_key_settles_the_receivers_queued_request(
+    bridge, repo, paired, scoped
+):
+    holder = actor(bridge, paired["root"], "claude")
+    peer = actor(bridge, paired["root"], "codex")
+    reserve(bridge, holder, "a.txt")
+    request(bridge, peer, "a.txt")
+    if scoped:
+        with store.connect(bridge.home, write=True) as db:
+            db.execute(
+                "UPDATE file_reservations SET claim_id='c1' WHERE agent_id=?",
+                (holder["id"],),
+            )
+        moved = store.transfer_claim_reservations(
+            bridge.home, paired["root"], "claude", "codex", "c1", "c2"
+        )
+    else:
+        moved = store.transfer_reservations(
+            bridge.home, paired["root"], "claude", "codex", ["a.txt"]
+        )
+    assert moved == ["a.txt"]
+    with store.connect(bridge.home) as db:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM reservation_requests WHERE agent_id=? "
+                "AND granted_ts IS NULL AND cancelled_ts IS NULL",
+                (peer["id"],),
+            ).fetchone()[0]
+            == 0
+        )
+    release(bridge, peer)
+    reserve(bridge, holder, "a.txt")
+    assert release(bridge, holder)["granted"] == []
+    assert store.active_reservations(bridge.home, paired["root"]) == {}
+
+
 def test_the_grant_and_the_notice_share_the_release_transaction(
     bridge, repo, paired, monkeypatch
 ):
@@ -196,6 +233,38 @@ def test_only_the_first_queued_lane_takes_the_released_key(
             "position": 1,
         }
     ]
+
+
+def test_two_lanes_queue_in_order_for_a_branchs_merge_turn(
+    bridge, repo, paired
+):
+    key = "merge:integration/0.15.0"
+    holder = actor(bridge, paired["root"], "claude")
+    peer = actor(bridge, paired["root"], "codex")
+    reserve(bridge, holder, key, reason="rebase and gate before merging")
+    result = request(bridge, peer, key)
+    assert result["granted"] == []
+    assert result["queued"] == [
+        {
+            "id": result["queued"][0]["id"],
+            "path": key,
+            "owner": "claude",
+            "position": 1,
+        }
+    ]
+    released = release(bridge, holder)
+    assert released["granted"] == [
+        {
+            "agent": "codex",
+            "paths": [key],
+            "message_id": released["granted"][0]["message_id"],
+        }
+    ]
+    assert store.active_reservations(bridge.home, paired["root"]) == {
+        "codex": [key]
+    }
+    notice = inbox(bridge, peer)[0]
+    assert notice["subject"] == f"Reservation granted: {key}"
 
 
 def test_asking_again_keeps_the_first_request_and_its_place(
@@ -432,6 +501,68 @@ def test_a_checkpoint_releases_a_lease_whose_claim_is_closed(
         "Reservation released with its claim: src/engine.py"
     )
     assert "a claim you no longer hold" in told["body_md"]
+
+
+def claim_two(bridge, paired):
+    """Has claude claim issues 7 and 8 and returns both claim identifiers."""
+    lane = Path(paired["lanes"]["claude"])
+    seven = bridge.issue(lane, "claim", "7")["claim_id"]
+    eight = bridge.issue(lane, "claim", "8")["claim_id"]
+    assert seven and eight and seven != eight
+    return seven, eight
+
+
+def test_a_lease_under_an_older_still_held_claim_is_renewed(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    peer = actor(bridge, paired["root"], "codex")
+    seven, _ = claim_two(bridge, paired)
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=3600)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET claim_id=? WHERE agent_id=?",
+            (seven, holder["id"]),
+        )
+    request(bridge, peer, "src/engine.py")
+    expire(bridge, holder, 60)
+    hook(bridge, paired, "claude")
+    assert held(bridge, holder) == {"leases": 1, "expired": 0}
+    assert store.active_reservations(bridge.home, paired["root"]) == {
+        "claude": ["src/engine.py"]
+    }
+
+
+def test_a_handoff_of_one_claim_keeps_a_reservation_made_under_two(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    actor(bridge, paired["root"], "codex")
+    _, eight = claim_two(bridge, paired)
+    reserve(bridge, holder, "src/seven.py")
+    moved = store.transfer_claim_reservations(
+        bridge.home, paired["root"], "claude", "codex", eight, "next"
+    )
+    assert moved == []
+    assert store.active_reservations(bridge.home, paired["root"]) == {
+        "claude": ["src/seven.py"]
+    }
+
+
+def test_an_unreadable_ledger_renews_a_claimed_lease_instead_of_dropping(
+    bridge, repo, paired
+):
+    holder = actor(bridge, paired["root"], "claude")
+    reserve(bridge, holder, "src/engine.py", ttl_seconds=3600)
+    expire(bridge, holder, 60)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE file_reservations SET claim_id='issue-7' WHERE agent_id=?",
+            (holder["id"],),
+        )
+    (bridge.project(repo)[1] / "issues.json").write_text("{not json")
+    store.renew_reservations(bridge.home, paired["root"], "claude")
+    assert held(bridge, holder) == {"leases": 1, "expired": 0}
 
 
 def test_status_lists_an_expired_lease_apart_from_the_live_ones(

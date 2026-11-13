@@ -25,20 +25,25 @@ from mcp.client.streamable_http import streamable_http_client
 
 from agent_parley import (
     checkpoints,
+    claims,
     cli,
     dashboard,
     evidence,
     forge,
+    issues,
+    merges,
     metrics,
     process,
     records,
     roster,
     store,
+    supervision,
 )
 from agent_parley.checkpoints import (
     MAX_EVENT_LOG_AGE,
     MAX_EVENT_LOG_BYTES,
     branch_guard,
+    changes_lane_branch,
     checkpoint,
     event_summary,
     mailbox,
@@ -55,7 +60,7 @@ from agent_parley.cli import (
     main,
     write_json,
 )
-from agent_parley.issues import MAX_BLOCKERS, describe
+from agent_parley.issues import MAX_BLOCKERS, describe, merge_claim
 from agent_parley.merges import launch_busy
 from agent_parley.process import start_ticks
 from agent_parley.server import TOOLS
@@ -86,6 +91,19 @@ def test_isolation_identity_and_idempotent_setup(bridge, repo, paired):
         len(git(repo, "worktree", "list", "--porcelain").split("worktree "))
         == 4
     )
+
+
+def test_setup_refuses_a_repository_without_commits(bridge, tmp_path):
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    git(fresh, "init")
+    (fresh / "notes.txt").write_text("draft\n")
+    with pytest.raises(BridgeError, match="no commits yet") as raised:
+        bridge.setup(fresh)
+    assert "fatal" not in str(raised.value)
+    assert raised.value.next_command.startswith("git commit")
+    assert not list(bridge.home.rglob("project.json"))
+    assert (fresh / "notes.txt").read_text() == "draft\n"
 
 
 def test_dirty_source_is_preserved_as_a_stash_entry(bridge, repo, capsys):
@@ -190,7 +208,8 @@ def test_checkpoint_waits_for_a_short_activity_update(
 
 def test_public_state_directory_rejected(tmp_path):
     public = tmp_path / "public"
-    public.mkdir(mode=0o755)
+    public.mkdir()
+    public.chmod(0o755)
     with pytest.raises(BridgeError, match="private"):
         Bridge(public)
 
@@ -274,20 +293,36 @@ def test_ps_reader_reports_a_live_process_through_the_real_command():
     assert process.read_ps_field("args=", os.getpid()) != ""
 
 
+def test_ps_reader_prints_one_start_time_whatever_the_caller_timezone(
+    monkeypatch,
+):
+    readings = set()
+    for zone, locale in (("UTC0", "C"), ("IST-5:30", "en_US.UTF-8")):
+        monkeypatch.setenv("TZ", zone)
+        monkeypatch.setenv("LC_ALL", locale)
+        readings.add(process.read_ps_field("lstart=", os.getpid()))
+    assert len(readings) == 1
+    assert "" not in readings
+
+
 def test_process_platform_is_chosen_once_for_the_running_system():
     linux = process.platform_for("linux")
     assert linux.start_ticks is process.linux_start_ticks
     assert linux.foreground_pid is process.linux_foreground_pid
     assert linux.parent_pid is process.linux_parent_pid
     assert linux.running is process.linux_running
+    assert linux.zombie is process.linux_zombie
     assert linux.matches_command is process.linux_matches_command
     assert linux.terminate is process.linux_terminate
     darwin = process.platform_for("darwin")
     assert darwin.running is process.darwin_running
+    assert darwin.zombie.func is process.darwin_zombie
     assert darwin.start_ticks.func is process.darwin_start_ticks
     assert darwin.foreground_pid.func is process.darwin_foreground_pid
     assert darwin.parent_pid.func is process.darwin_parent_pid
     assert darwin.terminate.func is process.darwin_terminate
+    assert darwin.same_start.func is process.darwin_same_start
+    assert linux.same_start is process.linux_same_start
     with pytest.raises(BridgeError, match="Unsupported operating system"):
         process.platform_for("win32")
     assert process.running(os.getpid()) is True
@@ -304,6 +339,88 @@ def test_macos_hook_identifies_the_foreground_native_process(monkeypatch):
         native_pid, created
     )
     assert process.foreground_process(9999) is None
+
+
+def test_a_ps_call_that_times_out_leaves_a_live_process_unknown(monkeypatch):
+    pid = os.getpid()
+    created = process.read_ps_field("lstart=", pid)
+
+    def timed_out(*args, **named):
+        raise subprocess.TimeoutExpired(args[0], process.PS_TIMEOUT)
+
+    monkeypatch.setattr(process, "PLATFORM", process.darwin_platform())
+    assert process.alive_or_unknown(pid, created) is True
+    monkeypatch.setattr(process.subprocess, "run", timed_out)
+    with pytest.raises(process.IdentityUnknown):
+        process.read_ps_field("lstart=", pid)
+    assert process.alive_or_unknown(pid, created) is None
+    assert process.alive(pid, created) is False
+    monkeypatch.setattr(process, "darwin_running", lambda pid: False)
+    assert process.read_ps_field("lstart=", pid) == ""
+    assert process.alive_or_unknown(pid, created) is False
+
+
+def test_a_failed_ps_call_for_a_running_process_is_not_an_exit(monkeypatch):
+    failed = subprocess.CompletedProcess([], 1, "", "")
+    monkeypatch.setattr(process.subprocess, "run", lambda *a, **k: failed)
+    with pytest.raises(process.IdentityUnknown):
+        process.read_ps_field("lstart=", os.getpid())
+    with pytest.raises(process.IdentityUnknown):
+        process.darwin_start_ticks(lambda field, pid: "", os.getpid())
+    monkeypatch.setattr(process, "darwin_running", lambda pid: False)
+    assert process.read_ps_field("lstart=", os.getpid()) == ""
+    with pytest.raises(ProcessLookupError):
+        process.darwin_start_ticks(lambda field, pid: "", os.getpid())
+
+
+def test_macos_finds_native_clients_working_inside_a_lane(
+    monkeypatch, tmp_path
+):
+    lane = (tmp_path / "lane").resolve()
+    (lane / "sub").mkdir(parents=True)
+    listing = "".join(
+        f"p{pid}\nfcwd\nn{path}\n"
+        for pid, path in (
+            (101, lane),
+            (102, lane / "sub"),
+            (103, tmp_path.resolve() / "other"),
+            (104, lane),
+        )
+    )
+    created = "Wed Sep 10 11:22:33 2026"
+    reader = macos_ps(
+        dict.fromkeys((101, 102, 103, 104), created),
+        {
+            101: "claude --resume abc",
+            102: "node /opt/bin/claude",
+            103: "claude",
+            104: "-zsh",
+        },
+    )
+    monkeypatch.setattr(os, "kill", lambda pid, number: None)
+    monkeypatch.setattr(
+        process,
+        "PLATFORM",
+        process.darwin_platform(reader, reader, lambda: listing),
+    )
+    assert process.cwd_pids(lane) == [101, 102, 104]
+    assert process.PLATFORM.worktree_clients(lane, "claude") == [101, 102]
+    assert process.worktree_client(lane, "claude").pid in {101, 102}
+
+
+def test_macos_reports_unknown_when_lsof_cannot_list_cwds(monkeypatch):
+    def missing(*args, **named):
+        raise FileNotFoundError("lsof")
+
+    monkeypatch.setattr(process.subprocess, "run", missing)
+    with pytest.raises(process.IdentityUnknown):
+        process.read_lsof_cwds()
+    darwin = process.darwin_platform()
+    assert darwin.cwd_pids(Path("/")) is None
+    assert darwin.worktree_clients(Path("/"), "claude") == []
+    partial = subprocess.CompletedProcess([], 1, "p7\nfcwd\nn/x\n", "")
+    monkeypatch.setattr(process.subprocess, "run", lambda *a, **k: partial)
+    assert process.parse_lsof_cwds(process.read_lsof_cwds()) == {7: Path("/x")}
 
 
 @contextlib.contextmanager
@@ -381,6 +498,46 @@ def test_macos_identity_pins_the_recorded_creation_time(monkeypatch, tmp_path):
     assert process.identify(record, tmp_path / "other") is None
 
 
+def test_macos_identity_accepts_a_creation_time_recorded_in_local_time(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "private state"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    universal = "Thu Sep 10 07:22:33 2026"
+    local = "jeu 10 sep 11:22:33 2026"
+    other = "Wed Sep  9 07:22:33 2026"
+    reader = macos_ps(
+        {child.pid: universal},
+        {child.pid: f"/usr/bin/python3 -m agent_parley.server --home {home}"},
+    )
+    local_reader = macos_ps({child.pid: local}, {})
+    monkeypatch.setattr(
+        process, "PLATFORM", process.darwin_platform(reader, local_reader)
+    )
+    try:
+        assert process.alive(child.pid, universal) is True
+        assert process.alive(child.pid, local) is True
+        assert process.alive(child.pid, other) is False
+        assert process.identify(
+            {"pid": child.pid, "start_ticks": local}, home
+        ) == process.ServerProcess(child.pid, universal)
+        with pytest.raises(BridgeError, match="PID changed"):
+            process.ServerProcess(child.pid, other).stop()
+        assert child.poll() is None
+        process.ServerProcess(child.pid, local).stop()
+        child.wait(timeout=5)
+        assert child.poll() is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
 def test_macos_liveness_separates_a_missing_process_from_a_foreign_one(
     monkeypatch, tmp_path
 ):
@@ -424,6 +581,32 @@ def test_macos_shutdown_signals_only_the_recorded_process(monkeypatch):
             child.wait(timeout=5)
 
 
+def test_a_zombie_session_process_is_not_alive():
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys, time;"
+            "child = subprocess.Popen(['sleep', '60']);"
+            "print(child.pid, flush=True);"
+            "time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert parent.stdout is not None
+        pid = int(parent.stdout.readline())
+        ticks = process.start_ticks(pid)
+        assert process.darwin_zombie(process.read_ps_field, pid) is False
+        process.ServerProcess(pid, ticks).stop()
+        assert process.alive(pid, ticks) is False
+        assert process.darwin_zombie(process.read_ps_field, pid) is True
+    finally:
+        parent.kill()
+        parent.wait(timeout=5)
+
+
 def test_changed_lane_branch_is_rejected_without_resetting(
     bridge, repo, paired
 ):
@@ -442,6 +625,7 @@ def test_changed_lane_branch_is_rejected_without_resetting(
         "git branch -m personal-work",
         "git symbolic-ref HEAD refs/heads/personal-work",
         "gh pr checkout 42",
+        "git fetch -q\ngit checkout -b personal-work",
     ],
 )
 def test_native_hook_blocks_bridge_lane_branch_changes(
@@ -458,6 +642,151 @@ def test_native_hook_blocks_bridge_lane_branch_changes(
     result = checkpoint(bridge.home, lane.parent, "codex", payload)
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert git(lane, "branch", "--show-current") == data["branches"]["codex"]
+
+
+def branch_payload(lane, command, cwd=None):
+    """Builds a native shell payload for the lane branch gate."""
+    return {
+        "hook_event_name": "PreToolUse",
+        "cwd": str(cwd or lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(git switch other)",
+        "{ git switch other; }",
+        "if true; then git switch other; fi",
+        "bash -c 'git switch other'",
+        "sh -ec 'git switch other'",
+        "eval git switch other",
+        "env git switch other",
+        "env -i PATH=/bin git switch other",
+        "env -S 'git switch other'",
+        "timeout 5 git switch other",
+        "timeout -s KILL 5 git switch other",
+        "nice -n 5 git switch other",
+        "nohup git switch other",
+        "exec git switch other",
+        "echo $(git switch other)",
+        'echo "$(git switch other)"',
+        "echo `git switch other`",
+        "! git switch other",
+        "time git switch other",
+        "echo other | xargs git switch",
+        "git -c alias.sw=switch sw other",
+        "git -c 'alias.sw=!git switch' sw other",
+        "for b in other; do git switch $b; done",
+        "while true; do git switch other; done",
+        "git checkout main",
+        "git checkout -b n",
+        "git checkout -",
+        "git checkout main --",
+        "git checkout --detach",
+    ],
+)
+def test_a_wrapped_branch_switch_is_refused(paired, command):
+    lane = Path(paired["lanes"]["codex"])
+    assert changes_lane_branch(branch_payload(lane, command), lane)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo 'git switch x'",
+        "echo '$(git switch x)'",
+        "git log --grep=switch",
+        "git log --grep switch",
+        "printf '%s' \"git switch x\"",
+        "git checkout .",
+        "git checkout a.py",
+        "git checkout HEAD -- a.py",
+        "git checkout -- a.py",
+        "git checkout -p",
+        "git checkout --patch HEAD",
+        "git checkout main a.py b.py",
+        "git checkout tracked.txt",
+    ],
+)
+def test_a_file_restore_or_plain_text_passes_the_branch_gate(paired, command):
+    lane = Path(paired["lanes"]["codex"])
+    (lane / "a.py").write_text("x\n")
+    git(lane, "add", "a.py")
+    tracked = lane / "tracked.txt"
+    tracked.write_text("x\n")
+    git(lane, "add", "tracked.txt")
+    tracked.unlink()
+    assert not changes_lane_branch(branch_payload(lane, command), lane)
+
+
+@pytest.mark.parametrize(
+    "command", ["git checkout notes", "git checkout notes --"]
+)
+def test_a_name_that_is_both_a_branch_and_a_path_switches(paired, command):
+    lane = Path(paired["lanes"]["codex"])
+    git(lane, "branch", "notes")
+    (lane / "notes").mkdir()
+    (lane / "notes" / "draft.txt").write_text("x\n")
+    assert changes_lane_branch(branch_payload(lane, command), lane)
+    git(lane, *shlex.split(command)[1:])
+    assert git(lane, "branch", "--show-current") == "notes"
+
+
+def test_a_detached_lane_can_recreate_its_deleted_branch(paired):
+    lane = Path(paired["lanes"]["codex"])
+    expected = paired["branches"]["codex"]
+    head = git(lane, "rev-parse", "HEAD")
+    git(lane, "switch", "--detach")
+    git(lane, "branch", "-D", expected)
+    payload = branch_payload(lane, "git status")
+    denied, reason = branch_guard("PreToolUse", payload, lane, expected)
+    assert reason == "branch_drift"
+    assert f"git switch -c {expected}" in str(denied)
+    for command in (
+        "git switch -c elsewhere",
+        f"git switch -C {expected}",
+    ):
+        payload["tool_input"]["command"] = command
+        assert branch_guard("PreToolUse", payload, lane, expected)[1] == (
+            "branch_drift"
+        )
+    for command in (
+        f"git switch -c {expected}",
+        f"git switch --create {expected}",
+        f"git checkout -b {expected}",
+    ):
+        payload["tool_input"]["command"] = command
+        assert branch_guard("PreToolUse", payload, lane, expected) == (
+            None,
+            "branch_restore",
+        )
+    git(lane, "switch", "-c", expected)
+    assert git(lane, "branch", "--show-current") == expected
+    assert git(lane, "rev-parse", "HEAD") == head
+
+
+def test_branch_head_ignores_a_tag_of_the_same_name(paired):
+    lane = Path(paired["lanes"]["codex"])
+    expected = paired["branches"]["codex"]
+    git(lane, "tag", expected)
+    (lane / "later.txt").write_text("later\n")
+    commit(lane, "Later work")
+    head = git(lane, "rev-parse", f"refs/heads/{expected}")
+    assert git(lane, "rev-parse", f"refs/tags/{expected}") != head
+    assert checkpoints.branch_head(lane, expected) == head
+
+
+def test_a_leading_cd_moves_the_branch_gate_out_of_the_lane(paired, tmp_path):
+    lane = Path(paired["lanes"]["codex"])
+    elsewhere = f"cd {tmp_path} && git switch x"
+    assert not changes_lane_branch(branch_payload(lane, elsewhere), lane)
+    back = f"cd {tmp_path} && cd {lane} && git switch x"
+    assert changes_lane_branch(branch_payload(lane, back), lane)
+    unknown = "cd $SOMEWHERE && git switch x"
+    assert changes_lane_branch(branch_payload(lane, unknown), lane)
 
 
 def test_native_hook_blocks_drift_until_exact_restore(bridge, repo, paired):
@@ -841,6 +1170,8 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
     executable.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        " sys.exit(print('9.9.9 (fake client)'))\n"
         "with open(os.environ['CAPTURE'], 'w') as f:\n"
         " json.dump({'argv': sys.argv[1:], 'cwd': os.getcwd(), "
         "'has_token': bool(os.environ.get('AGENT_PARLEY_TOKEN'))}, f)\n"
@@ -859,6 +1190,11 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
     assert bridge.launch(agent, repo, task) == 0
     result = json.loads(capture.read_text())
     assert result["cwd"] == bridge.setup(repo)["lanes"][agent]
+    state = json.loads(
+        (Path(result["cwd"]).parent / f"{agent}-activity.json").read_text()
+    )
+    assert state["client"] == agent
+    assert state["client_version"] == "9.9.9 (fake client)"
     assert result["has_token"]
     assert task in result["argv"][-1]
     assert bridge.config["token"] not in json.dumps(result)
@@ -882,7 +1218,63 @@ def test_native_launch_preserves_task_and_passes_shared_configuration(
         parsed = tomllib.loads("\n".join(overrides))
         assert "PreToolUse" in parsed["hooks"]
         assert "SessionEnd" in parsed["hooks"]
+        assert "default_tools_approval_mode" not in " ".join(result["argv"])
     assert "bypass" not in " ".join(result["argv"])
+
+
+@pytest.mark.parametrize(
+    ("version", "approved"),
+    [
+        ("codex-cli 0.153.0", True),
+        ("codex-cli 0.200.1", True),
+        ("codex-cli 0.152.9", False),
+        ("", False),
+    ],
+)
+def test_an_opted_in_codex_lane_approves_only_the_bridge_server(
+    bridge, repo, monkeypatch, tmp_path, capsys, version, approved
+):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / "codex"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        " sys.exit(print(os.environ['VERSION']) if os.environ['VERSION'] "
+        "else 1)\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        " json.dump(sys.argv[1:], f)\n"
+    )
+    executable.chmod(0o755)
+    capture = tmp_path / "capture.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("VERSION", version)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def fake_identity(*args):
+        return {"registration_token": "test-scoped-credential"}
+
+    monkeypatch.setattr(bridge, "identity", fake_identity)
+    bridge.add_participant(repo, "codex", "codex", None)
+    bridge.resume_opt_in(repo, participant="codex", bridge_tools=True)
+    capsys.readouterr()
+    assert bridge.launch("codex", repo, "Coordinate") == 0
+    argv = json.loads(capture.read_text())
+    overrides = [arg for arg in argv if "approval_mode" in arg]
+    if approved:
+        assert overrides == [
+            'mcp_servers.agent_parley.default_tools_approval_mode="approve"'
+        ]
+        assert "predates" not in capsys.readouterr().err
+    else:
+        assert overrides == []
+        assert "codex lane with a bridge tool approval recorded" in (
+            capsys.readouterr().err
+        )
+    assert "bypass" not in " ".join(argv)
+    assert "approval_policy" not in " ".join(argv)
 
 
 def test_mcp_two_clients_conflict_handoff_auth_and_restart(
@@ -1146,6 +1538,23 @@ def test_reports_require_remaining_work_or_verification(bridge, repo, paired):
     assert state["remaining"] == "CLI integration missing"
 
 
+def test_a_waiting_report_declares_a_wait_instead_of_a_claim_phase(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    with pytest.raises(BridgeError, match="seconds"):
+        bridge.report(lane, "waiting", "3 background jobs", "", "")
+
+    bridge.report(lane, "waiting", "3 background jobs", "", "", until=900)
+
+    directory = bridge.project(repo)[1]
+    published = supervision.published_wait(directory, "claude")
+    assert published["reason"] == "3 background jobs"
+    assert published["until"] <= time.time() + 900
+    state = json.loads((directory / "claude-activity.json").read_text())
+    assert state["outcome"] == "waiting"
+
+
 def test_liveness_follows_the_session_process_not_the_session_lock(
     bridge, repo, paired, capsys
 ):
@@ -1221,7 +1630,7 @@ def test_top_reports_every_participant_and_writes_no_state(
     dashboard.run(bridge.home, lambda: False, once=True)
     output = capsys.readouterr().out
     assert "agent-parley top - " in output
-    assert "server not running" in output
+    assert "service not running" in output
     assert "0 denied (0%)" in output
     assert "#77" in output
     assert "Wire the dashboard" in output
@@ -1733,7 +2142,33 @@ def test_forge_slug_reads_github_remotes_and_ignores_everything_else(repo):
     assert forge.slug(repo) == "owner/name"
     git(repo, "remote", "set-url", "origin", "https://github.com/owner/name")
     assert forge.slug(repo) == "owner/name"
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        "https://user@github.com/owner/name.git",
+    )
+    assert forge.slug(repo) == "owner/name"
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        "ssh://git@ssh.github.com:443/owner/name.git",
+    )
+    assert forge.slug(repo) == "owner/name"
+    git(repo, "remote", "set-url", "origin", "https://GitHub.com/owner/name")
+    assert forge.slug(repo) == "owner/name"
     git(repo, "remote", "set-url", "origin", "git@example.com:owner/name.git")
+    assert forge.slug(repo) is None
+    git(
+        repo,
+        "remote",
+        "set-url",
+        "origin",
+        "https://user@gitlab.com/owner/name.git",
+    )
     assert forge.slug(repo) is None
 
 
@@ -1892,6 +2327,90 @@ def test_a_release_keeps_an_assignee_the_claim_did_not_add(
     assert mirrored == [("assign", "568")]
 
 
+def test_an_unread_assignee_is_never_taken_over_or_later_removed(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    mirrored = []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assigned", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign",
+        lambda directory, number: not mirrored.append(("assign", number)),
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.unassign",
+        lambda directory, number: not mirrored.append(("unassign", number)),
+    )
+    bridge.issue(claude, "claim", "568")
+    bridge.issue(claude, "release", "568")
+    assert mirrored == []
+
+
+def test_a_failed_unassign_keeps_its_mark_until_a_poll_removes_it(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    directory = bridge.project(repo)[1]
+    answers = [False]
+    mirrored = []
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assigned", lambda directory, number: False
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.assign", lambda directory, number: True
+    )
+
+    def unassign(directory, number):
+        mirrored.append(number)
+        return answers[-1]
+
+    monkeypatch.setattr("agent_parley.cli.forge.unassign", unassign)
+    bridge.issue(claude, "claim", "610")
+    bridge.issue(claude, "release", "610")
+    marks = directory / claims.FORGE_MARKS
+    assert json.loads(marks.read_text()) == {"610": True}
+    bridge.issue(claude, "claim", "611")
+    answers.append(True)
+    supervision.release_forge_marks(directory, roster.read(directory))
+    assert mirrored == ["610", "610"]
+    assert json.loads(marks.read_text()) == {"611": True}
+
+
+def test_claiming_an_issue_someone_else_holds_names_them_instead(
+    bridge, repo, paired, monkeypatch
+):
+    claude = Path(paired["lanes"]["claude"])
+    directory = bridge.project(repo)[1]
+    write_json(
+        directory / supervision.FORGE_ISSUES,
+        {
+            "read_at": time.time(),
+            "login": "operator",
+            "issues": {"612": {"title": "Theirs", "assignees": ["teammate"]}},
+        },
+    )
+    monkeypatch.setattr(
+        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+    )
+
+    def refuse(directory, number):
+        raise AssertionError("someone else's issue is never co-assigned")
+
+    monkeypatch.setattr("agent_parley.cli.forge.assigned", refuse)
+    monkeypatch.setattr("agent_parley.cli.forge.assign", refuse)
+    record = bridge.issue(claude, "claim", "612")
+    assert record["owner"] == "claude"
+    assert record["forge_assignees"] == ["teammate"]
+
+
 def test_a_report_requires_one_claim_and_comments_on_that_issue(
     bridge, repo, paired, monkeypatch
 ):
@@ -1910,8 +2429,11 @@ def test_a_report_requires_one_claim_and_comments_on_that_issue(
     bridge.issue(claude, "claim", "432")
     bridge.issue(claude, "claim", "433")
 
-    with pytest.raises(BridgeError, match="owns multiple issues"):
+    with pytest.raises(
+        BridgeError, match=r"owns multiple issues \(#432, #433\)"
+    ) as refused:
         bridge.report(claude, "partial", "Halfway", "More to do", "")
+    assert "--issue 432" in str(refused.value)
 
     bridge.report(
         claude,
@@ -1936,8 +2458,8 @@ def test_a_report_requires_one_claim_and_comments_on_that_issue(
     assert "claude" not in posted[0][1]
     assert "make check passed" in posted[0][1]
     assert "neither review nor independent verification" in posted[0][1]
-    with pytest.raises(BridgeError, match="owns multiple issues"):
-        bridge.merge(repo, "claude")
+    directory = bridge.project(repo)[1]
+    assert merge_claim(directory, "claude")["issue"] == 432
 
     bridge.report(
         claude,
@@ -2063,10 +2585,22 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
     metadata = tomllib.loads((project / "pyproject.toml").read_text())
     version = metadata["project"]["version"]
     stem = metadata["project"]["name"].replace("-", "_")
-    wheel = project / "dist" / f"{stem}-{version}-py3-none-any.whl"
-    assert wheel.exists(), "Run make build before the installed-package test."
+    dist = tmp_path / "dist"
+    subprocess.run(
+        ["uv", "build", "--no-sources", "--out-dir", str(dist)],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    wheel = dist / f"{stem}-{version}-py3-none-any.whl"
     with zipfile.ZipFile(wheel) as archive:
         assert "agent_parley/__main__.py" in archive.namelist()
+        assert (
+            "agent_parley/plugins/agent-parley/skills/coordinate/SKILL.md"
+            in archive.namelist()
+        )
         for client in ("claude", "codex"):
             manifest = archive.read(
                 f"agent_parley/plugins/agent-parley/"
@@ -2078,7 +2612,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
         ).decode()
         assert "Requires-Dist:" not in package_metadata
         assert not any(name.startswith("src/") for name in archive.namelist())
-    with tarfile.open(project / "dist" / f"{stem}-{version}.tar.gz") as archive:
+    with tarfile.open(dist / f"{stem}-{version}.tar.gz") as archive:
         root = f"{stem}-{version}"
         for client in ("codex", "claude"):
             manifest_path = (
@@ -2163,11 +2697,11 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             check=True,
             timeout=10,
         )
-        assert "Server: ready" in health.stdout
+        assert "Service: running" in health.stdout
         report = subprocess.run(
             [str(executable), "doctor"],
             cwd=tmp_path,
-            env=environment,
+            env={**environment, "HOME": str(tmp_path / "doctor-home")},
             capture_output=True,
             text=True,
             check=False,
@@ -2205,7 +2739,7 @@ def test_built_wheel_installs_and_coordinates_outside_checkout(tmp_path, repo):
             timeout=30,
         )
     result = subprocess.run(
-        [str(executable), "setup", str(repo)],
+        [str(executable), "setup", str(repo), "--json"],
         cwd=tmp_path,
         env=environment,
         capture_output=True,
@@ -2340,7 +2874,7 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
     )
     captured = json.loads((tmp_path / "capture.json").read_text())
     assert captured["home"] == str(account)
-    assert captured["argv"][0] == "-p"
+    assert captured["argv"][0] == "-i"
     assert "Work on issue 42" in captured["argv"][1]
     assert not [flag for flag in captured["argv"] if flag.startswith("--al")]
 
@@ -2358,6 +2892,38 @@ def test_a_copilot_lane_configures_only_its_own_client_home(
     assert hook["timeoutSec"] == 3
     assert bridge_hook(hook["bash"])
     assert hook["bash"].endswith("--adapter copilot")
+
+
+@pytest.mark.parametrize(
+    "provider,home_env",
+    [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")],
+)
+def test_a_default_account_lane_ignores_an_exported_config_home(
+    bridge, repo, monkeypatch, tmp_path, provider, home_env
+):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    executable = binary / provider
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "with open(os.environ['CAPTURE'], 'w') as f:\n"
+        f" json.dump({{'home': os.environ.get({home_env!r})}}, f)\n"
+    )
+    executable.chmod(0o755)
+    capture = tmp_path / "capture.json"
+    monkeypatch.setenv("CAPTURE", str(capture))
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv(home_env, str(tmp_path / "other-account"))
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    store.initialize(bridge.home)
+    assert bridge.launch("helper", repo, "Work on issue 7", provider) == 0
+    assert json.loads(capture.read_text()) == {"home": None}
+    roster.define_credential(
+        bridge.home, "second", str(tmp_path / "second"), [], []
+    )
+    assert bridge.launch("other", repo, "Work", provider, "second") == 0
+    assert json.loads(capture.read_text()) == {"home": str(tmp_path / "second")}
 
 
 def test_provider_definitions_never_store_credential_values(
@@ -2617,6 +3183,38 @@ def test_retire_removes_a_lane_and_revokes_its_credential(bridge, repo, paired):
     readded = bridge.add_participant(repo, "codex", "codex")
     assert Path(readded["lanes"]["codex"]).exists()
     assert event_summary(lane.parent, "codex")["events"] == 0
+
+
+def test_retire_releases_the_lanes_reservations_and_claims(
+    bridge, repo, paired
+):
+    _, directory = bridge.project(repo)
+    data = json.loads((directory / "project.json").read_text())
+    store.initialize(bridge.home)
+    actors = {}
+    for name in ("claude", "codex"):
+        display = data["participants"][name]["display"]
+        token = store.register(bridge.home, data["root"], display)[
+            "registration_token"
+        ]
+        actors[name] = store.authenticate(bridge.home, token)
+    claude, codex = actors["claude"], actors["codex"]
+    held = store.call(
+        bridge.home, claude, "file_reservation_paths", {"paths": ["shared.txt"]}
+    )
+    assert held["granted"]
+    queued = store.call(
+        bridge.home, codex, "request_reservation", {"paths": ["shared.txt"]}
+    )
+    assert not queued.get("granted")
+    issues.change(
+        directory, "claude", "claim", "7", participants={"claude", "codex"}
+    )
+    bridge.retire(repo, "claude")
+    active = store.active_reservations(bridge.home, data["root"])
+    assert claude["name"] not in active
+    assert active[codex["name"]] == ["shared.txt"]
+    assert issues.snapshot(directory)["issues"]["7"]["owner"] is None
 
 
 def test_retire_keeps_a_branch_that_still_holds_commits(bridge, repo, paired):
@@ -2969,9 +3567,43 @@ def test_merge_integrates_a_lane_branch_and_leaves_the_lane_alone(
     )
 
 
-def test_merge_leaves_a_conflict_resolvable_without_discarding(
+def test_a_predicted_conflict_is_refused_before_the_base_is_touched(
     bridge, repo, paired
 ):
+    lane = Path(paired["lanes"]["codex"])
+    branch = paired["branches"]["codex"]
+    identify(repo)
+    (lane / "shared.txt").write_text("lane version\n")
+    commit(lane, "Lane edit")
+    (repo / "shared.txt").write_text("base version\n")
+    commit(repo, "Base edit")
+    head = git(repo, "rev-parse", "HEAD")
+    git_dir = Path(
+        git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+
+    report = bridge.preview_merge(repo, "codex")
+    assert f"- Merging {branch} would conflict in: shared.txt." in report
+    with pytest.raises(BridgeError, match="would conflict in: shared.txt"):
+        bridge.merge(repo, "codex")
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert not (git_dir / "MERGE_HEAD").exists()
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_a_git_without_merge_tree_predicts_nothing(monkeypatch, tmp_path):
+    def usage(arguments, **options):
+        return subprocess.CompletedProcess(arguments, 129, "", "usage")
+
+    monkeypatch.setattr(merges.subprocess, "run", usage)
+    assert merges.predicted_conflicts(tmp_path, "HEAD", "lane") is None
+    assert merges.run_conflicts(tmp_path, [("codex", "lane")]) is None
+
+
+def test_merge_leaves_a_conflict_resolvable_without_discarding(
+    bridge, repo, paired, monkeypatch
+):
+    monkeypatch.setattr(merges, "predicted_conflicts", lambda *args: None)
     lane = Path(paired["lanes"]["codex"])
     identify(repo)
     (lane / "shared.txt").write_text("lane version\n")
@@ -3012,7 +3644,7 @@ def test_preview_reports_pending_work_and_leaves_the_base_untouched(
     assert "Lane work" in report
     assert "feature.txt" in report
     assert f"Nothing refuses this merge; it would land on {base}." in report
-    assert "cannot predict conflicts" in report
+    assert "It merges cleanly." in report
     assert "would be refused" not in report
 
     assert git(repo, "rev-parse", "HEAD") == head
@@ -3063,8 +3695,9 @@ def test_preview_gathers_every_blocking_condition_in_one_report(
 
 
 def test_preview_reports_a_merge_in_progress_a_drift_and_a_missing_branch(
-    bridge, repo, paired
+    bridge, repo, paired, monkeypatch
 ):
+    monkeypatch.setattr(merges, "predicted_conflicts", lambda *args: None)
     lane = Path(paired["lanes"]["codex"])
     branch = paired["branches"]["codex"]
     identify(repo)
@@ -3530,8 +4163,11 @@ def test_mail_commands_read_the_lane_participants_own_thread_and_search(
     found = bridge.mail(lane, "search", query="reservation")
     assert [row["id"] for row in found["messages"]] == [sent["id"]]
     assert bridge.mail(lane, "search", query="unrelated")["messages"] == []
-    with pytest.raises(BridgeError, match="assigned agent worktree"):
+    with pytest.raises(BridgeError, match="with --as NAME") as main_checkout:
         bridge.mail(repo, "thread", thread=sent["thread_id"])
+    assert main_checkout.value.next_command == (
+        "agent-parley mail list --as claude"
+    )
     before = mailbox(bridge.home, paired["root"], identities["codex"])["unread"]
     named = bridge.mail(
         repo, "thread", thread=sent["thread_id"], participant="codex"

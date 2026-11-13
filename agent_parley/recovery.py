@@ -19,6 +19,7 @@ CAPTURE_INTERVAL = 30
 GIT_SECONDS = 30
 MAX_STEP_BYTES = 400
 RECOVERY_FOLDER = "recovery"
+TEMPORARY_REF_NAMESPACE = "refs/agent-parley-recovery/"
 
 
 def _git(
@@ -287,14 +288,64 @@ def _require_dead(activity: dict, issue: str, owner: str) -> None:
         )
 
 
+def _lane_scope(lane: Path) -> str:
+    """Returns a path-safe token scoping one worktree's temporary refs.
+
+    Every lane is a linked worktree of one shared repository (`git
+    worktree add`), so a ref created under `TEMPORARY_REF_NAMESPACE` in
+    one lane is visible, and deletable, from every sibling lane sharing
+    that repository. Scoping the namespace by the lane's own resolved
+    path keeps one lane's publish or sweep from ever touching a sibling
+    lane's ref.
+
+    Args:
+        lane: Worktree to scope.
+
+    Returns:
+        A 16-character hex token derived from the lane's resolved path.
+    """
+    return hashlib.sha256(str(lane.resolve()).encode()).hexdigest()[:16]
+
+
+def _reclaim_temporary_refs(lane: Path) -> None:
+    """Deletes recovery refs a killed capture left behind in this lane.
+
+    ``_publish_bundle`` always removes its temporary ref before returning,
+    so any ref still under this lane's scoped prefix here was orphaned by
+    a process that died between its ``update-ref`` and that cleanup. The
+    caller holds this lane's capture lock, so no other capture of this
+    lane can be publishing one right now, and every surviving ref under
+    its own prefix is stale. The sweep never reaches past that prefix, so
+    a sibling lane's in-flight ref, live in the same shared repository, is
+    never touched. Coordination state belongs outside the target
+    repository; this keeps an orphaned ref from lingering there past the
+    next capture of the same lane.
+
+    Args:
+        lane: Assigned worktree to sweep.
+    """
+    prefix = f"{TEMPORARY_REF_NAMESPACE}{_lane_scope(lane)}/"
+    listing = _text(lane, "for-each-ref", "--format=%(refname)", prefix)
+    for name in listing.splitlines():
+        if name:
+            _git(lane, "update-ref", "-d", name)
+
+
 def _publish_bundle(
     lane: Path,
     destination: Path,
     reference: str,
     commit: str,
 ) -> tuple[int, str]:
-    """Publishes one fsynced bundle and removes its temporary Git ref."""
-    temporary_ref = f"refs/agent-parley-recovery/{reference}"
+    """Publishes one fsynced bundle and removes its temporary Git ref.
+
+    The temporary ref is scoped under the lane's own resolved path
+    (`_lane_scope`) because every lane is a linked worktree sharing one
+    repository's refs; an unscoped name would let one lane's cleanup or
+    reclaim delete a sibling lane's ref still between its own
+    ``update-ref`` and ``bundle create``.
+    """
+    temporary_ref = f"{TEMPORARY_REF_NAMESPACE}{_lane_scope(lane)}/{reference}"
     _git(lane, "update-ref", temporary_ref, commit)
     descriptor, temporary_name = tempfile.mkstemp(dir=destination.parent)
     os.close(descriptor)
@@ -321,28 +372,36 @@ def _publish_bundle(
     return size, digest
 
 
+def gate_evidence(payload: dict) -> dict:
+    """Returns bounded gate evidence from a native event.
+
+    Args:
+        payload: Native lifecycle event.
+
+    Returns:
+        The gate command, its exit code and the time it was read, or an
+        empty dict when the event ran no recognized gate command.
+    """
+    command = str((payload.get("tool_input") or {}).get("cmd") or "")
+    if not re.search(r"\b(pytest|mypy|ruff)\b|\bmake\s+check\b", command):
+        return {}
+    response = payload.get("tool_response") or {}
+    return {
+        "command": command.encode()[:MAX_STEP_BYTES].decode(errors="ignore"),
+        "exit_code": (
+            response.get("exit_code") if isinstance(response, dict) else None
+        ),
+        "observed_at": time.time(),
+    }
+
+
 def _step(payload: dict) -> tuple[str, dict]:
     """Returns bounded last-step and gate evidence from a native event."""
     event = str(payload.get("hook_event_name") or "")
     tool = str(payload.get("tool_name") or "")
     step = ": ".join(item for item in (event, tool) if item)
     step = step.encode()[:MAX_STEP_BYTES].decode(errors="ignore")
-    command = str((payload.get("tool_input") or {}).get("cmd") or "")
-    gate: dict = {}
-    if re.search(r"\b(pytest|mypy|ruff)\b|\bmake\s+check\b", command):
-        response = payload.get("tool_response") or {}
-        gate = {
-            "command": command.encode()[:MAX_STEP_BYTES].decode(
-                errors="ignore"
-            ),
-            "exit_code": (
-                response.get("exit_code")
-                if isinstance(response, dict)
-                else None
-            ),
-            "observed_at": time.time(),
-        }
-    return step, gate
+    return step, gate_evidence(payload)
 
 
 def capture(
@@ -350,6 +409,43 @@ def capture(
     manifest: dict,
     agent: str,
     payload: dict | None = None,
+    evidence: dict | None = None,
+) -> list[dict]:
+    """Captures every claim owned by one lane under the lane's capture lock.
+
+    The capture runs Git over the whole worktree and can take seconds, so
+    it holds ``<lane>-capture.lock`` rather than ``<lane>-checkpoint.lock``.
+    Hook decisions wait on the checkpoint lock for at most one second, and
+    a capture held under it answered them without coordination. The
+    capture lock serializes captures of one lane, which share the lane's
+    temporary Git refs, bundles and checkpoint records. A caller that
+    also holds the checkpoint lock takes it first, never the reverse.
+
+    Args:
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        agent: Participant whose owned claims are captured.
+        payload: Optional native lifecycle event supplying step evidence.
+        evidence: Optional earlier native event whose gate evidence is
+            recorded when ``payload`` ran no gate command.
+
+    Returns:
+        Checkpoint records published for the lane's current claims.
+
+    Raises:
+        LockBusy: If another capture of the lane holds the capture lock.
+        BridgeError: If the lane or Git state cannot be captured.
+    """
+    with lock(directory / f"{agent}-capture.lock", timeout=1):
+        return _capture(directory, manifest, agent, payload, evidence)
+
+
+def _capture(
+    directory: Path,
+    manifest: dict,
+    agent: str,
+    payload: dict | None = None,
+    evidence: dict | None = None,
 ) -> list[dict]:
     """Captures every claim owned by one lane into private durable bundles.
 
@@ -364,11 +460,18 @@ def capture(
     tool calls bundles each lane at most once per interval. A capture with no
     event, such as a handoff or an overdue offer, always reflects the tree.
 
+    A capture killed mid-publish can leave its temporary ref behind in the
+    lane. This capture, holding the lane's capture lock, reclaims any such
+    ref before doing its own work, so coordination state never lingers in
+    the target repository past the next capture of the same lane.
+
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
         agent: Participant whose owned claims are captured.
         payload: Optional native lifecycle event supplying step evidence.
+        evidence: Optional earlier native event whose gate evidence is
+            recorded when ``payload`` ran no gate command.
 
     Returns:
         Checkpoint records published for the lane's current claims.
@@ -380,8 +483,12 @@ def capture(
 
     participant = manifest["participants"].get(agent)
     if not participant:
-        raise BridgeError(f"{agent} is not a participant in this project.")
+        raise BridgeError(
+            f"{agent} is not a participant in this project.",
+            next_command="agent-parley participant list",
+        )
     lane = Path(participant["lane"])
+    _reclaim_temporary_refs(lane)
     ledger = issues.snapshot(directory)
     owned = [
         (number, record)
@@ -393,6 +500,8 @@ def capture(
     folder = _folder(directory)
     fingerprint = _fingerprint(lane)
     step, gate = _step(payload or {})
+    if not gate and evidence:
+        gate = gate_evidence(evidence)
     unchanged = []
     for number, record in owned:
         identifier = _identifier(number, str(record["claim_id"]))
@@ -546,6 +655,128 @@ def preserve(directory: Path, worktree: Path) -> dict:
     return record
 
 
+def preserved(directory: Path) -> list[dict]:
+    """Lists the checkpoints written before a sweep removed a worktree.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        Every readable `worktree-*` record, oldest first.
+    """
+    records = []
+    for path in _folder(directory).glob("worktree-*.json"):
+        if not PRESERVED_NAME.fullmatch(path.stem):
+            continue
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(saved, dict) and saved.get("id") == path.stem:
+            records.append(saved)
+    return sorted(records, key=lambda saved: saved.get("captured_at") or 0)
+
+
+def restore_preserved(
+    directory: Path, root: Path, identifier: str, destination: Path
+) -> dict:
+    """Recreates a removed worktree from its preserved checkpoint.
+
+    The bundle is fetched into a temporary ref of the base checkout. A new
+    worktree is added at the destination on the saved branch when that
+    branch still points at the saved head, on a new branch of that name
+    when it is gone, and detached at the head otherwise. The saved index
+    and worktree are then applied with the same patches `restore` uses.
+    Files Git ignored were never part of the checkpoint.
+
+    Args:
+        directory: Private project state directory.
+        root: Base checkout the worktree is registered with.
+        identifier: The `worktree-*` checkpoint identifier.
+        destination: Path the worktree is recreated at; must not exist.
+
+    Returns:
+        The checkpoint record with the destination it was restored to.
+
+    Raises:
+        BridgeError: If the checkpoint is unknown or fails its integrity
+            check, the destination exists, or Git refuses a step.
+    """
+    if not PRESERVED_NAME.fullmatch(identifier):
+        raise BridgeError(f"{identifier} is not a preserved worktree id.")
+    folder = _folder(directory)
+    try:
+        saved = json.loads((folder / f"{identifier}.json").read_text())
+    except (OSError, ValueError):
+        raise BridgeError(f"No preserved worktree {identifier}.") from None
+    artifact = saved.get("artifact") or {}
+    bundle = folder / f"{identifier}.bundle"
+    try:
+        intact = (
+            saved.get("id") == identifier
+            and bundle.stat().st_size == artifact.get("bytes")
+            and _digest(bundle) == artifact.get("sha256")
+        )
+    except OSError:
+        intact = False
+    if not intact:
+        raise BridgeError(f"Preserved worktree {identifier} is damaged.")
+    if destination.exists() or destination.is_symlink():
+        raise BridgeError(f"{destination} already exists.")
+    head = str(saved["head"])
+    branch = str(saved.get("branch") or "")
+    temporary_ref = f"{TEMPORARY_REF_NAMESPACE}restore/{identifier}"
+    _git(
+        root,
+        "fetch",
+        "--no-write-fetch-head",
+        str(bundle),
+        f"{saved['worktree_commit']}:{temporary_ref}",
+    )
+    try:
+        tip = _text(root, "rev-parse", "--verify", "-q", f"refs/heads/{branch}")
+    except BridgeError:
+        tip = ""
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        target = ["--detach", str(destination), head]
+        if branch and not tip:
+            target = ["-b", branch, str(destination), head]
+        elif branch and tip == head:
+            target = [str(destination), branch]
+        _git(root, "worktree", "add", *target)
+        index_patch = _git(
+            destination, "diff", "--binary", head, str(saved["index_commit"])
+        )
+        if index_patch:
+            _git(
+                destination,
+                "apply",
+                "--index",
+                "--binary",
+                "-",
+                input_data=index_patch,
+            )
+        worktree_patch = _git(
+            destination,
+            "diff",
+            "--binary",
+            str(saved["index_commit"]),
+            str(saved["worktree_commit"]),
+        )
+        if worktree_patch:
+            _git(
+                destination,
+                "apply",
+                "--binary",
+                "-",
+                input_data=worktree_patch,
+            )
+    finally:
+        _git(root, "update-ref", "-d", temporary_ref)
+    return {**saved, "restored_to": str(destination.resolve())}
+
+
 def checkpoint(directory: Path, issue: str, claim_id: str) -> dict:
     """Reads the checkpoint for one exact ownership generation."""
     identifier = _identifier(issue, claim_id)
@@ -560,6 +791,88 @@ def checkpoint(directory: Path, issue: str, claim_id: str) -> dict:
     if value.get("id") != identifier:
         raise BridgeError(f"Issue #{issue} recovery checkpoint is invalid.")
     return value
+
+
+CHECKPOINT_NAME = re.compile(r"issue-([1-9][0-9]{0,17})-([0-9a-f]{16})")
+RECEIPT_NAME = re.compile(
+    r"(issue-[1-9][0-9]{0,17}-[0-9a-f]{16})-to-[0-9a-f]{16}-[0-9a-f]{16}"
+)
+PRESERVED_NAME = re.compile(r"worktree-[0-9a-f]{24}")
+PRESERVED_RETENTION = 30 * 24 * 3600
+TEMPORARY_MAX_AGE = 3600
+
+
+def prune(directory: Path, ledger: dict) -> list[str]:
+    """Removes recovery bundles no live claim can still read.
+
+    A capture keeps one checkpoint bundle reachable for every claim a lane
+    ever owned; nothing previously removed one. A checkpoint is safe to
+    remove once its exact ownership generation is no longer the issue's
+    current one: the claim was released, taken again under a new claim
+    identifier, or its issue closed on the forge. A checkpoint a live owner
+    took over stays, because `restore` reads it until the take completes; a
+    restore receipt goes once its checkpoint is gone. A capture also leaves a
+    same-sized temporary bundle behind when the process is killed between
+    `tempfile.mkstemp` and the rename that publishes it; one old enough that
+    no capture still in progress could have written it is removed too. A
+    checkpoint `preserve` wrote before a sweep removed a worktree is kept
+    for `PRESERVED_RETENTION` seconds after its capture, then removed.
+
+    Args:
+        directory: Private project state directory.
+        ledger: Published issue ledger the current ownership is read from.
+
+    Returns:
+        Identifiers of the checkpoints removed.
+    """
+    folder = _folder(directory)
+    issue_records = ledger.get("issues", {})
+    taken = {
+        (current_take(record).get("checkpoint") or {}).get("id")
+        for record in issue_records.values()
+        if record.get("owner") and not record.get("ended_on_forge")
+    }
+    removed = []
+    for record_path in sorted(folder.glob("issue-*.json")):
+        match = CHECKPOINT_NAME.fullmatch(record_path.stem)
+        if not match:
+            continue
+        issue, claim_id = match.group(1), match.group(2)
+        current = issue_records.get(issue) or {}
+        live = (
+            current.get("owner")
+            and current.get("claim_id") == claim_id
+            and not current.get("ended_on_forge")
+        )
+        if live or record_path.stem in taken:
+            continue
+        try:
+            saved = json.loads(record_path.read_text())
+        except (OSError, ValueError):
+            saved = {}
+        reference = (saved.get("artifact") or {}).get("reference")
+        if isinstance(reference, str) and "/" not in reference:
+            (folder / reference).unlink(missing_ok=True)
+        record_path.unlink(missing_ok=True)
+        (folder / f"{record_path.stem}-approval.json").unlink(missing_ok=True)
+        (folder / f"{record_path.stem}-quiesce.json").unlink(missing_ok=True)
+        removed.append(record_path.stem)
+    for receipt in sorted(folder.glob("issue-*-to-*.json")):
+        match = RECEIPT_NAME.fullmatch(receipt.stem)
+        if match and not (folder / f"{match.group(1)}.json").exists():
+            receipt.unlink(missing_ok=True)
+    expired = time.time() - PRESERVED_RETENTION
+    for saved in preserved(directory):
+        if float(saved.get("captured_at") or 0) < expired:
+            (folder / f"{saved['id']}.bundle").unlink(missing_ok=True)
+            (folder / f"{saved['id']}.json").unlink(missing_ok=True)
+            removed.append(saved["id"])
+    threshold = time.time() - TEMPORARY_MAX_AGE
+    for stray in folder.glob("tmp*"):
+        with contextlib.suppress(OSError):
+            if stray.is_file() and stray.stat().st_mtime < threshold:
+                stray.unlink(missing_ok=True)
+    return removed
 
 
 def authorize(
@@ -786,6 +1099,10 @@ def prepare_takeover(
 ) -> dict:
     """Loads a dead owner's exact claim generation for takeover.
 
+    A marker the supervisor published after a failed capture records that
+    failure, and its takeover proceeds with no checkpoint: ownership truth
+    does not wait on a best-effort recovery of the dead lane's work.
+
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
@@ -793,11 +1110,13 @@ def prepare_takeover(
         issue: Bare repository issue number.
 
     Returns:
-        Expected claim and orphan identities plus its durable checkpoint.
+        Expected claim and orphan identities plus its durable checkpoint,
+        which is empty when the marker records a failed capture.
 
     Raises:
-        BridgeError: If ownership changed, no checkpoint exists, or the old
-            session process is alive.
+        BridgeError: If ownership changed, no checkpoint exists and the
+            marker records no failed capture, or the old session process is
+            alive.
     """
     from agent_parley import issues
 
@@ -813,7 +1132,12 @@ def prepare_takeover(
     if owner not in manifest["participants"]:
         raise BridgeError(f"Issue #{issue} names an unknown owner {owner}.")
     claim_id = str(record.get("claim_id") or "")
-    saved = checkpoint(directory, issue, claim_id)
+    try:
+        saved = checkpoint(directory, issue, claim_id)
+    except BridgeError:
+        if not orphan.get("capture_failed"):
+            raise
+        saved = {}
     with lock(directory / f"{owner}-checkpoint.lock", timeout=1):
         activity_path = directory / f"{owner}-activity.json"
         try:
@@ -1052,10 +1376,18 @@ def quiesce_exhausted(
         }
         write_json(activity_path, activity)
         saved = next(
-            value
-            for value in capture(directory, manifest, owner)
-            if value["issue"] == issue
+            (
+                value
+                for value in capture(directory, manifest, owner)
+                if value["issue"] == issue
+            ),
+            None,
         )
+        if saved is None:
+            raise BridgeError(
+                f"Issue #{issue} has no capture for claim {claim_id}; the "
+                "claim moved before recovery captured it."
+            )
         transition["phase"] = "captured"
         transition["checkpoint"] = saved["id"]
         write_json(transition_path, transition)
@@ -1255,12 +1587,29 @@ def quiesce_authorized(
 
 
 def stale_session(directory: Path, agent: str, payload: dict) -> dict | None:
-    """Returns a native refusal for a session fenced by a takeover."""
+    """Returns a native refusal for a session fenced by a takeover.
+
+    Tool use is denied and other events carry the transfer as context. A
+    `Stop` is never blocked: the fenced generation can do nothing, so its
+    turn is allowed to end with the transfer shown, rather than being
+    continued and refused again on every following `Stop`.
+
+    Args:
+        directory: Private project state directory.
+        agent: Lane whose activity record may carry a fence.
+        payload: Native hook payload naming the session and event.
+
+    Returns:
+        Native hook output for a session whose ownership generation was
+        transferred by a published takeover, or None otherwise.
+    """
     try:
         activity = json.loads(
             (directory / f"{agent}-activity.json").read_text()
         )
     except (OSError, ValueError):
+        return None
+    if not isinstance(activity, dict):
         return None
     fence = activity.get("ownership_fence") or {}
     session = str(payload.get("session_id") or "")
@@ -1293,7 +1642,7 @@ def stale_session(directory: Path, agent: str, payload: dict) -> dict | None:
             }
         }
     if event == "Stop":
-        return {"decision": "block", "reason": detail}
+        return {"systemMessage": detail}
     return {
         "hookSpecificOutput": {
             "hookEventName": event,
@@ -1395,18 +1744,21 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
     """Restores one taken checkpoint into a clean recipient worktree.
 
     A take that belongs to an earlier ownership generation restores nothing.
+    A take whose receipt is already complete returns without reading the
+    bundle, so a re-claim after the bundle was removed still succeeds.
 
     Args:
         directory: Private project state directory.
-        lane: Recipient's assigned worktree.
+        lane: Recipient's assigned worktree root. A subdirectory is refused
+            because Git would apply the saved patches to it alone.
         record: Persisted taken-claim record.
 
     Returns:
         Record with restored checkpoint and content evidence.
 
     Raises:
-        BridgeError: If the artifact is invalid or destination has work that
-            could be overwritten.
+        BridgeError: If the artifact is invalid, the lane is not a worktree
+            root, or destination has work that could be overwritten.
     """
     saved = current_take(record).get("checkpoint") or {}
     if not saved:
@@ -1415,8 +1767,14 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
     recipient_claim = str(record.get("claim_id") or "")
     if not recipient or not re.fullmatch(r"[0-9a-f]{16}", recipient_claim):
         raise BridgeError("Recovery recipient generation is invalid.")
-    _artifact(directory, saved)
     resolved_lane = str(lane.resolve())
+    if str(Path(_text(lane, "rev-parse", "--show-toplevel")).resolve()) != (
+        resolved_lane
+    ):
+        raise BridgeError(
+            "Recovery destination must be the worktree root; Git applies "
+            "a patch run from a subdirectory to that subdirectory only."
+        )
     lane_id = hashlib.sha256(resolved_lane.encode()).hexdigest()[:16]
     receipt = _folder(directory) / (
         f"{saved['id']}-to-{recipient_claim}-{lane_id}.json"
@@ -1453,6 +1811,7 @@ def restore(directory: Path, lane: Path, record: dict) -> dict:
         write_json(receipt, restored)
     if restored.get("phase") == "complete":
         return {**record, "recovery": restored}
+    _artifact(directory, saved)
     head_tree = _tree(lane, str(saved["head"]))
     index_tree = _tree(lane, str(saved["index_commit"]))
     worktree_tree = _tree(lane, str(saved["worktree_commit"]))

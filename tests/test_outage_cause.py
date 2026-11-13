@@ -326,7 +326,7 @@ def test_status_names_the_repair_for_an_unusable_store(
         db.execute(f"PRAGMA user_version={store.SCHEMA_VERSION - 1}")
     bridge.status()
     printed = capsys.readouterr().out
-    assert "Server: not ready" in printed
+    assert "Service: not running" in printed
     assert protocol.MIGRATE in printed
 
 

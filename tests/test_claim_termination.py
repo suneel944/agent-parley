@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import time
 from pathlib import Path
 
@@ -155,6 +156,41 @@ def test_an_answering_holder_clears_its_own_escalation(
     assert record(claimed)["owner"] == "claude"
 
 
+def test_a_reopened_issue_retracts_its_escalation(bridge, claimed, monkeypatch):
+    closed = {
+        "state": "CLOSED",
+        "closed_at": time.time() + 1,
+        "pull_request": None,
+        "url": "",
+        "branch": "",
+        "commit": "",
+    }
+    reading = {"now": closed}
+    monkeypatch.setattr(supervision, "ISSUE_READING_SECONDS", 0.0)
+    monkeypatch.setattr(
+        supervision.forge, "issue_completion", lambda *args: reading["now"]
+    )
+    marker = escalated(bridge, claimed, monkeypatch)["unresolved_completion"]
+    assert marker["branch"] == "issue #1"
+    reading["now"] = {"state": "OPEN"}
+    supervision.poll(bridge.home, claimed.parent)
+    assert record(claimed).get("unresolved_completion") is None
+    assert record(claimed)["owner"] == "claude"
+    supervision.poll(bridge.home, claimed.parent)
+    assert record(claimed).get("unresolved_completion") is None
+
+
+def test_an_unreadable_forge_keeps_the_escalation(bridge, claimed, monkeypatch):
+    marker = escalated(bridge, claimed, monkeypatch)["unresolved_completion"]
+
+    def broken(*args):
+        raise ValueError("forge reply unreadable")
+
+    monkeypatch.setattr(forge, "issue_completion", broken)
+    supervision.poll(bridge.home, claimed.parent)
+    assert record(claimed)["unresolved_completion"] == marker
+
+
 def test_an_open_pull_request_never_escalates(bridge, claimed, monkeypatch):
     completion(monkeypatch, "OPEN", time.time() + 1)
     for _ in range(4):
@@ -208,7 +244,7 @@ def test_the_escalation_reaches_status_and_problems(
     assert len(listed) == 1
     assert listed[0]["participant"] == "claude"
     assert listed[0]["command"] == (
-        f"agent-parley issue resolve 1 --repo {paired['root']}"
+        f"agent-parley issue resolve 1 --repo {shlex.quote(paired['root'])}"
     )
 
 
@@ -254,8 +290,8 @@ def test_a_released_claim_stops_reminding_its_former_holder(
         },
     )
     escalated(bridge, claimed, monkeypatch)
-    everywhere = {"wake": True, "delivery": True, "listing": True}
-    assert owed(bridge, paired, claimed, monkeypatch) == everywhere
+    escalated_only = {"wake": False, "delivery": True, "listing": True}
+    assert owed(bridge, paired, claimed, monkeypatch) == escalated_only
     bridge.issue(claimed, "release", "1")
     supervision.poll(bridge.home, claimed.parent)
     ended = record(claimed)
@@ -290,9 +326,8 @@ def test_the_operator_resolves_a_merged_claim_with_its_evidence(
     assert lifecycle.state(after)["commit"] == "abcdef1234567"
 
 
-def test_a_claim_closed_by_a_per_issue_pull_request_is_resolved(
-    bridge, repo, claimed, monkeypatch
-):
+def merged_issue(monkeypatch):
+    """Reports the claimed issue closed by a merged per-issue pull request."""
     reading = {
         "state": "MERGED",
         "closed_at": time.time() + 1,
@@ -304,16 +339,124 @@ def test_a_claim_closed_by_a_per_issue_pull_request_is_resolved(
     monkeypatch.setattr(forge, "issue_completion", lambda *args: reading)
     completion(monkeypatch, None, 0.0)
     evidence(monkeypatch, None, 0.0)
+
+
+def test_the_service_ends_a_claim_its_merged_pull_request_closed(
+    bridge, claimed, monkeypatch
+):
+    merged_issue(monkeypatch)
     supervision.poll(bridge.home, claimed.parent)
-    unanswered(claimed, 2)
-    supervision.poll(bridge.home, claimed.parent)
-    marker = record(claimed)["unresolved_completion"]
-    assert marker["branch"] == "refactor/1-replay-package"
-    result = bridge.issue_resolve(repo, "1", reason="landed per issue")
-    assert result["outcome"] == "complete"
-    resolution = record(claimed)["resolution"]
+    ended = record(claimed)
+    assert ended["owner"] is None
+    assert lifecycle.state(ended)["state"] == lifecycle.COMPLETE
+    assert lifecycle.state(ended)["integrated_commit"] == "abcdef1234567"
+    resolution = ended["resolution"]
+    assert resolution["actor"] == "supervisor"
+    assert resolution["holder"] == "claude"
+    assert resolution["outcome"] == "complete"
     assert resolution["evidence"]["pull_request"] == 1328
     assert resolution["evidence"]["branch"] == "refactor/1-replay-package"
+    actions = [entry["action"] for entry in ended["history"]]
+    assert "complete" not in actions
+    assert actions[-1] == "resolve"
+
+
+def test_a_claim_taken_again_after_the_reading_is_not_ended(
+    bridge, claimed, monkeypatch
+):
+    merged_issue(monkeypatch)
+    ended = supervision.completed_claims(
+        supervision.roster.read(claimed.parent),
+        issues.snapshot(claimed.parent),
+    )
+    path = claimed.parent / "issues.json"
+    ledger = json.loads(path.read_text())
+    ledger["issues"]["1"]["claim_id"] = "newer-claim"
+    path.write_text(json.dumps(ledger))
+    assert supervision.end_merged_claims(claimed.parent, ended) == []
+    assert record(claimed)["owner"] == "claude"
+
+
+def test_a_pull_request_another_lane_landed_is_left_to_the_operator(
+    bridge, claimed, monkeypatch
+):
+    merged_issue(monkeypatch)
+    ended = supervision.completed_claims(
+        supervision.roster.read(claimed.parent),
+        issues.snapshot(claimed.parent),
+    )
+    ended["1"]["landed_by"] = "codex"
+    assert supervision.end_merged_claims(claimed.parent, ended) == []
+    assert record(claimed)["owner"] == "claude"
+
+
+def closed_issue(monkeypatch, closed_at, pull_request=0, state="CLOSED"):
+    """Reports the claimed issue closed on the forge at a fixed instant."""
+    reading = {
+        "state": state,
+        "closed_at": closed_at,
+        "pull_request": pull_request,
+        "url": "",
+        "branch": "",
+        "commit": "abcdef1234567" if pull_request else "",
+    }
+    monkeypatch.setattr(forge, "issue_completion", lambda *args: reading)
+    completion(monkeypatch, None, 0.0)
+    evidence(monkeypatch, None, 0.0)
+
+
+def reported_ready(lane):
+    """Files the holder's ready report for the claimed issue."""
+    lifecycle.record_report(
+        lane.parent, "claude", lifecycle.READY, "1234567abcdef", "", issue="1"
+    )
+
+
+def test_a_closed_issue_cannot_be_claimed(bridge, paired, monkeypatch):
+    registered(bridge, paired)
+    closed_issue(monkeypatch, time.time() - HOUR)
+    with pytest.raises(BridgeError, match="is closed on the forge"):
+        bridge.issue(Path(paired["lanes"]["claude"]), "claim", "1")
+
+
+def test_an_unreadable_forge_never_blocks_a_claim(bridge, paired, monkeypatch):
+    registered(bridge, paired)
+    monkeypatch.setattr(forge, "issue_completion", lambda *args: None)
+    lane = Path(paired["lanes"]["claude"])
+    assert bridge.issue(lane, "claim", "1")["owner"] == "claude"
+
+
+@pytest.mark.parametrize(
+    ("offset", "pull_request", "state", "reason"),
+    [
+        (-HOUR, 1328, "MERGED", "closed on the forge before the claim"),
+        (1.0, 0, "CLOSED", "closed by hand"),
+    ],
+)
+def test_a_ready_claim_on_a_closed_issue_ends(
+    bridge, claimed, monkeypatch, offset, pull_request, state, reason
+):
+    reported_ready(claimed)
+    closed_issue(monkeypatch, time.time() + offset, pull_request, state)
+    supervision.poll(bridge.home, claimed.parent)
+    ended = record(claimed)
+    assert ended["owner"] is None
+    assert lifecycle.state(ended)["state"] == lifecycle.COMPLETE
+    resolution = ended["resolution"]
+    assert resolution["actor"] == "supervisor"
+    assert resolution["outcome"] == "complete"
+    assert reason in resolution["reason"]
+    assert resolution["evidence"]["state"] == state
+    assert resolution["evidence"]["closed_at"]
+
+
+@pytest.mark.parametrize("offset", [-HOUR, 1.0])
+def test_a_claim_not_ready_on_a_closed_issue_stays(
+    bridge, claimed, monkeypatch, offset
+):
+    closed_issue(monkeypatch, time.time() + offset)
+    supervision.poll(bridge.home, claimed.parent)
+    assert record(claimed)["owner"] == "claude"
 
 
 def test_a_resolution_is_not_an_owner_filed_completion(

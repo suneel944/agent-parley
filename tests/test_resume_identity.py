@@ -1,6 +1,8 @@
 """Checks that a failed launch never destroys the last resumable session."""
 
+import io
 import json
+import sys
 import threading
 from pathlib import Path
 
@@ -51,6 +53,15 @@ def test_a_nonzero_exit_before_any_hook_keeps_the_resumable_session(
     assert recorded["resumable_session"] == CONFIRMED
     assert recorded["session_id"] == ""
     assert recorded["activity"] == "stopped"
+
+
+def test_a_resume_without_a_terminal_is_recorded_as_detached(
+    bridge, repo, lane, monkeypatch
+):
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+    monkeypatch.setattr(terminal, "run", lambda *args, **kwargs: 0)
+    assert bridge.launch("claude", repo, terminal.PROMPT, resume=True) == 0
+    assert state(lane)["attached"] is False
 
 
 def test_a_launch_exception_before_any_hook_keeps_the_resumable_session(
@@ -119,6 +130,18 @@ def test_a_launch_moves_a_lane_sampled_stopped_to_starting_at_once(
     assert bridge.launch("claude", repo, terminal.PROMPT, resume=True) == 0
     assert seen[0]["state"] == lanes.STARTING
     assert seen[0]["evidence"].startswith("launch:")
+
+
+def test_a_launch_moves_a_lane_to_stopped_once_the_client_exits(
+    bridge, repo, lane, monkeypatch
+):
+    root = roster.read(lane)["root"]
+    monkeypatch.setattr(terminal, "run", lambda *args, **kwargs: 0)
+    assert bridge.launch("claude", repo, terminal.PROMPT, resume=True) == 0
+    with store.connect(bridge.home) as db:
+        record = lanes.read(db, root, "claude")
+    assert record["state"] == lanes.STOPPED
+    assert record["evidence"] == "launch: session exited"
 
 
 def test_a_lane_that_never_reported_a_session_refuses_to_resume(

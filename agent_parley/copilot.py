@@ -7,6 +7,7 @@ launch, and removes one retired lane's entries from that profile again.
 import json
 import re
 import shlex
+import sys
 from pathlib import Path
 
 from agent_parley import roster
@@ -67,7 +68,9 @@ def response(value: dict) -> dict:
     return result
 
 
-def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
+def configure_copilot(
+    home: Path, server: dict, hooks: dict, owner: str = ""
+) -> None:
     """Merges lane configuration without replacing native user settings.
 
     Copilot CLI selects its payload format from the case of the configured
@@ -81,10 +84,18 @@ def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
     Existing hook order is retained and identical lane hooks are not appended
     again on relaunch. Both documents are validated before either is written.
 
+    Copilot runs every hook in a profile for every session on it, so a hook
+    another participant left behind would decide this lane's events. With
+    ``owner`` named, every bridge hook naming a different participant is
+    dropped; the launcher has already refused the launch when such a
+    participant is still live, so only retired or absent lanes lose entries.
+
     Args:
         home: Credential profile's native configuration directory.
         server: Agent Parley MCP server definition.
         hooks: Native hook events and their command lists.
+        owner: Participant the profile now serves, or empty to keep every
+            existing entry.
 
     Raises:
         BridgeError: If either existing document has an incompatible shape.
@@ -113,6 +124,12 @@ def configure_copilot(home: Path, server: dict, hooks: dict) -> None:
             existing = settings["hooks"].setdefault(event, [])
             if not isinstance(existing, list):
                 raise BridgeError(f"Expected a hook list for {event}.")
+            if owner:
+                existing[:] = [
+                    command
+                    for command in existing
+                    if hook_participant(command) in (None, owner)
+                ]
             existing.extend(
                 command for command in commands if command not in existing
             )
@@ -126,8 +143,13 @@ def release_copilot(home: Path, participant: dict, name: str) -> None:
     Only entries whose command names this participant are removed, so other
     lanes sharing the profile and the operator's own hooks are untouched. The
     ``agent_parley`` MCP server entry is removed once no lane hook remains.
-    A profile that no longer resolves, or files that were never written,
-    leave nothing to do.
+    Files that were never written leave nothing to do.
+
+    The profile directory is resolved from the recorded credential alone,
+    without the variables a launch requires from the caller's shell, because
+    a retirement runs from whatever shell or service retires the lane. A
+    profile that no longer resolves is reported on standard error, since
+    the lane's hooks then stay in that directory for every later session.
 
     Args:
         home: Private bridge state root.
@@ -136,13 +158,21 @@ def release_copilot(home: Path, participant: dict, name: str) -> None:
     """
     try:
         entry = roster.provider(home, participant["provider"])
-        account = roster.launch_environment(
-            home, entry, participant.get("credential")
-        )
     except BridgeError:
         return
-    config_home = account.get(entry.get("home_env", ""))
-    if entry["adapter"] != "copilot" or not config_home:
+    if entry["adapter"] != "copilot":
+        return
+    try:
+        config_home = roster.config_home(
+            home, entry, participant.get("credential")
+        )
+    except BridgeError as error:
+        print(
+            f"Could not remove {name}'s Copilot hooks: {error}",
+            file=sys.stderr,
+        )
+        return
+    if not config_home:
         return
     settings_path = Path(config_home) / "settings.json"
     servers_path = Path(config_home) / "mcp-config.json"
@@ -199,15 +229,89 @@ def bridge_hook(text: str) -> bool:
     return "agent_parley.hook" in text or hook_client.CLIENT_NAME in text
 
 
-def owned_hook(command: object, name: str) -> bool:
-    """Reports whether a Copilot hook entry runs this participant's hook."""
+def hook_participant(command: object) -> str | None:
+    """Names the participant a Copilot hook entry runs this bridge's hook for.
+
+    Args:
+        command: One entry of a hook list in a Copilot ``settings.json``.
+
+    Returns:
+        The ``--participant`` value of a bridge hook, or None for an entry
+        that is not one, such as the operator's own hook.
+    """
     if not isinstance(command, dict):
-        return False
+        return None
     try:
         words = shlex.split(str(command.get("bash", "")))
     except ValueError:
-        return False
-    return any(bridge_hook(word) for word in words) and any(
-        words[index : index + 2] == ["--participant", name]
-        for index in range(len(words) - 1)
-    )
+        return None
+    if not any(bridge_hook(word) for word in words):
+        return None
+    for index in range(len(words) - 1):
+        if words[index] == "--participant":
+            return words[index + 1]
+    return None
+
+
+def owned_hook(command: object, name: str) -> bool:
+    """Reports whether a Copilot hook entry runs this participant's hook."""
+    return hook_participant(command) == name
+
+
+def occupants(
+    home: Path, config_home: Path, directory: Path, name: str
+) -> list[str]:
+    """Names the other live lanes whose hooks a Copilot profile already runs.
+
+    A lane counts once its hooks are in the profile's ``settings.json`` and
+    it is a participant of a project in this home that is not retired and
+    resolves to the same profile directory on a ``copilot`` adapter. A lane
+    refused before configuring its hooks therefore never blocks another.
+
+    Args:
+        home: Private bridge state root.
+        config_home: Profile directory the launching lane would configure.
+        directory: Project state directory of the launching lane.
+        name: Launching participant, which is never its own occupant.
+
+    Returns:
+        Sorted participant names, empty when the profile is free.
+    """
+    try:
+        settings = json.loads((config_home / "settings.json").read_text())
+    except (OSError, ValueError):
+        return []
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    hooked = {
+        hook_participant(command)
+        for commands in (hooks.values() if isinstance(hooks, dict) else ())
+        if isinstance(commands, list)
+        for command in commands
+    }
+    found = set()
+    for path in sorted((home / "projects").glob("*/project.json")):
+        try:
+            participants = roster.read(path.parent)["participants"]
+        except (BridgeError, OSError, ValueError, KeyError):
+            continue
+        for other, entry in participants.items():
+            if (
+                other not in hooked
+                or (path.parent == directory and other == name)
+                or roster.retired(entry)
+            ):
+                continue
+            try:
+                provider = roster.provider(home, entry["provider"])
+                selected = roster.config_home(
+                    home, provider, entry.get("credential")
+                )
+            except (BridgeError, KeyError):
+                continue
+            if (
+                provider["adapter"] == "copilot"
+                and selected
+                and Path(selected) == config_home
+            ):
+                found.add(other)
+    return sorted(found)

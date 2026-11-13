@@ -4,7 +4,8 @@
 lane filed, but neither lets an operator sit on one participant and see its
 coordination activity as it happens. This module tails the records that
 already exist: the issue ledger, the per-lane report log, the store's mail,
-reservations and served calls, and the lane's hook event log. Each poll reads
+reservations and served calls, the lane's hook event log, and its blueprint
+runs' current node and nodes passed. Each poll reads
 the same substrates the snapshot commands read, keeps a cursor over what it
 has already printed, and prints only what is new.
 
@@ -35,7 +36,7 @@ from pathlib import Path
 from agent_parley import checkpoints, history, store, views
 from agent_parley.state import BridgeError
 
-KINDS = (*history.KINDS, "call", "denied", "session")
+KINDS = (*history.KINDS, "call", "denied", "session", "blueprint")
 BACKLOG = 20
 INTERVAL = 0.5
 HORIZON = 300.0
@@ -119,7 +120,8 @@ def _store(home: Path, manifest: dict, name: str) -> list:
     with store.connect(home) as db:
         for row in db.execute(
             "SELECT m.id,m.thread_id,s.name AS sender,"
-            "unixepoch(m.created_ts) AS created FROM message_recipients r "
+            "CAST(strftime('%s',m.created_ts) AS INTEGER) AS created "
+            "FROM message_recipients r "
             "JOIN messages m ON m.id=r.message_id "
             "JOIN agents s ON s.id=m.sender_id "
             "JOIN agents a ON a.id=r.agent_id "
@@ -141,7 +143,8 @@ def _store(home: Path, manifest: dict, name: str) -> list:
                 )
             )
         for row in db.execute(
-            "SELECT e.id,e.tool,e.outcome,unixepoch(e.created_ts) AS created "
+            "SELECT e.id,e.tool,e.outcome,"
+            "CAST(strftime('%s',e.created_ts) AS INTEGER) AS created "
             "FROM events e JOIN agents a ON a.id=e.agent_id "
             "JOIN projects p ON p.id=a.project_id "
             "WHERE p.human_key=? AND a.name=? ORDER BY e.id DESC LIMIT ?",
@@ -191,6 +194,34 @@ def _hooks(directory: Path, name: str, since: float) -> list:
     return entries
 
 
+def _blueprints(directory: Path, name: str) -> list:
+    """Reads the current node and nodes passed of the lane's blueprint runs.
+
+    A run's record changes as it moves, so its key carries the node, status
+    and nodes passed: each step prints once, and a lane without a run
+    prints nothing new.
+    """
+    from agent_parley import blueprints
+
+    entries = []
+    for number, run in blueprints.for_lane(directory, name).items():
+        key = json.dumps(
+            [number, run["node"], run["status"], run["passed"]],
+            sort_keys=True,
+        )
+        entries.append(
+            _entry(
+                "blueprint",
+                float(run.get("updated") or run.get("started") or 0),
+                name,
+                f"blueprint {blueprints.line(number, run)}",
+                f"blueprint:{key}",
+                issue=int(number),
+            )
+        )
+    return entries
+
+
 def collect(
     home: Path,
     directory: Path,
@@ -217,6 +248,7 @@ def collect(
         *_history(home, directory, manifest, name),
         *_store(home, manifest, name),
         *_hooks(directory, name, since),
+        *_blueprints(directory, name),
     ]
     selected = [
         record
@@ -260,7 +292,8 @@ def follow(
     floor trails the newest record by a fixed horizon, so a record committed
     with a slightly earlier time than one already printed is still caught,
     and keys older than the floor are forgotten so a long watch does not grow
-    without bound.
+    without bound. Records the backlog leaves out are marked seen without
+    being printed, so a later poll never emits them after newer ones.
 
     Args:
         source: Reads every record at or after a Unix time floor.
@@ -272,10 +305,10 @@ def follow(
         backlog: Records to print first when no floor is given.
     """
     floor = since
-    seen: dict[str, float] = {}
     records = source(floor)
-    if not since:
-        records = records[-backlog:]
+    hidden = 0 if since else max(len(records) - backlog, 0)
+    seen = {record["key"]: record["at"] for record in records[:hidden]}
+    records = records[hidden:]
     while True:
         for record in records:
             if record["key"] in seen:
@@ -355,7 +388,8 @@ def run(
     if name not in manifest["participants"]:
         raise BridgeError(
             f"{name} is not a participant in this project; "
-            "run agent-parley participant list."
+            "run agent-parley participant list.",
+            next_command="agent-parley participant list",
         )
     floor = time.time() - since if since else 0.0
 

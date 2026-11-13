@@ -4,7 +4,7 @@ import json
 import os
 import time
 
-from agent_parley import cli, dashboard, metrics, store
+from agent_parley import cli, dashboard, metrics, store, supervision
 from agent_parley.process import start_ticks
 from agent_parley.state import write_json
 
@@ -45,6 +45,42 @@ def test_idle_runs_from_a_turn_end_to_the_next_activity(bridge, repo, paired):
     assert [interval["seconds"] for interval in measured["intervals"]] == [300]
     assert measured["seconds"] == 300
     assert measured["complete"] is True
+
+
+def test_service_records_and_foreign_sessions_do_not_end_idle(
+    bridge, repo, paired
+):
+    directory = bridge.project(repo)[1]
+    now = time.time()
+    log_events(
+        directory,
+        "claude",
+        {"ts": now - 900, "event": "Stop"},
+        {
+            "ts": now - 800,
+            "event": "RuntimeWake",
+            "reason_class": "wake_requested",
+        },
+        {
+            "ts": now - 700,
+            "event": "PreToolUse",
+            "reason_class": "session_mismatch",
+        },
+        {"ts": now - 600, "event": "UserPromptSubmit"},
+    )
+    measured = metrics.idle_intervals(directory, "claude", now=now)
+    assert [interval["seconds"] for interval in measured["intervals"]] == [300]
+    log_events(
+        directory,
+        "claude",
+        {"ts": now - 900, "event": "PostToolUse"},
+        {
+            "ts": now - 60,
+            "event": "PreToolUse",
+            "reason_class": "session_mismatch",
+        },
+    )
+    assert supervision.tool_silence(directory, "claude") >= 890
 
 
 def test_an_open_interval_counts_only_while_the_session_is_alive(

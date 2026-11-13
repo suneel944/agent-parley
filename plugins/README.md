@@ -25,14 +25,14 @@ Claude Code:
 
 ```sh
 claude plugin marketplace add .
-claude plugin install agent-parley@agent-parley-local --scope user
+claude plugin install agent-parley@agent-parley --scope user
 ```
 
 Codex:
 
 ```sh
 codex plugin marketplace add .
-codex plugin add agent-parley@agent-parley-local
+codex plugin add agent-parley@agent-parley
 ```
 
 Install from only one marketplace per client. If already installed through a

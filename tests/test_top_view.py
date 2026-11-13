@@ -47,6 +47,14 @@ def lane(name: str, **changes: object) -> dict:
         "queued": 0,
         "queued_by": [],
         "injected_bytes": 0,
+        "context_percent": None,
+        "context_full": False,
+        "diff_files": None,
+        "diff_added": None,
+        "diff_deleted": None,
+        "diff_paths": [],
+        "host": "host",
+        "worktree": f"/work/{name}",
         "hook_events": 0,
         "denials": 0,
         "calls": 0,
@@ -60,6 +68,14 @@ def lane(name: str, **changes: object) -> dict:
         "offer_kind": "",
         "work_dispatch": {},
         "awaiting_approval": False,
+        "task_plan": {
+            "source": "plan update",
+            "recorded": False,
+            "done": 0,
+            "total": 0,
+            "current": "",
+            "truncated": False,
+        },
         "prompt": "",
     }
     return {**row, **changes}
@@ -265,7 +281,7 @@ def test_an_unbounded_frame_shows_every_row_and_leaves_the_legend_to_keys():
 
 def test_a_lane_is_one_row_with_its_task_and_one_note_per_warning():
     rows = lanes(6, stall="idle; message 3 waiting", prompt="build the gate")
-    frame = dashboard.layout(snapshot(("/repo", rows)), 120, 20)
+    frame = dashboard.layout(snapshot(("/repo", rows)), 150, 20)
     drawn = [line for line in frame["lines"] if line.startswith("lane-")]
     assert len(drawn) == frame["shown"] == 6
     assert all("build the gate" in line for line in drawn)
@@ -273,6 +289,21 @@ def test_a_lane_is_one_row_with_its_task_and_one_note_per_warning():
     assert notes[0] == "! lane-0  idle; message 3 waiting"
     assert notes[-1] == "! 3 more; P lists every problem"
     assert len(notes) == 4
+
+
+def test_a_lane_that_needs_input_leads_whatever_the_sort():
+    asking = lane(
+        "zed",
+        condition={"state": "blocked", "cause": "approval", "since": 0.0},
+        provenance={"inferred": False},
+    )
+    rows = [lane("alpha"), asking, lane("beta")]
+    view = dashboard.select(snapshot(("/repo", rows)), sort="PARTICIPANT")
+    shown = view["projects"][0]["rows"]
+    assert [row["participant"] for row in shown] == ["zed", "alpha", "beta"]
+    cells = dashboard.row_cells(shown[0])
+    assert cells[1].startswith("needs input: permission prompt ")
+    assert dashboard.row_cells(shown[1])[1] == "idle"
 
 
 def test_every_emphasised_row_names_its_cause_in_a_note():
@@ -365,6 +396,14 @@ def test_chosen_columns_are_the_only_ones_shown():
 def test_an_unknown_column_choice_still_shows_the_table():
     view = snapshot(("/repo", lanes(1)))
     assert "PARTICIPANT" in text(dashboard.render(view, 120, columns=("XY",)))
+
+
+def test_an_unmeasured_lane_shows_n_a_in_the_tokens_cell():
+    rows = [lane("gem", unmeasured=["tokens"]), lane("cod", tokens=42)]
+    view = snapshot(("/repo", rows))
+    lines = dashboard.render(view, 160, columns=("PARTICIPANT", "TOKENS"))
+    assert any("gem" in line and "n/a" in line for line in lines)
+    assert not any("cod" in line and "n/a" in line for line in lines)
 
 
 def test_a_warning_row_is_marked_in_text_and_offered_for_colour():
@@ -647,3 +686,32 @@ def test_the_a_key_shows_and_hides_what_the_live_view_left_out(monkeypatch):
 def test_the_header_reports_how_long_the_frame_took_to_read():
     view = {**snapshot(("/repo", lanes(1))), "read_seconds": 0.25}
     assert "read 0.25s" in dashboard.render(view)[0]
+
+
+def test_no_color_keeps_warning_rows_bold_without_setting_up_colour(
+    monkeypatch,
+):
+    started = []
+    monkeypatch.setattr(curses, "has_colors", lambda: True)
+    monkeypatch.setattr(curses, "start_color", lambda: started.append(1))
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert dashboard._warning() == curses.A_BOLD
+    assert started == []
+
+
+def test_ages_of_two_days_and_more_read_in_days():
+    assert tables.age(47 * 3600) == "47h"
+    assert tables.age(3 * 86400) == "3d"
+    assert tables.age(30 * 86400) == "30d"
+
+
+def test_numbered_lanes_sort_by_their_number():
+    names = ["codex13", "amp5", "codex7", "amp17", "codex", "amp11"]
+    assert sorted(names, key=tables.natural_key) == [
+        "amp5",
+        "amp11",
+        "amp17",
+        "codex",
+        "codex7",
+        "codex13",
+    ]

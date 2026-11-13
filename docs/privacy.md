@@ -6,7 +6,7 @@ policy describes what the software stores, where it stores it, and what it
 transmits. It applies to the published package, to the Claude plugin and to
 the Codex plugin, which share one coordination runtime.
 
-Last updated 2026-09-26.
+Last updated 2026-10-13.
 
 ## What the software transmits
 
@@ -32,23 +32,46 @@ it unassigns it, and a report that turns ready posts its summary and evidence
 as a comment on the issue it is bound to. `issue next`, `issue match` and
 `issue resolve` read open issues, their labels and the pull requests that
 close them, and the supervision service and `gc` read whether a lane's branch
-or issue has landed. Agent Parley stores no forge token and adds no flag that
-bypasses a repository rule, and when no `gh` client, no GitHub remote or no
-network is available nothing is sent and the local record is unchanged.
+or issue has landed. `run --issue N` reads that issue's title, body, its latest
+three comments and the titles of up to five linked issues. The supervision
+service reads a lane's pull request checks, reviews, inline review comments and
+the logs of failed jobs, and re-runs a cancelled job unless `rerun_cancelled`
+is off. A repository carrying a Beads ledger in `.beads/` uses
+the `beads` forge instead: the same title lookups, assignments and comments go
+through the `bd` client in place of `gh`. Agent Parley stores no forge token
+and adds no flag that bypasses a repository rule, and when no `gh` client, no
+GitHub remote or no network is available nothing is sent and the local record
+is unchanged.
 
-Notifications are off unless `AGENT_PARLEY_NOTIFY` names `telegram`, `email`
-or both. Then a change that moves ownership or holds a lane, such as a handoff
-offer, a permission prompt, a native dialog or an idle lane, is sent to the
-Telegram Bot API with `AGENT_PARLEY_TELEGRAM_TOKEN` and
-`AGENT_PARLEY_TELEGRAM_CHAT`, or to the SMTP server named by
-`AGENT_PARLEY_SMTP_HOST` and its companion variables. A message names the
+Notifications are off unless `AGENT_PARLEY_NOTIFY` names `telegram`, `email`,
+`webhook` or a mix. Then a change that moves ownership or holds a lane, such
+as a handoff offer, a permission prompt, a native dialog or an idle lane, is
+sent to the Telegram Bot API with `AGENT_PARLEY_TELEGRAM_TOKEN` and
+`AGENT_PARLEY_TELEGRAM_CHAT`, to the SMTP server named by
+`AGENT_PARLEY_SMTP_HOST` and its companion variables, or as a JSON POST to
+`AGENT_PARLEY_WEBHOOK_URL`, which must be HTTPS unless it names a loopback
+relay.
+`AGENT_PARLEY_TELEGRAM_API` replaces the Telegram Bot API address,
+`https://api.telegram.org` by default, so messages go to the host it names. A
+message names the
 repository, the lane, its provider, the event, the issue or offer, and the
 dialog text involved, capped at 1,536 bytes. With `AGENT_PARLEY_INBOUND` set
 to `telegram` and an `AGENT_PARLEY_INBOUND_PASSCODE`, the service long-polls
 the same bot and answers a passcoded `status` query from the configured chat
-with a status reading; no other command is accepted.
-These settings and secrets are read from the environment and never written
-into coordination state.
+with a status reading. It also records answers to decisions, given by a
+button tap in the configured chat or by a passcoded `decide` message; the
+decision record keeps the option, the Telegram user identifier that chose
+it, the time and any note, capped at 1,024 bytes, and the lane receives the
+answer as mail. An answer to a native dialog is instead pressed as that
+option's key on the lane's terminal, and a note is never typed there. No
+other command is accepted.
+These settings and secrets are read from the environment, or from
+`notify.json` in the state directory when `agent-parley notify setup` stored
+them. That command reads the bot token and passcode from a hidden prompt or
+standard input, never from its arguments, prints neither, and writes the file
+with mode `0600`. A variable set in the environment overrides the stored
+value. The file is read by the process that sends or polls and is never
+copied into a lane's environment or into coordination state.
 
 There is no analytics, no crash reporting, no license check and no account.
 The publisher receives no data from your use of the software.
@@ -62,7 +85,8 @@ their own providers, and it does not read or forward their credentials.
 Coordination state is kept outside your repositories, in a private state
 directory created with mode `0700`. The default location is
 `~/.local/state/agent-parley`, and `AGENT_PARLEY_HOME` or `--home` overrides
-it. The tool refuses to run if that directory is not private.
+it; an empty `AGENT_PARLEY_HOME` counts as unset, never as the current
+directory. The tool refuses to run if that directory is not private.
 
 The directory holds the coordination record you create by using the tool:
 
@@ -111,15 +135,36 @@ Logs are bounded automatically:
   it drops to `server.log.1`, which is bounded the same way. A lane's report
   log is bounded the same way, and an attachment goes with the report it
   belonged to.
-- A wake log is cut back to empty before a write would take it past 1 MiB.
-- The store keeps the newest 2,000 served-call records and the newest 2,000
-  lane state transitions of each project.
-- An offer's attachment is removed when the offer is declined, cancelled or
-  released.
+- A wake log is cut back to empty before a write would take it past 1 MiB,
+  and one left untouched for two days is deleted.
+- The store keeps the newest 2,000 served-call records, the newest 2,000
+  lane state events and, counted apart so they never evict those events,
+  the newest 2,000 lane accounting events of each project.
+- An offer's attachment is removed when the offer is declined, cancelled,
+  released, completed or resolved.
+- A recovery checkpoint is removed once the claim it was captured for is no
+  longer the issue's current one: released, taken again or closed.
+- An issue record keeps its newest 50 history entries, plus its latest claim,
+  take and complete markers.
+- The store keeps the newest 200 settled operator decisions, and an open
+  decision expires after one day.
+- Retry records keep the newest 500 calls of each participant.
 
-Everything else, messages, decisions and recovery checkpoints included,
-persists until you delete it. To remove all coordination state, stop the
-server and delete the state directory:
+Everything else, messages included, persists until you delete
+it. To remove the private state of one project whose root checkout is gone,
+once the service has retired its lanes and none of its sessions runs:
+
+```sh
+agent-parley gc --project ROOT          # report what would be removed
+agent-parley gc --project ROOT --apply  # remove it
+```
+
+Its recovery checkpoints are kept under `recovered/` in the state directory
+unless you add `--yes`, which deletes them too. A project whose root still
+exists is never removed this way.
+
+To remove all coordination state, stop the server and delete the state
+directory:
 
 ```sh
 agent-parley down

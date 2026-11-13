@@ -1,6 +1,7 @@
 """Checks that the forge is selected per project and every choice holds."""
 
 import os
+import subprocess
 import sys
 
 import pytest
@@ -106,9 +107,84 @@ def test_github_reads_whether_the_signed_in_account_holds_an_issue(
     replies["issue"] = '{"assignees": [{"login": "operator"}]}'
     assert forge.assigned(repo, "568") is True
     replies["issue"] = "not json"
-    assert forge.assigned(repo, "568") is False
+    assert forge.assigned(repo, "568") is None
+    replies["issue"] = '{"assignees": [{"login": "operator"}]}'
     replies["api"] = None
-    assert forge.assigned(repo, "568") is False
+    assert forge.assigned(repo, "568") is None
+
+
+def test_beads_reads_the_assignee_before_a_claim_assigns(
+    repo, tmp_path, monkeypatch
+):
+    stub_beads_cli(tmp_path, monkeypatch)
+    (repo / ".beads").mkdir()
+    assert forge.assigned(repo, "42") is False
+    replies = {"show": '{"id": "42", "assignee": "operator"}'}
+    monkeypatch.setattr(forge, "_operator", lambda: "operator")
+    monkeypatch.setattr(forge, "_run", lambda args, timeout: replies["show"])
+    assert forge.assigned(repo, "42") is True
+    replies["show"] = '[{"id": "42", "assignee": "someone"}]'
+    assert forge.assigned(repo, "42") is None
+    replies["show"] = "not json"
+    assert forge.assigned(repo, "42") is None
+    replies["show"] = None
+    assert forge.assigned(repo, "42") is None
+
+
+def test_the_open_issue_catalog_records_the_forge_update_time(
+    repo, monkeypatch
+):
+    calls = []
+    reply = (
+        '[{"number": 7, "title": "Reopened", "labels": [], "assignees": [],'
+        ' "updatedAt": "2026-10-13T10:00:00Z"},'
+        ' {"number": 8, "title": "Plain", "labels": [], "assignees": []}]'
+    )
+    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    monkeypatch.setattr(
+        forge, "_run", lambda args, timeout: calls.append(args) or reply
+    )
+    catalog = forge.open_issue_catalog(repo)
+    assert "updatedAt" in calls[0][calls[0].index("--json") + 1]
+    assert catalog["7"]["updated_at"] == 1791885600.0
+    assert "updated_at" not in catalog["8"]
+
+
+@pytest.mark.parametrize(
+    ("stderr", "kind"),
+    [
+        ("HTTP 401: Bad credentials (https://api.github.com/user)", "auth"),
+        ("To get started with GitHub CLI, please run:  gh auth login", "auth"),
+        ("HTTP 403: API rate limit exceeded for user ID 1.", "rate"),
+        ("HTTP 429: Too Many Requests", "rate"),
+        ("API rate limit exceeded for installation ID 1.", "rate"),
+        ("You have exceeded a secondary rate limit.", "rate"),
+        ("gh: Not Found (HTTP 404)", "missing"),
+        ("HTTP 403: Resource not accessible by integration", "error"),
+    ],
+)
+def test_a_failed_forge_call_records_its_class(monkeypatch, stderr, kind):
+    failed = subprocess.CompletedProcess(["gh"], 1, "", stderr)
+    monkeypatch.setattr(forge.subprocess, "run", lambda *a, **k: failed)
+    assert forge._run(["gh", "api", "user"], 5) is None
+    failure = forge.last_failure()
+    assert failure["kind"] == kind
+    assert failure["detail"] == stderr
+    passed = subprocess.CompletedProcess(["gh"], 0, "ok", "")
+    monkeypatch.setattr(forge.subprocess, "run", lambda *a, **k: passed)
+    assert forge._run(["gh", "api", "user"], 5) == "ok"
+    assert forge.last_failure() is None
+
+
+def test_a_forge_timeout_is_recorded_as_one(monkeypatch):
+    def slow(*args, **kwargs):
+        raise subprocess.TimeoutExpired(["gh"], 5)
+
+    monkeypatch.setattr(forge.subprocess, "run", slow)
+    assert forge._run(["gh", "issue", "list"], 5) is None
+    assert forge.last_failure()["kind"] == "timeout"
+    forge._failure.clear()
 
 
 def test_beads_speaks_through_bd_and_absorbs_failure(
@@ -153,7 +229,8 @@ def test_a_claim_under_beads_mirrors_through_bd_not_gh(
     assert record["title"] == "Beads title"
     recorded = calls.read_text().split("\0")[:-1]
     assert recorded[:3] == ["show", "42", "--json"]
-    assert recorded[3:6] == ["update", "42", "--assignee"]
+    assert recorded[3:6] == ["show", "42", "--json"]
+    assert recorded[6:9] == ["update", "42", "--assignee"]
 
 
 def test_participant_pr_refuses_under_a_forge_without_pull_requests(

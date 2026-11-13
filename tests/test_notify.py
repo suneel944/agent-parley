@@ -1,8 +1,14 @@
 """Checks outbound notification selection, formatting and delivery."""
 
+import hashlib
+import hmac
+import http.server
+import io
 import json
 import smtplib
+import ssl
 import sys
+import threading
 import urllib.request
 from pathlib import Path
 
@@ -205,7 +211,9 @@ def test_email_starts_tls_before_it_authenticates(monkeypatch):
         def __exit__(self, *args):
             return False
 
-        def starttls(self):
+        def starttls(self, context=None):
+            assert context.verify_mode == ssl.CERT_REQUIRED
+            assert context.check_hostname
             steps.append("starttls")
 
         def login(self, user, password):
@@ -238,6 +246,71 @@ def test_email_starts_tls_before_it_authenticates(monkeypatch):
     ]
 
 
+def mail(tls, host="smtp.example.com", user="bridge"):
+    """Builds an email configuration for one TLS mode, host and user."""
+    return {
+        "email": {
+            "host": host,
+            "port": 465,
+            "user": user,
+            "password": "secret",
+            "sender": "bridge@example.com",
+            "recipients": ["owner@example.com"],
+            "tls": tls,
+        }
+    }
+
+
+def test_implicit_tls_verifies_the_server_certificate(monkeypatch):
+    contexts = []
+
+    class Session:
+        def __init__(self, host, port, timeout=0, context=None):
+            contexts.append(context)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def login(self, user, password):
+            pass
+
+        def send_message(self, message):
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", Session)
+    notify.email(mail("implicit"), "subject", "body")
+    assert contexts[0].verify_mode == ssl.CERT_REQUIRED
+    assert contexts[0].check_hostname
+
+
+def test_email_refuses_a_clear_login_to_a_remote_host(monkeypatch):
+    monkeypatch.setattr(smtplib, "SMTP", None)
+    with pytest.raises(BridgeError, match="in the clear"):
+        notify.email(mail("none"), "subject", "body")
+    assert notify.email_fault(mail("none")["email"]).endswith(
+        "set AGENT_PARLEY_SMTP_TLS to starttls or implicit."
+    )
+    assert notify.email_fault(mail("none", host="127.0.0.1")["email"]) == ""
+    assert notify.email_fault(mail("none", user="")["email"]) == ""
+    assert notify.email_fault(mail("starttls")["email"]) == ""
+    report = notify.reported(
+        {
+            "AGENT_PARLEY_NOTIFY": "email",
+            "AGENT_PARLEY_SMTP_HOST": "smtp.example.com",
+            "AGENT_PARLEY_SMTP_FROM": "bridge@example.com",
+            "AGENT_PARLEY_SMTP_TO": "owner@example.com",
+            "AGENT_PARLEY_SMTP_TLS": "none",
+            "AGENT_PARLEY_SMTP_USER": "bridge",
+            "AGENT_PARLEY_SMTP_PASSWORD": "secret",
+        }
+    )
+    assert "AGENT_PARLEY_SMTP_TLS=none" in report["fault"]
+    assert "secret" not in report["fault"]
+
+
 def test_the_same_situation_notifies_once(tmp_path, fake):
     assert notify.deliver(
         tmp_path, "codex", notify.Event.HANDOFF_OFFERED, offer_context()
@@ -252,7 +325,8 @@ def test_the_same_situation_notifies_once(tmp_path, fake):
         offer_context(offer="def456"),
     )
     notify.drain()
-    assert len(fake) == 2
+    bodies = "\n".join(body for _, body in fake)
+    assert bodies.count("\ndecision: ") == 2
     marker = json.loads((tmp_path / "codex-notify.json").read_text())
     assert set(marker) == {"handoff_offered"}
 
@@ -281,6 +355,40 @@ def test_a_refused_send_records_one_event_and_moves_on(tmp_path, refusing):
         "notification_failed"
     ]
     assert "the bot token is rejected" in recorded[0]["cause"]
+
+
+def test_a_refused_send_is_sent_again_on_the_next_observation(
+    tmp_path, refusing
+):
+    for _ in range(2):
+        assert notify.deliver(
+            tmp_path, "codex", notify.Event.RUN_FINISHED, {"session": "s1"}
+        )
+        notify.drain()
+    assert not (tmp_path / "codex-notify.json").exists()
+
+
+def test_a_send_abandoned_by_an_exiting_process_is_not_marked(
+    tmp_path, monkeypatch
+):
+    started = []
+    monkeypatch.setitem(
+        notify.TRANSPORTS,
+        "fake",
+        lambda config, subject, body: started.append(subject),
+    )
+    monkeypatch.setenv("AGENT_PARLEY_NOTIFY", "fake")
+    monkeypatch.setattr(notify, "_SENDING", set())
+    monkeypatch.setattr(notify, "_THREADS", [])
+    monkeypatch.setattr(notify.threading.Thread, "start", lambda self: None)
+    assert notify.deliver(
+        tmp_path, "codex", notify.Event.RUN_FINISHED, {"session": "s1"}
+    )
+    assert not notify.deliver(
+        tmp_path, "codex", notify.Event.RUN_FINISHED, {"session": "s1"}
+    )
+    assert not (tmp_path / "codex-notify.json").exists()
+    assert started == []
 
 
 def test_the_test_message_reports_each_transport(tmp_path, fake):
@@ -346,14 +454,17 @@ def test_an_idle_lane_past_the_grace_period_notifies_once(
         )
         == []
     )
+    notify.drain()
+    assert len(fake) == 1
+    assert "A lane is idle with no claim" in fake[0][0]
+    assert "idle 900s with no claim" in fake[0][1]
     write_json(directory / "codex-activity.json", {"updated": 2000.0})
     assert supervision.announce_idle(
         directory, manifest, ["codex"], {"codex": 900}, 600
     ) == ["codex"]
     notify.drain()
     assert len(fake) == 2
-    assert "A lane is idle with no claim" in fake[0][0]
-    assert "idle 900s with no claim" in fake[0][1]
+    assert "A lane is idle with no claim" in fake[1][0]
 
 
 def test_a_broken_transport_leaves_the_sweep_running(tmp_path, monkeypatch):
@@ -404,3 +515,288 @@ def test_a_lane_without_transports_skips_the_notifier(tmp_path, monkeypatch):
         == ""
     )
     assert not Path(tmp_path / "codex-notify.json").exists()
+
+
+@pytest.fixture
+def unset(monkeypatch):
+    """Clears every stored notification variable from the environment."""
+    for key in notify.STORED_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_stored_settings_are_owner_only_and_merge_by_key(tmp_path, unset):
+    notify.store(tmp_path, {"AGENT_PARLEY_TELEGRAM_TOKEN": "t0ken"})
+    path = notify.store(tmp_path, {"AGENT_PARLEY_TELEGRAM_CHAT": "42"})
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert notify.stored(tmp_path) == {
+        "AGENT_PARLEY_TELEGRAM_TOKEN": "t0ken",
+        "AGENT_PARLEY_TELEGRAM_CHAT": "42",
+    }
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_SMTP_HOST"):
+        notify.store(tmp_path, {"AGENT_PARLEY_SMTP_HOST": "mail"})
+
+
+def test_the_environment_overrides_the_stored_settings(
+    tmp_path, unset, monkeypatch
+):
+    notify.store(
+        tmp_path,
+        {"AGENT_PARLEY_NOTIFY": "telegram", "AGENT_PARLEY_TELEGRAM_CHAT": "1"},
+    )
+    monkeypatch.setenv("AGENT_PARLEY_TELEGRAM_CHAT", "2")
+    values = notify.environment(tmp_path)
+    assert values["AGENT_PARLEY_NOTIFY"] == "telegram"
+    assert values["AGENT_PARLEY_TELEGRAM_CHAT"] == "2"
+    assert notify.enabled(tmp_path)
+    assert not notify.enabled()
+    assert "AGENT_PARLEY_NOTIFY" not in notify.environment()
+
+
+def test_a_service_with_no_environment_sends_on_stored_settings(
+    tmp_path, fake, monkeypatch
+):
+    monkeypatch.delenv("AGENT_PARLEY_NOTIFY")
+    directory = tmp_path / "projects" / "demo"
+    directory.mkdir(parents=True)
+    notify.store(tmp_path, {"AGENT_PARLEY_NOTIFY": "fake"})
+    manifest = {"root": "demo", "participants": {}}
+    checkpoints.announce(
+        directory,
+        "codex",
+        manifest,
+        {"provider": "codex"},
+        {"hook_event_name": "SessionEnd", "session_id": "s1"},
+        checkpoints.Reason.OBSERVED,
+    )
+    notify.drain()
+    assert len(fake) == 1
+
+
+def test_setup_reads_the_token_from_stdin_and_never_prints_it(
+    tmp_path, unset, monkeypatch, capsys
+):
+    home = tmp_path / "agent_parley_home"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("s3cret-token\n"))
+    assert not invoke(monkeypatch, "notify", "setup", "--chat", "42")
+    printed = capsys.readouterr().out
+    assert "s3cret-token" not in printed
+    assert "Notify: outbound on (telegram); inbound off" in printed
+    stored = notify.stored(home)
+    assert stored["AGENT_PARLEY_TELEGRAM_TOKEN"] == "s3cret-token"
+    assert stored["AGENT_PARLEY_TELEGRAM_CHAT"] == "42"
+    assert (home / notify.STORED_NAME).stat().st_mode & 0o077 == 0
+
+
+def test_setup_refuses_a_short_passcode_and_stores_nothing(
+    tmp_path, unset, monkeypatch
+):
+    home = tmp_path / "agent_parley_home"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("token\nshort\n"))
+    with pytest.raises(BridgeError, match="passcode"):
+        cli.secret_settings("42", True)
+    assert notify.stored(home) == {}
+
+
+def test_the_notify_line_says_why_each_direction_is_off(unset):
+    off = notify.reported({})
+    assert not off["enabled"]
+    line = cli.notification_line(off, {"enabled": False, "fault": ""})
+    assert "outbound off: No notification transport is configured" in line
+    assert "inbound off: AGENT_PARLEY_INBOUND is not set" in line
+    half = notify.reported({"AGENT_PARLEY_NOTIFY": "telegram"})
+    assert "AGENT_PARLEY_TELEGRAM_TOKEN" in half["fault"]
+    whole = notify.reported(
+        {
+            "AGENT_PARLEY_NOTIFY": "telegram",
+            "AGENT_PARLEY_TELEGRAM_TOKEN": "t",
+            "AGENT_PARLEY_TELEGRAM_CHAT": "1",
+        }
+    )
+    assert cli.notification_line(whole, {"enabled": True, "fault": ""}) == (
+        "Notify: outbound on (telegram); inbound on"
+    )
+
+
+def test_the_inbound_reader_counts_only_after_the_latest_start(tmp_path):
+    from agent_parley import inbound
+
+    log = tmp_path / "server.log"
+    assert not inbound.polling(tmp_path)
+    log.write_text(
+        "2026-09-29T10:00:00+0000 bound 127.0.0.1:1\n"
+        f"2026-09-29T10:00:01+0000 inbound {inbound.POLLING}\n"
+    )
+    assert inbound.polling(tmp_path)
+    with log.open("a") as stream:
+        stream.write("2026-09-29T11:00:00+0000 bound 127.0.0.1:1\n")
+    assert not inbound.polling(tmp_path)
+
+
+@pytest.fixture
+def receiver():
+    """Serves one loopback webhook receiver that records each request."""
+    received: list[dict] = []
+    answer = {"status": 204}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            received.append(
+                {"headers": dict(self.headers), "data": self.rfile.read(length)}
+            )
+            self.send_response(answer["status"])
+            self.end_headers()
+
+        def log_message(self, *args):
+            return None
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield {
+            "url": f"http://127.0.0.1:{server.server_port}/hook/s3cret",
+            "received": received,
+            "answer": answer,
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def webhook_config(url, secret=""):
+    """Resolves a webhook-only configuration for one URL."""
+    return notify.settings(
+        {
+            "AGENT_PARLEY_NOTIFY": "webhook",
+            "AGENT_PARLEY_WEBHOOK_URL": url,
+            "AGENT_PARLEY_WEBHOOK_SECRET": secret,
+        }
+    )
+
+
+def test_the_webhook_posts_json_every_chat_service_reads(receiver):
+    results = notify.send(webhook_config(receiver["url"]), "subject", "body")
+    assert results == [{"transport": "webhook", "ok": True, "error": ""}]
+    (request,) = receiver["received"]
+    document = json.loads(request["data"])
+    assert document == {
+        "text": "subject\n\nbody",
+        "content": "subject\n\nbody",
+        "subject": "subject",
+        "body": "body",
+    }
+    assert request["headers"]["Content-Type"] == "application/json"
+    assert notify.SIGNATURE_HEADER not in request["headers"]
+
+
+def test_a_webhook_secret_signs_the_exact_body(receiver):
+    notify.webhook(webhook_config(receiver["url"], "k3y"), "subject", "body")
+    (request,) = receiver["received"]
+    expected = hmac.new(b"k3y", request["data"], hashlib.sha256).hexdigest()
+    assert request["headers"][notify.SIGNATURE_HEADER] == f"sha256={expected}"
+
+
+def test_a_refused_webhook_never_reports_its_url(receiver):
+    receiver["answer"]["status"] = 404
+    (result,) = notify.send(webhook_config(receiver["url"]), "s", "b")
+    assert not result["ok"]
+    assert "404" in result["error"]
+    assert "s3cret" not in result["error"]
+    receiver["answer"]["status"] = 202
+    assert notify.send(webhook_config(receiver["url"]), "s", "b")[0]["ok"]
+
+
+def test_an_unreachable_webhook_never_reports_its_url(monkeypatch):
+    url = "https://hooks.example.com/services/s3cret"
+
+    def urlopen(request, timeout=0):
+        raise OSError(f"cannot reach {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    (result,) = notify.send(webhook_config(url), "s", "b")
+    assert not result["ok"]
+    assert "s3cret" not in result["error"]
+    assert notify.REDACTED_URL in result["error"]
+
+
+def test_only_https_or_a_loopback_relay_may_receive_the_webhook():
+    assert not notify.webhook_fault("https://hooks.slack.com/services/x")
+    assert not notify.webhook_fault("http://localhost:8080/relay")
+    assert not notify.webhook_fault("http://127.0.0.1/relay")
+    for url in ("http://hooks.example.com/s3cret", "ftp://x/y", "https://"):
+        fault = notify.webhook_fault(url)
+        assert "https://" in fault
+        assert "s3cret" not in fault
+    assert "AGENT_PARLEY_WEBHOOK_URL" in notify.webhook_fault("")
+    (result,) = notify.send(
+        webhook_config("http://hooks.example.com/s3cret"), "s", "b"
+    )
+    assert not result["ok"]
+    assert "s3cret" not in result["error"]
+
+
+def test_status_names_a_missing_webhook_url():
+    report = notify.reported({"AGENT_PARLEY_NOTIFY": "webhook"})
+    assert report["transports"] == ["webhook"]
+    assert "AGENT_PARLEY_WEBHOOK_URL" in report["fault"]
+    usable = notify.reported(
+        {
+            "AGENT_PARLEY_NOTIFY": "webhook",
+            "AGENT_PARLEY_WEBHOOK_URL": "https://hooks.example.com/x",
+        }
+    )
+    assert usable["fault"] == ""
+
+
+def test_status_names_each_missing_email_setting():
+    complete = {
+        "AGENT_PARLEY_NOTIFY": "email",
+        "AGENT_PARLEY_SMTP_HOST": "smtp.example.com",
+        "AGENT_PARLEY_SMTP_FROM": "bridge@example.com",
+        "AGENT_PARLEY_SMTP_TO": "owner@example.com",
+    }
+    assert notify.reported(complete)["fault"] == ""
+    for name in (
+        "AGENT_PARLEY_SMTP_HOST",
+        "AGENT_PARLEY_SMTP_FROM",
+        "AGENT_PARLEY_SMTP_TO",
+    ):
+        values = {key: value for key, value in complete.items() if key != name}
+        report = notify.reported(values)
+        assert report["transports"] == ["email"]
+        assert report["fault"] == f"Email needs {name}."
+    bare = notify.reported({"AGENT_PARLEY_NOTIFY": "email,webhook"})
+    assert bare["fault"].startswith(
+        "Email needs AGENT_PARLEY_SMTP_HOST, AGENT_PARLEY_SMTP_FROM and "
+        "AGENT_PARLEY_SMTP_TO.; "
+    )
+    assert "AGENT_PARLEY_WEBHOOK_URL" in bare["fault"]
+
+
+def test_setup_adds_the_webhook_and_keeps_telegram(
+    tmp_path, unset, monkeypatch, capsys
+):
+    home = tmp_path / "agent_parley_home"
+    home.mkdir(mode=0o700)
+    notify.store(home, {"AGENT_PARLEY_NOTIFY": "telegram"})
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO("https://hooks.example.com/s3cret\nk3y\n")
+    )
+    assert not invoke(monkeypatch, "notify", "setup", "--webhook")
+    assert "s3cret" not in capsys.readouterr().out
+    stored = notify.stored(home)
+    assert stored["AGENT_PARLEY_NOTIFY"] == "telegram,webhook"
+    assert stored["AGENT_PARLEY_WEBHOOK_URL"].endswith("/s3cret")
+    assert stored["AGENT_PARLEY_WEBHOOK_SECRET"] == "k3y"
+    assert (home / notify.STORED_NAME).stat().st_mode & 0o077 == 0
+
+
+def test_setup_refuses_a_plain_http_webhook_and_stores_nothing(
+    tmp_path, unset, monkeypatch
+):
+    monkeypatch.setattr(sys, "stdin", io.StringIO("http://example.com/x\n"))
+    with pytest.raises(BridgeError, match="Nothing stored"):
+        cli.webhook_settings({}, False)
+    with pytest.raises(BridgeError, match="Telegram only"):
+        cli.webhook_settings({}, True)

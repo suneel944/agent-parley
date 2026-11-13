@@ -634,3 +634,73 @@ def test_a_lane_without_a_record_is_still_woken(bridge, paired, monkeypatch):
     observed = supervision.presence(directory, "codex", 1)
     supervision.wake(bridge.home, directory, paired, "codex", observed, config)
     assert len(calls) == 1
+
+
+def returned_mail(bridge):
+    """Returns the dead-mail notices claude received and codex's receipts."""
+    with store.connect(bridge.home) as db:
+        notices = db.execute(
+            "SELECT m.subject,m.body_md FROM messages m "
+            "JOIN message_recipients r ON r.message_id=m.id "
+            "JOIN agents a ON a.id=r.agent_id WHERE a.name='claude' "
+            "AND m.subject LIKE 'Mail returned%'"
+        ).fetchall()
+        receipts = db.execute(
+            "SELECT r.message_id,r.superseded_reason "
+            "FROM message_recipients r JOIN agents a ON a.id=r.agent_id "
+            "WHERE a.name='codex' ORDER BY r.message_id"
+        ).fetchall()
+    return [dict(row) for row in notices], [tuple(row) for row in receipts]
+
+
+def test_mail_to_a_lane_dead_past_the_bound_returns_to_its_sender(
+    bridge, paired
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.DEAD)
+    supervision.dead_mail(bridge.home, directory, paired)
+    assert returned_mail(bridge)[0] == []
+    aged = int(supervision.DEAD_MAIL_AFTER) + 60
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("UPDATE lane_states SET since=since-?", (aged,))
+        db.execute(
+            "UPDATE messages SET created_ts=datetime('now',?)",
+            (f"-{aged} seconds",),
+        )
+    store.call(
+        bridge.home,
+        actors["claude"],
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Fresh",
+            "body_md": "Sent just now",
+            "idempotency_key": "fresh",
+        },
+    )
+    supervision.dead_mail(bridge.home, directory, paired)
+    supervision.dead_mail(bridge.home, directory, paired)
+    notices, receipts = returned_mail(bridge)
+    [notice] = notices
+    old, fresh = receipts
+    assert notice["subject"] == "Mail returned: codex is dead"
+    assert f"message {old[0]} (Review)" in notice["body_md"]
+    assert "Fresh" not in notice["body_md"]
+    assert old[1] == "codex dead past 1800s"
+    assert fresh[1] is None
+
+
+def test_mail_to_a_lane_that_is_not_dead_is_kept(bridge, paired):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    mail(bridge, actors)
+    place(bridge, paired, "codex", lanes.IDLE)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute("UPDATE lane_states SET since=0")
+        db.execute("UPDATE messages SET created_ts=datetime('now','-1 day')")
+    supervision.dead_mail(bridge.home, directory, paired)
+    notices, [receipt] = returned_mail(bridge)
+    assert notices == []
+    assert receipt[1] is None

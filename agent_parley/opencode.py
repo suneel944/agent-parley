@@ -6,10 +6,14 @@ command contract of its own. The lane therefore receives a private copy of
 that directory, selected with ``OPENCODE_CONFIG_DIR`` for one launch only,
 holding the user's configuration plus the lane's MCP server and one plugin
 that runs the configured hook command for each supported native event.
+
+The service marks coordination text delivered on every event, but only
+``chat.message`` and ``tool.execute.after`` can carry text into the session.
+The plugin therefore holds context returned to any other event and adds it,
+per session, to the next message or tool result.
 """
 
 import json
-import os
 import shlex
 import shutil
 from pathlib import Path
@@ -50,19 +54,33 @@ function decide(payload) {
 }
 
 export const AgentParley = async ({ client, directory }) => {
+  const pending = new Map();
   const payload = (name, sessionID, fields) => ({
     hook_event_name: name,
     session_id: sessionID,
     cwd: directory,
     ...fields,
   });
+  const hold = (sessionID, reply) => {
+    if (reply.context) {
+      const held = pending.get(sessionID) || [];
+      pending.set(sessionID, [...held, reply.context]);
+    }
+    return reply;
+  };
+  const take = (sessionID) => {
+    const held = pending.get(sessionID) || [];
+    pending.delete(sessionID);
+    return held.join("\\n\\n");
+  };
   return {
     event: async ({ event }) => {
       if (event.type === "session.created") {
-        decide(payload("session.created", event.properties.info.id, {}));
+        const id = event.properties.info.id;
+        hold(id, decide(payload("session.created", id, {})));
       } else if (event.type === "session.idle") {
         const id = event.properties.sessionID;
-        const reply = decide(payload("session.idle", id, {}));
+        const reply = hold(id, decide(payload("session.idle", id, {})));
         if (reply.decision === "block" && reply.reason) {
           await client.session.prompt({
             path: { id },
@@ -72,36 +90,53 @@ export const AgentParley = async ({ client, directory }) => {
       }
     },
     "chat.message": async (input, output) => {
-      const reply = decide(payload("chat.message", input.sessionID, {}));
-      if (reply.context) {
-        output.parts.push({ type: "text", text: reply.context });
+      const id = input.sessionID;
+      hold(id, decide(payload("chat.message", id, {})));
+      const context = take(id);
+      if (context) {
+        output.parts.push({ type: "text", text: context });
       }
     },
     "tool.execute.before": async (input, output) => {
-      const reply = decide(
-        payload("tool.execute.before", input.sessionID, {
-          tool_name: input.tool,
-          tool_input: output.args,
-        }),
+      const reply = hold(
+        input.sessionID,
+        decide(
+          payload("tool.execute.before", input.sessionID, {
+            tool_name: input.tool,
+            tool_input: output.args,
+          }),
+        ),
       );
       if (reply.decision === "deny") {
         throw new Error(reply.reason || "Agent Parley refused this call");
       }
     },
     "tool.execute.after": async (input, output) => {
-      decide(
-        payload("tool.execute.after", input.sessionID, {
-          tool_name: input.tool,
-          tool_response: output.output,
-        }),
+      hold(
+        input.sessionID,
+        decide(
+          payload("tool.execute.after", input.sessionID, {
+            tool_name: input.tool,
+            tool_response: output.output,
+          }),
+        ),
       );
+      const context = take(input.sessionID);
+      if (context) {
+        output.output = [output.output, context]
+          .filter((part) => part)
+          .join("\\n\\n");
+      }
     },
     "permission.ask": async (input) => {
-      decide(
-        payload("permission.ask", input.sessionID, {
-          tool_name: input.type,
-          tool_input: input.metadata,
-        }),
+      hold(
+        input.sessionID,
+        decide(
+          payload("permission.ask", input.sessionID, {
+            tool_name: input.type,
+            tool_input: input.metadata,
+          }),
+        ),
       );
     },
   };
@@ -115,13 +150,18 @@ def configure(
     url: str,
     hooks: dict,
     source_dir: str | None = None,
+    trusted: bool = False,
 ) -> Path:
     """Copies the user's OpenCode configuration into a lane-private directory.
 
-    The lane's MCP server is added under ``mcp`` and one plugin file is
-    written that runs the shared hook command for each event in ``EVENTS``.
-    Every other key of the user's ``opencode.json`` is carried unchanged, the
-    source directory is never written, and OpenCode's own authentication
+    Every file of the source directory except ``node_modules`` and ``.git``
+    is copied, so the lane sees the same agents, commands, plugins and
+    ``AGENTS.md`` as the operator. The lane's MCP server is then added under
+    ``mcp`` and one plugin file is written that runs the shared hook command
+    for each event in ``EVENTS``. Every other key of the user's
+    ``opencode.json`` is carried unchanged, except that relative
+    ``instructions`` entries are made absolute under the source directory.
+    The source directory is never written, and OpenCode's own authentication
     store outside the configuration directory stays in effect.
 
     Args:
@@ -129,22 +169,21 @@ def configure(
         name: Validated participant name.
         url: Authenticated loopback MCP endpoint.
         hooks: Common checkpoint hook definitions.
-        source_dir: Configuration directory selected by the launch
-            environment; OpenCode's default location when unset.
+        source_dir: Configuration directory selected by the lane's
+            credential profile; OpenCode's default location when unset,
+            whatever the caller's environment exports.
+        trusted: Whether the operator opted this lane in to pre-approving
+            the bridge's own tools, which allows only ``agent_parley_*``.
 
     Returns:
         Directory for OPENCODE_CONFIG_DIR in this launch only.
 
     Raises:
         BridgeError: If the user's configuration cannot safely accept the
-            lane server or plugin.
+            lane server or plugin, or already holds a plugin file named
+            ``agent-parley.js``.
     """
-    source = Path(
-        source_dir
-        or os.environ.get(
-            "OPENCODE_CONFIG_DIR", str(Path.home() / ".config" / "opencode")
-        )
-    )
+    source = Path(source_dir or Path.home() / ".config" / "opencode")
     if (source / "opencode.jsonc").exists() and not (source / CONFIG).exists():
         raise BridgeError(
             f"{source / 'opencode.jsonc'} cannot be carried into a lane "
@@ -173,11 +212,43 @@ def configure(
             protocol.HEADER: str(protocol.PROTOCOL),
         },
     }
+    if trusted:
+        permission = settings.setdefault("permission", {})
+        if not isinstance(permission, dict):
+            raise BridgeError(
+                "OpenCode permission settings must be an object to carry "
+                "the bridge tool approval."
+            )
+        permission["agent_parley_*"] = "allow"
     command = shlex.split(hooks["PreToolUse"][0]["hooks"][0]["command"])
     command += ["--adapter", "opencode"]
+    if (source / "plugin" / "agent-parley.js").exists():
+        raise BridgeError(
+            f"{source / 'plugin' / 'agent-parley.js'} would be replaced by "
+            "the lane's bridge plugin; rename it first."
+        )
+    instructions = settings.get("instructions")
+    if isinstance(instructions, list):
+        settings["instructions"] = [
+            str(source / entry)
+            if isinstance(entry, str)
+            and not entry.startswith(("~", "http://", "https://"))
+            and not Path(entry).is_absolute()
+            else entry
+            for entry in instructions
+        ]
     overlay = directory / f"{name}-opencode"
     shutil.rmtree(overlay, ignore_errors=True)
-    (overlay / "plugin").mkdir(parents=True, mode=0o700)
+    if source.is_dir():
+        shutil.copytree(
+            source,
+            overlay,
+            symlinks=True,
+            ignore=shutil.ignore_patterns("node_modules", ".git"),
+        )
+    overlay.mkdir(parents=True, mode=0o700, exist_ok=True)
+    overlay.chmod(0o700)
+    (overlay / "plugin").mkdir(mode=0o700, exist_ok=True)
     write_json(overlay / CONFIG, settings)
     write_text(
         overlay / "plugin" / "agent-parley.js",

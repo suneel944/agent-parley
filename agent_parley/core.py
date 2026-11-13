@@ -12,7 +12,10 @@ moved method reads. This module never imports `cli` at import time, because
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -23,6 +26,56 @@ from agent_parley import BridgeError
 if TYPE_CHECKING:
     from agent_parley import process
 
+TIMING_LOCK_SECONDS = 5
+
+
+def suggested_gate(root: Path) -> list[str] | None:
+    """Names the check command a repository's committed files declare.
+
+    Detection only suggests: the operator owns the merge gate, so nothing
+    found here is ever recorded. Only files committed at HEAD count, which
+    keeps an untracked scratch file from shaping the suggestion.
+
+    Args:
+        root: Base checkout of the repository.
+
+    Returns:
+        The argument list of the first match, in order: a ``Makefile``
+        ``check`` or ``test`` target, a ``package.json`` test script, a
+        ``pyproject.toml`` pytest table, a ``Cargo.toml``, a ``go.mod``;
+        None when nothing matches or HEAD cannot be read.
+    """
+    from agent_parley.cli import git
+
+    try:
+        committed = set(git(root, "ls-tree", "--name-only", "HEAD").split())
+        files = {
+            name: git(root, "show", f"HEAD:{name}")
+            for name in ("Makefile", "package.json", "pyproject.toml")
+            if name in committed
+        }
+    except BridgeError:
+        return None
+    targets = re.findall(
+        r"^([\w.-]+)\s*:", files.get("Makefile", ""), re.MULTILINE
+    )
+    for target in ("check", "test"):
+        if target in targets:
+            return ["make", target]
+    try:
+        scripts = json.loads(files.get("package.json") or "{}")["scripts"]
+    except (ValueError, KeyError, TypeError):
+        scripts = {}
+    if isinstance(scripts, dict) and scripts.get("test"):
+        return ["npm", "test"]
+    if "[tool.pytest" in files.get("pyproject.toml", ""):
+        return ["pytest", "-q"]
+    if "Cargo.toml" in committed:
+        return ["cargo", "test"]
+    if "go.mod" in committed:
+        return ["go", "test", "./..."]
+    return None
+
 
 class BridgeCore:
     """Private state root, mail server and project lanes of the bridge.
@@ -31,7 +84,12 @@ class BridgeCore:
         home: Resolved private state directory.
         config: Local HTTP port and bearer credential.
         url: Loopback HTTP origin of the mail server.
+        preserved: The notice naming the stash entry registration made of
+            the base checkout's pending changes, empty when nothing was
+            stashed, so `run` can repeat it after the native CLI exits.
     """
+
+    preserved: str = ""
 
     def __init__(self, home: Path) -> None:
         """Loads or initializes private configuration under home."""
@@ -41,7 +99,8 @@ class BridgeCore:
         self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.home.stat().st_mode & 0o077:
             raise BridgeError(
-                f"State directory must be private: chmod 700 {self.home}"
+                f"State directory must be private: chmod 700 {self.home}",
+                next_command=f"chmod 700 {shlex.quote(str(self.home))}",
             )
         path = self.home / "config.json"
         if not path.exists():
@@ -57,6 +116,12 @@ class BridgeCore:
                         {"port": port, "token": secrets.token_urlsafe(32)},
                     )
         self.config = json.loads(path.read_text())
+        for key in ("port", "token"):
+            if key not in self.config:
+                raise BridgeError(
+                    f"{path} lacks {key!r}; the file is incomplete or "
+                    "corrupt. Remove it so the bridge writes a new one."
+                )
         self.url = f"http://127.0.0.1:{self.config['port']}"
 
     def server_process(self) -> process.ServerProcess | None:
@@ -153,6 +218,7 @@ class BridgeCore:
             subprocess,
             write_json,
         )
+        from agent_parley.hook import inherited_environment
 
         with lock(self.home / "server.lock"):
             published = self.home / "server.json"
@@ -166,14 +232,16 @@ class BridgeCore:
                     raise BridgeError(
                         "A service from an older installation is running. "
                         "Stop it with the command that started it before "
-                        "upgrading; existing sessions are preserved."
+                        "upgrading; existing sessions are preserved.",
+                        next_command=f"kill {int(record['pid'])}",
                     )
             running = self.server_process()
             if running:
                 if not self.ready():
                     raise BridgeError(
                         "Server is running but unhealthy. "
-                        f"Inspect {self.home}/server.log"
+                        f"Inspect {self.home}/server.log",
+                        next_command="agent-parley down",
                     )
                 store.initialize(self.home)
                 return
@@ -203,7 +271,7 @@ class BridgeCore:
                         str(self.home),
                     ],
                     cwd=self.home,
-                    env=os.environ.copy(),
+                    env=inherited_environment(self.home),
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=log,
@@ -231,7 +299,9 @@ class BridgeCore:
             write_json(published, failed)
             raise BridgeError(
                 "Coordination server failed to start. "
-                f"Inspect {self.home}/server.log"
+                f"Inspect {self.home}/server.log",
+                next_command="tail -n 50 "
+                + shlex.quote(str(self.home / "server.log")),
             )
 
     def down(self) -> None:
@@ -263,12 +333,28 @@ class BridgeCore:
 
         Returns:
             Main worktree and shared state directory paths.
+
+        Raises:
+            BridgeError: If ``repo`` is not inside a Git checkout, naming
+                ``--repo`` instead of repeating Git's own refusal, or if the
+                repository is bare.
         """
         from agent_parley.cli import git, hashlib
 
-        common = Path(
-            git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
-        )
+        try:
+            common = Path(
+                git(
+                    repo,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                )
+            )
+        except BridgeError as error:
+            raise BridgeError(
+                "not inside a Git repository; pass --repo PATH or run from "
+                "the checkout"
+            ) from error
         if git(repo, "rev-parse", "--is-bare-repository") == "true":
             raise BridgeError(
                 "Use a non-bare repository with an initial commit."
@@ -325,9 +411,19 @@ class BridgeCore:
         worktree to be on the wrong branch of, and reading its pruned lane
         would report an unavailable worktree as a drifted one.
 
+        A new manifest records ``case_insensitive`` when Git reports
+        ``core.ignorecase``, which Git sets from a file-system probe when the
+        repository is cloned or initialized, so reservation keys there are
+        compared without regard to case. A manifest without the field keeps
+        exact comparison.
+
         Raises:
-            BridgeError: If a checked lane left its assigned branch, or no
-                manifest exists and creation is not allowed.
+            BridgeError: If a checked lane left its assigned branch, Git
+                registers its worktree at another path, which names the
+                command that moves it back, no manifest exists and
+                creation is not allowed, or the repository has no commit
+                yet for lanes to start from, checked before any pending
+                work is stashed.
         """
         from agent_parley.cli import (
             drift,
@@ -336,6 +432,7 @@ class BridgeCore:
             json,
             lane_branch,
             preserve_pending,
+            reclaim,
             roster,
             write_json,
         )
@@ -353,22 +450,46 @@ class BridgeCore:
                 participant = participants[name]
                 if roster.retired(participant):
                     continue
-                actual = lane_branch(Path(participant["lane"]))
+                lane = Path(participant["lane"])
+                actual = lane_branch(lane)
                 if actual != participant["branch"]:
-                    raise BridgeError(drift(name, participant, actual))
+                    if moved := reclaim.relocated(
+                        data["root"], lane, participant["branch"]
+                    ):
+                        raise BridgeError(
+                            f"{name}: {reclaim.moved_remedy(lane, moved)}."
+                        )
+                    raise BridgeError(
+                        drift(name, participant, actual),
+                        next_command=f"agent-parley participant restore {name}",
+                    )
             return data
         if not preserve:
             return roster.read(directory)
+        try:
+            base = git(root, "rev-parse", "--verify", "--quiet", "HEAD")
+        except BridgeError:
+            raise BridgeError(
+                "This repository has no commits yet; lanes start from HEAD. "
+                "Make a first commit, then retry.",
+                next_command='git commit --allow-empty -m "Initial commit"',
+            ) from None
         preserved = preserve_pending(root)
         if preserved:
+            self.preserved = preserved
             print(preserved, file=sys.stderr, flush=True)
+        try:
+            folded = git(root, "config", "--bool", "core.ignorecase")
+        except BridgeError:
+            folded = "false"
         data = {
             "version": roster.MANIFEST_VERSION,
             "root": str(root),
-            "base": git(root, "rev-parse", "--verify", "HEAD"),
+            "base": base,
             "verify": [],
             "initialize": [],
             "forge": forge.select(root),
+            **({"case_insensitive": True} if folded == "true" else {}),
             "participants": {},
         }
         write_json(path, data)
@@ -392,7 +513,9 @@ class BridgeCore:
             repo: Main checkout or linked worktree of the target repository.
             name: Participant name, unique within this project.
             provider: Provider definition; defaults to the registered one, or
-                to a provider named exactly like the participant.
+                to a provider named exactly like the participant. A new name
+                that names no provider is refused with a ``--provider``
+                remedy rather than a provider definition.
             credential: Credential profile selecting one account; defaults to
                 the profile already registered for this participant.
 
@@ -406,6 +529,7 @@ class BridgeCore:
             git,
             initialize_lane,
             lock,
+            preparation,
             roster,
             write_json,
         )
@@ -416,9 +540,20 @@ class BridgeCore:
             data = self._project(root, directory, verify={name}, preserve=True)
             participants = data["participants"]
             existing = participants.get(name)
-            provider = provider or (existing or {}).get("provider") or name
+            chosen = provider or (existing or {}).get("provider")
+            provider = chosen or name
             if credential is None:
                 credential = (existing or {}).get("credential")
+            if not chosen and provider not in roster.providers(self.home):
+                raise BridgeError(
+                    f"No provider named {name!r}; a new lane name needs "
+                    f"--provider. Run agent-parley run {name} --provider "
+                    "claude, or agent-parley provider list.",
+                    next_command=(
+                        f"agent-parley run {shlex.quote(name)} "
+                        "--provider claude"
+                    ),
+                )
             roster.provider(self.home, provider)
             if credential is not None:
                 roster.credential(self.home, credential)
@@ -460,8 +595,22 @@ class BridgeCore:
                     f"Existing lane directory for {name}; preserve or remove "
                     f"the worktree at {lane} before adding this participant."
                 )
-            git(root, "worktree", "add", "-b", branch, str(lane), data["base"])
-            if data.get("initialize"):
+            started = time.monotonic()
+            spare = self._spare(root, directory, data, branch)
+            if spare is not None:
+                lane = spare
+            else:
+                git(
+                    root,
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(lane),
+                    data["base"],
+                )
+            created = time.monotonic()
+            if spare is None and data.get("initialize"):
                 initialize_lane(lane, data["initialize"], root)
             participants[name] = {
                 "provider": provider,
@@ -470,6 +619,9 @@ class BridgeCore:
                 "branch": branch,
                 "credential": credential,
                 "scheme": "lane",
+                "launch": preparation(
+                    created - started, time.monotonic() - created
+                ),
             }
             try:
                 write_json(directory / "project.json", data)
@@ -480,6 +632,49 @@ class BridgeCore:
                 )
                 raise
             return roster.expand(data)
+
+    def _spare(
+        self, root: Path, directory: Path, data: dict, branch: str
+    ) -> Path | None:
+        """Takes a prepared spare worktree for a new lane, if one is ready.
+
+        Only a project that records a pool hands out spares. The spare's
+        branch is renamed to the lane branch the lane would otherwise have
+        been created on, so the lane starts on the current base under the
+        project's branch prefix exactly as a fresh one does. A spare whose
+        branch cannot be renamed is removed and the lane is created the
+        ordinary way. Every new lane of a pooled project then starts a
+        detached fill, so the pool regains what was taken without the
+        launch waiting for it.
+
+        Args:
+            root: Common repository root.
+            directory: Private state directory for the repository.
+            data: Manifest being updated, under the held setup lock.
+            branch: Lane branch the new lane is assigned.
+
+        Returns:
+            The spare's worktree, now on the lane branch, or None when the
+            project keeps no pool or none of its spares is usable.
+        """
+        from agent_parley import pool
+        from agent_parley.cli import git
+        from agent_parley.state import LockBusy
+
+        if not data.get("pool"):
+            return None
+        try:
+            spare = pool.take(root, directory, data)
+        except LockBusy:
+            spare = None
+        if spare is not None:
+            try:
+                git(root, "branch", "-m", spare["branch"], branch)
+            except BridgeError:
+                pool.discard(root, spare)
+                spare = None
+        pool.replenish(self.home, root, directory)
+        return None if spare is None else Path(spare["path"])
 
     def _readmit(
         self, root: Path, directory: Path, data: dict, name: str
@@ -493,23 +688,62 @@ class BridgeCore:
         credential is not reissued here; the next launch registers one, which
         is the only path that has ever issued a lane's credential.
 
+        A worktree already at the lane path is kept only when it is this
+        lane's own: on the lane branch, and neither a recorded spare nor
+        another participant's lane. Anything else is refused, because
+        adopting it would put two participants, or a lane and a spare the
+        pool may still hand out, in one worktree.
+
         Args:
             root: Common repository root.
             directory: Private state directory for the repository.
             data: Manifest being updated, under the held setup lock.
             name: Retired participant being re-admitted.
+
+        Raises:
+            BridgeError: If the lane path holds a spare, another
+                participant's lane, or a worktree on another branch.
         """
+        from agent_parley import pool
         from agent_parley.cli import (
+            drift,
             git,
             has_branch,
             initialize_lane,
+            lane_branch,
+            preparation,
             write_json,
         )
 
         participant = data["participants"][name]
         lane = Path(participant["lane"])
         branch = participant["branch"]
-        if not lane.exists():
+        if lane.exists():
+            holders = sorted(
+                other
+                for other, entry in data["participants"].items()
+                if other != name and Path(entry["lane"]) == lane
+            )
+            if holders or any(
+                Path(spare["path"]) == lane for spare in pool.spares(directory)
+            ):
+                holder = f"{holders[0]}'s lane" if holders else "a pool spare"
+                raise BridgeError(
+                    f"{name}'s recorded lane {lane} now holds {holder}, so "
+                    "re-admitting there would share one worktree. Move that "
+                    f"worktree away with `git worktree move`, then run "
+                    f"agent-parley run {shlex.quote(name)} again.",
+                    next_command=f"git -C {shlex.quote(str(root))} "
+                    "worktree list",
+                )
+            actual = lane_branch(lane)
+            if actual != branch:
+                raise BridgeError(
+                    drift(name, participant, actual),
+                    next_command=f"agent-parley participant restore {name}",
+                )
+        else:
+            started = time.monotonic()
             git(root, "worktree", "prune")
             if has_branch(root, branch):
                 git(root, "worktree", "add", str(lane), branch)
@@ -523,10 +757,42 @@ class BridgeCore:
                     str(lane),
                     data["base"],
                 )
+            created = time.monotonic()
             if data.get("initialize"):
                 initialize_lane(lane, data["initialize"], root)
+            participant["launch"] = preparation(
+                created - started, time.monotonic() - created
+            )
         participant.pop("retired", None)
         write_json(directory / "project.json", data)
+
+    def record_launch(self, directory: Path, name: str, timing: dict) -> None:
+        """Keeps a lane's launch timing on its roster entry.
+
+        The timing is a measurement, never a reason to refuse a launch, so a
+        setup lock another lane holds past a short wait leaves the previous
+        timing in place rather than failing this one.
+
+        Args:
+            directory: Private state directory for the repository.
+            name: Participant that owns the lane.
+            timing: Launch timing to record in place of the previous one.
+        """
+        import contextlib
+
+        from agent_parley.cli import lock, roster, write_json
+        from agent_parley.state import LockBusy
+
+        with (
+            contextlib.suppress(LockBusy),
+            lock(directory / "setup.lock", timeout=TIMING_LOCK_SECONDS),
+        ):
+            data = roster.read(directory)
+            participant = data["participants"].get(name)
+            if participant is None:
+                return
+            participant["launch"] = timing
+            write_json(directory / "project.json", data)
 
     def _lane(self, repo: Path, name: str) -> tuple[Path, dict, dict]:
         """Resolves one participant's state directory and manifest entry."""
@@ -538,7 +804,8 @@ class BridgeCore:
         if participant is None:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-parley participant list."
+                "run agent-parley participant list.",
+                next_command="agent-parley participant list",
             )
         return directory, data, participant
 

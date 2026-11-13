@@ -7,8 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import issues, process, store, supervision
-from agent_parley.state import write_json
+from agent_parley import (
+    attachments,
+    denials,
+    issues,
+    lanes,
+    lifecycle,
+    metrics,
+    process,
+    store,
+    supervision,
+)
+from agent_parley.state import BridgeError, write_json
 
 WINDOW = 300
 
@@ -63,6 +73,33 @@ def step(bridge, directory, paired):
     return issues.snapshot(directory)["issues"]["7"]
 
 
+def aged(directory):
+    """Ages the recorded overdue step past one inactivity window."""
+    edit(
+        directory,
+        "7",
+        lambda record: record["overdue_recovery"].update(
+            at=time.time() - WINDOW - 2
+        ),
+    )
+
+
+def woke(bridge, directory, paired, record, result="resume requested"):
+    """Records the dispatcher's wake attempt for the claim's overdue step."""
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        paired["root"],
+        "claude",
+        {
+            "at": time.time() - WINDOW - 1,
+            "backlog": [f"overdue:{record['overdue_recovery']['id']}"],
+            "attempts": 1,
+            "result": result,
+        },
+    )
+
+
 def overdue(bridge, paired):
     """Leaves claude holding an overdue claim after an hour of no tool call."""
     registered(bridge, paired)
@@ -90,16 +127,13 @@ def test_a_silent_holder_is_woken_then_offered_away_then_released(
     assert woken["attempts"] == 1
     assert woken["history"][-1]["action"] == "overdue-wake"
 
-    edit(
-        directory,
-        "7",
-        lambda record: record["overdue_recovery"].update(
-            at=time.time() - WINDOW - 1
-        ),
-    )
+    assert step(bridge, directory, paired)["offer"] is None
+    aged(directory)
+    woke(bridge, directory, paired, woken)
     offered = step(bridge, directory, paired)
     assert offered["owner"] == "claude"
     assert offered["offer"]["to"] == "codex"
+    assert "after a wake delivered at" in offered["offer"]["summary"]
     assert "Recovery checkpoint issue-7-" in offered["offer"]["summary"]
     assert offered["offer"]["commit"]
     assert offered["attempts"] == 2
@@ -265,6 +299,362 @@ def test_a_tool_call_still_running_counts_as_work(bridge, paired):
     directory = overdue(bridge, paired)
     events(directory, "claude", ("SessionStart", 40), ("PreToolUse", 30))
     assert supervision.tool_silence(directory, "claude") < WINDOW
+
+
+def test_a_long_running_tool_call_under_the_timeout_is_not_silent(
+    bridge, paired
+):
+    directory = overdue(bridge, paired)
+    events(directory, "claude", ("PreToolUse", WINDOW + 150))
+    assert supervision.tool_silence(directory, "claude") == 0.0
+    observed = supervision.presence(directory, "claude", WINDOW)
+    assert not supervision.holder_silent(directory, "claude", observed, WINDOW)
+    kept = step(bridge, directory, paired)
+    assert kept["owner"] == "claude"
+    assert "overdue_recovery" not in kept
+
+
+def polled_three_times(bridge, directory, paired):
+    """Polls three times, ageing the step and recording a wake between."""
+    for _ in range(3):
+        kept = step(bridge, directory, paired)
+        if kept.get("overdue_recovery"):
+            aged(directory)
+            woke(bridge, directory, paired, kept)
+    return kept
+
+
+def test_an_operator_blocked_overdue_claim_is_never_moved(bridge, paired):
+    directory = overdue(bridge, paired)
+    lifecycle.record_report(
+        directory, "claude", "blocked", "", "needs operator host", issue="7"
+    )
+    kept = polled_three_times(bridge, directory, paired)
+    assert kept["owner"] == "claude" and kept["offer"] is None
+    assert "overdue_recovery" not in kept
+    execution = lifecycle.state(kept)
+    assert execution["state"] == lifecycle.BLOCKED
+    assert execution["blocker"] == {"reason": "needs operator host"}
+    manifest = json.loads((directory / "project.json").read_text())
+    supervision.deadline_notices(directory, manifest)
+    text = issues.snapshot(directory)["issues"]["7"]["deadline_notice"]["text"]
+    assert "blocked on needs operator host" in text
+    assert "does not move it" in text and "offered away" not in text
+
+    lifecycle.record_report(
+        directory, "claude", "partial", "", "host is back", issue="7"
+    )
+    edit(
+        directory, "7", lambda record: record.update(deadline=time.time() - 60)
+    )
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_a_claim_blocked_on_another_issue_is_kept(bridge, paired):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    bridge.issue(lane, "claim", "9")
+    lifecycle.record_report(
+        directory,
+        "claude",
+        "blocked",
+        "",
+        "waits on #9",
+        issue="7",
+        resume_on="9",
+    )
+    kept = polled_three_times(bridge, directory, paired)
+    assert kept["owner"] == "claude" and kept["offer"] is None
+    assert lifecycle.state(kept)["resume_when"]
+
+
+def test_an_open_denial_decision_holds_the_overdue_transition(bridge, paired):
+    directory = overdue(bridge, paired)
+    denials.record(
+        directory,
+        paired["root"],
+        "claude",
+        denials.Denial("claude", "Bash", "make deploy", "classifier"),
+        issue="7",
+    )
+    kept = polled_three_times(bridge, directory, paired)
+    assert denials.waiting(directory, "claude")
+    assert kept["owner"] == "claude" and kept["offer"] is None
+    assert "overdue_recovery" not in kept
+
+
+def test_a_blocked_lane_holds_the_overdue_transition(bridge, paired):
+    directory = overdue(bridge, paired)
+    with store.connect(bridge.home, write=True) as db:
+        lanes.transition(
+            db, paired["root"], "claude", lanes.BLOCKED, cause="approval"
+        )
+    kept = polled_three_times(bridge, directory, paired)
+    assert kept["owner"] == "claude" and kept["offer"] is None
+
+
+def test_a_wake_that_could_not_reach_the_holder_says_so(bridge, paired):
+    directory = overdue(bridge, paired)
+    woken = step(bridge, directory, paired)
+    aged(directory)
+    woke(bridge, directory, paired, woken, supervision.WAKE_UNAVAILABLE)
+    summary = step(bridge, directory, paired)["offer"]["summary"]
+    assert "could not be woken at" in summary
+    assert "after a wake" not in summary
+
+
+def test_a_wake_never_attempted_advances_one_window_after_the_step(
+    bridge, paired
+):
+    directory = overdue(bridge, paired)
+    step(bridge, directory, paired)
+    aged(directory)
+    asked = issues.snapshot(directory)["issues"]["7"]["overdue_recovery"]["at"]
+    offered = step(bridge, directory, paired)
+    moment = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(asked + WINDOW))
+    assert offered["offer"]["to"] == "codex"
+    assert f"could not be woken at {moment}" in offered["offer"]["summary"]
+    assert offered["history"][-1]["action"] == "overdue-offer"
+
+
+def test_a_declared_wait_holds_the_overdue_transition(bridge, paired):
+    directory = overdue(bridge, paired)
+    supervision.record_wait(
+        directory,
+        "claude",
+        "gpu forecast run",
+        time.time() + 3600,
+        supervision.DEFAULT_WAIT_CEILING,
+    )
+    kept = polled_three_times(bridge, directory, paired)
+    assert kept["owner"] == "claude" and kept["offer"] is None
+    assert "overdue_recovery" not in kept
+    wait = json.loads((directory / "claude-wait.json").read_text())
+    write_json(
+        directory / "claude-wait.json", {**wait, "until": time.time() - 1}
+    )
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def reported_work(directory, work):
+    """Records the process evidence a holder's latest report named."""
+    path = directory / "claude-activity.json"
+    write_json(path, {**json.loads(path.read_text()), "work": work})
+
+
+def bound(directory, lane, pid, output=""):
+    """Builds work evidence bound to claude's claim on #7."""
+    claim_id = issues.snapshot(directory)["issues"]["7"]["claim_id"]
+    return supervision.work_evidence(lane, pid, output, "7", claim_id)
+
+
+def test_a_reported_live_process_holds_the_overdue_transition(
+    bridge, paired, worker
+):
+    directory = overdue(bridge, paired)
+    work = bound(directory, directory, worker)
+    reported_work(directory, work)
+    kept = polled_three_times(bridge, directory, paired)
+    assert kept["owner"] == "claude" and kept["offer"] is None
+    assert "overdue_recovery" not in kept
+    reported_work(directory, {**work, "ticks": "recycled"})
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_reported_work_holds_no_longer_than_the_wait_ceiling(
+    bridge, paired, worker
+):
+    directory = overdue(bridge, paired)
+    claim_id = issues.snapshot(directory)["issues"]["7"]["claim_id"]
+    work = supervision.work_evidence(
+        directory, worker, "", "7", claim_id, ceiling=60
+    )
+    assert work["until"] == pytest.approx(work["recorded_at"] + 60)
+    reported_work(directory, work)
+    assert step(bridge, directory, paired)["offer"] is None
+    reported_work(directory, {**work, "until": time.time() - 1})
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_a_report_naming_a_process_that_is_not_its_work_is_refused(
+    tmp_path,
+):
+    for pid, refusal in (
+        (1, "is not running"),
+        (os.getpid(), "lane's own session"),
+        (os.getppid(), "lane's own session"),
+    ):
+        with pytest.raises(BridgeError, match=refusal):
+            supervision.work_evidence(tmp_path, pid, "", "7", "c")
+
+
+def test_a_report_naming_its_session_or_another_users_process_is_refused(
+    tmp_path, worker, monkeypatch
+):
+    with pytest.raises(BridgeError, match="lane's own session"):
+        supervision.work_evidence(tmp_path, worker, "", "7", "c", 60, worker)
+    monkeypatch.setattr(process, "read_ps_field", lambda field, pid: "0")
+    monkeypatch.setattr(supervision.os, "getuid", lambda: 4242)
+    with pytest.raises(BridgeError, match="belongs to another user"):
+        supervision.work_evidence(tmp_path, worker, "", "7", "c")
+
+
+def test_an_output_file_outside_the_lane_is_refused(bridge, paired):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    for outside in (
+        directory / "claude-activity.json",
+        bridge.home / "state.db",
+        lane.parent.parent / "elsewhere.log",
+        "../claude-activity.json",
+    ):
+        with pytest.raises(BridgeError, match="inside the lane worktree"):
+            bound(directory, lane, None, str(outside))
+    scratch = lanes.extras(lane) / "job.log"
+    assert bound(directory, lane, None, str(scratch))["output"] == str(
+        scratch.resolve()
+    )
+
+
+def test_an_advancing_output_file_holds_the_overdue_transition(bridge, paired):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    output = lanes.extras(lane) / "forecast.log"
+    output.parent.mkdir()
+    output.write_text("epoch 1\n")
+    stamp = time.time() - 3600
+    os.utime(output, (stamp, stamp))
+    reported_work(directory, bound(directory, lane, None, str(output)))
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+    output.write_text("epoch 2\n")
+    kept = step(bridge, directory, paired)
+    assert kept["offer"] is None and "overdue_recovery" not in kept
+    stale = time.time() - supervision.TOOL_TIMEOUT - 5
+    os.utime(output, (stale, stale))
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
+
+
+def test_a_waiting_report_records_the_work_it_names(bridge, paired, worker):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    output = lanes.extras(lane) / "forecast.log"
+    bridge.report(
+        lane,
+        "waiting",
+        "gpu forecast run",
+        "",
+        "",
+        issue="7",
+        until=1,
+        pid=worker,
+        output=str(output),
+    )
+    work = json.loads((directory / "claude-activity.json").read_text())["work"]
+    assert work["pid"] == worker
+    assert work["ticks"] == process.start_ticks(worker)
+    assert work["output"] == str(output.resolve())
+    assert work["mtime"] == 0.0
+    assert (
+        work["claim_id"]
+        == issues.snapshot(directory)["issues"]["7"]["claim_id"]
+    )
+    wait = json.loads((directory / "claude-wait.json").read_text())
+    write_json(
+        directory / "claude-wait.json", {**wait, "until": time.time() - 1}
+    )
+    assert supervision.holder_held(
+        bridge.home, directory, paired["root"], "claude"
+    ) == (f"working: process {worker} is alive")
+    bridge.report(lane, "partial", "paused", "resume it", "", issue="7")
+    state = json.loads((directory / "claude-activity.json").read_text())
+    assert "work" not in state
+
+
+def test_a_refused_report_stores_no_attachment_and_a_retry_replays(
+    bridge, paired, worker, monkeypatch
+):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    long = "x" * (metrics.MAX_REPORT_BYTES + 1)
+    with pytest.raises(BridgeError, match="is not running"):
+        bridge.report(lane, "partial", "s", "r", long, issue="7", pid=2**22 + 1)
+    assert not attachments.folder(directory).exists() or not any(
+        attachments.folder(directory).iterdir()
+    )
+    bridge.report(
+        lane, "partial", "s", "r", long, key="once", issue="7", pid=worker
+    )
+    stored = sorted(attachments.folder(directory).rglob("*"))
+    monkeypatch.setattr(process, "running", lambda pid: False)
+    assert (
+        bridge.report(
+            lane, "partial", "s", "r", long, key="once", issue="7", pid=worker
+        )
+        == ""
+    )
+    assert sorted(attachments.folder(directory).rglob("*")) == stored
+
+
+def test_a_report_naming_a_stopped_process_is_refused(tmp_path):
+    with pytest.raises(BridgeError, match="is not running"):
+        supervision.work_evidence(tmp_path, 2**22 + 1, "")
+
+
+def test_a_held_holder_is_not_named_to_idle_peers(bridge, paired):
+    directory = overdue(bridge, paired)
+    manifest = json.loads((directory / "project.json").read_text())
+    pool = issues.snapshot(directory)
+    pool["issues"]["9"] = {
+        "owner": "codex",
+        "claim_id": "codex-c",
+        "offer": None,
+        "blocked_by": [],
+        "execution": {
+            "authorized": True,
+            "state": "ready",
+            "claim_id": "codex-c",
+        },
+    }
+    leads = supervision._idle_leads(
+        bridge.home, directory, manifest, "codex", pool, 0
+    )
+    assert leads["stalled"] == {"issue": "7", "owner": "claude"}
+    denials.record(
+        directory,
+        paired["root"],
+        "claude",
+        denials.Denial("claude", "Bash", "make deploy", "classifier"),
+        issue="7",
+    )
+    leads = supervision._idle_leads(
+        bridge.home, directory, manifest, "codex", pool, 0
+    )
+    assert leads["stalled"] is None
+
+
+def test_a_holder_offer_survives_the_overdue_transition(bridge, paired):
+    directory = overdue(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    woken = step(bridge, directory, paired)
+    assert woken["overdue_recovery"]["step"] == "wake"
+    bridge.issue(lane, "offer", "7", to="codex", summary="hand over")
+    chosen = issues.snapshot(directory)["issues"]["7"]["offer"]
+    aged_offer = polled_three_times(bridge, directory, paired)
+    assert aged_offer["offer"]["id"] == chosen["id"]
+    assert aged_offer["offer"]["to"] == "codex"
+    assert "overdue_recovery" not in aged_offer
+    actions = [entry["action"] for entry in aged_offer["history"]]
+    assert "cancel" not in actions
+
+    edit(
+        directory,
+        "7",
+        lambda record: record["offer"].update(deadline=time.time() - 1),
+    )
+    manifest = json.loads((directory / "project.json").read_text())
+    supervision.expire_offers(directory, manifest)
+    assert issues.snapshot(directory)["issues"]["7"]["offer"] is None
+    assert step(bridge, directory, paired)["overdue_recovery"]["step"] == "wake"
 
 
 def test_issue_list_names_a_claim_without_a_deadline(bridge, paired):

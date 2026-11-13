@@ -3,11 +3,12 @@
 import json
 import shlex
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, issues, lifecycle, plan
+from agent_parley import cli, issues, lifecycle, plan, retries
 from agent_parley.cli import git
 from agent_parley.state import BridgeError
 
@@ -119,6 +120,71 @@ def test_release_requeues_partial_work_but_never_recycles_completion(tmp_path):
         claim(tmp_path, "8")
 
 
+def test_a_released_external_blocker_stays_out_of_dispatch_until_claimed(
+    tmp_path,
+):
+    claim(tmp_path, "8")
+    claim(tmp_path, "9")
+    lifecycle.record_report(
+        tmp_path, "codex", "blocked", "", "needs 100 paper trades", issue="8"
+    )
+    for number in ("8", "9"):
+        issues.change(
+            tmp_path, "codex", "release", number, participants={"codex"}
+        )
+    ledger = issues.snapshot(tmp_path)
+    execution = ledger["issues"]["8"]["execution"]
+    assert ledger["issues"]["8"]["owner"] is None
+    assert execution["state"] == lifecycle.BLOCKED
+    assert execution["resume_when"] == {
+        "kind": "external",
+        "detail": "needs 100 paper trades",
+    }
+    assert execution["next_action"] == "wait for external"
+    assert lifecycle.actionable(ledger) == ["9"]
+    assert issues.unclaimed(ledger) == ["9"]
+
+    claim(tmp_path, "8", agent="claude")
+    lifted = issues.snapshot(tmp_path)["issues"]["8"]["execution"]
+    assert lifted["state"] == lifecycle.RUNNING
+    assert lifted["resume_when"] == ""
+
+
+@pytest.mark.parametrize("condition", ["external", "", None])
+def test_a_released_legacy_operator_blocker_keeps_its_block(condition):
+    record = {
+        "owner": "codex",
+        "execution": {
+            "authorized": True,
+            "state": lifecycle.BLOCKED,
+            "claim_id": "c1",
+            "blocker": "needs approval",
+            "resume_when": condition,
+        },
+    }
+    assert lifecycle.operator_blocked(record)
+    execution = lifecycle.released(record)
+    assert execution["state"] == lifecycle.BLOCKED
+    assert execution["blocker"] == "needs approval"
+    assert execution["claim_id"] is None
+
+
+def test_a_released_issue_blocker_returns_to_the_queue():
+    record = {
+        "owner": "codex",
+        "execution": {
+            "authorized": True,
+            "state": lifecycle.BLOCKED,
+            "claim_id": "c1",
+            "blocker": "waits on #7",
+            "resume_when": {"kind": "issue", "issue": "7"},
+        },
+    }
+    execution = lifecycle.released(record)
+    assert execution["state"] == lifecycle.QUEUED
+    assert execution["resume_when"] == ""
+
+
 def test_release_refuses_ready_work_and_preserves_its_claim(tmp_path):
     current = claim(tmp_path, "9")
     lifecycle.record_report(
@@ -129,7 +195,7 @@ def test_release_refuses_ready_work_and_preserves_its_claim(tmp_path):
         "",
     )
 
-    with pytest.raises(BridgeError, match="must remain claimed"):
+    with pytest.raises(BridgeError, match="must remain claimed") as refused:
         issues.change(
             tmp_path,
             "codex",
@@ -137,12 +203,36 @@ def test_release_refuses_ready_work_and_preserves_its_claim(tmp_path):
             "9",
             participants={"codex"},
         )
+    assert "Keep issue #9 and merge it" in str(refused.value)
+    assert "partial or blocked" in str(refused.value)
+    assert refused.value.next_command == (
+        "agent-parley participant merge codex --issue 9"
+    )
 
     record = issues.snapshot(tmp_path)["issues"]["9"]
     assert record["owner"] == "codex"
     assert record["claim_id"] == current["claim_id"]
     assert record["execution"]["state"] == lifecycle.READY
     assert record["execution"]["commit"] == "e" * 40
+
+
+def test_unowned_selection_names_its_holder_and_the_next_command(tmp_path):
+    claim(tmp_path, "9", agent="claude")
+    claim(tmp_path, "11")
+
+    with pytest.raises(BridgeError) as held:
+        issues.exact_claim(tmp_path, "codex", "9")
+    assert str(held.value) == (
+        "Issue #9 is not owned by codex; claude owns it. codex owns #11."
+    )
+    assert held.value.next_command == "agent-parley issue request 9"
+
+    with pytest.raises(BridgeError) as free:
+        issues.exact_claim(tmp_path, "codex", "12")
+    assert str(free.value) == (
+        "Issue #12 is not owned by codex; it is unclaimed. codex owns #11."
+    )
+    assert free.value.next_command == "agent-parley issue claim 12"
 
 
 def test_old_generation_and_closed_pull_request_cannot_complete_new_claim(
@@ -196,6 +286,21 @@ def test_blocked_and_ready_work_are_not_dispatched_as_continuations(tmp_path):
     assert ledger["issues"]["10"]["execution"]["next_action"] == (
         "verify and integrate"
     )
+
+
+def test_a_held_claim_whose_issue_closed_is_not_a_continuation(tmp_path):
+    claim(tmp_path, "11")
+    ledger = issues.snapshot(tmp_path)
+    assert lifecycle.actionable(ledger, "codex") == ["11"]
+
+    for responded in (None, time.time()):
+        ledger["issues"]["11"]["handoff_prompt"] = {
+            "trigger": issues.ENDED,
+            "holder": "codex",
+            "created": time.time(),
+            "responded_at": responded,
+        }
+        assert lifecycle.actionable(ledger, "codex") == []
 
 
 def test_cli_issue_resume_condition_continues_after_verified_dependency(
@@ -602,3 +707,62 @@ def test_the_operator_unblocks_an_unowned_issue_from_the_base_checkout(
         bridge.issue(lane, "unblock", "42", on="17")
     bridge.issue(repo, "unblock", "42", on="17")
     assert issues.snapshot(directory)["issues"]["42"]["blocked_by"] == []
+
+
+def test_history_is_capped_but_keeps_the_claim_marker():
+    record = {"history": []}
+    lifecycle.append_history(record, {"action": "claim", "at": 0})
+    last = 0
+    for last in range(1, lifecycle.MAX_HISTORY + 20):
+        lifecycle.append_history(record, {"action": "note", "at": last})
+    history = record["history"]
+    assert len(history) == lifecycle.MAX_HISTORY + 1
+    assert history[0] == {"action": "claim", "at": 0}
+    assert history[-1] == {"action": "note", "at": last}
+    assert history[1]["at"] == last - lifecycle.MAX_HISTORY + 1
+
+
+def test_repeated_claim_release_cycles_never_grow_past_the_cap(tmp_path):
+    """A lane cycling one issue keeps its ledger entry bounded.
+
+    At most four retained marker entries (claim, accept, take and complete)
+    can sit outside the capped recent window, so the total never exceeds
+    the cap by more than that fixed amount, however many cycles run.
+    """
+    for _ in range(lifecycle.MAX_HISTORY + 20):
+        claim(tmp_path, "42")
+        issues.change(
+            tmp_path,
+            "codex",
+            "release",
+            "42",
+            participants={"codex", "claude"},
+        )
+    record = issues.snapshot(tmp_path)["issues"]["42"]
+    assert len(record["history"]) <= lifecycle.MAX_HISTORY + 4
+
+
+def test_a_replayed_claim_omits_history_from_the_retained_result(tmp_path):
+    first = issues.change(
+        tmp_path,
+        "codex",
+        "claim",
+        "42",
+        participants={"codex", "claude"},
+        key="claim-42",
+    )
+    assert first["history"]
+    scoped = retries.scope("codex", "claim", "claim-42")
+    stored = issues.snapshot(tmp_path)["retries"][scoped]["result"]
+    assert "history" not in stored
+
+    replayed = issues.change(
+        tmp_path,
+        "codex",
+        "claim",
+        "42",
+        participants={"codex", "claude"},
+        key="claim-42",
+    )
+    assert "history" not in replayed
+    assert replayed["replayed"] is True

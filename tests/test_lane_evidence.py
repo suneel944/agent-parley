@@ -235,7 +235,7 @@ def test_a_hook_from_a_dead_lane_starts_it_before_it_works(tmp_path):
             "/r",
             [
                 {
-                    "ts": 5.0,
+                    "ts": 15.0,
                     "lane": "a",
                     "source": "PreToolUse",
                     "state": "working",
@@ -245,7 +245,7 @@ def test_a_hook_from_a_dead_lane_starts_it_before_it_works(tmp_path):
         record = lanes.read(db, "/r", "a")
         moves = [item["target"] for item in lanes.history(db, "/r", "a")]
     assert record["state"] == lanes.WORKING
-    assert record["since"] == 10.0
+    assert record["since"] == 15.0
     assert moves == [lanes.DEAD, lanes.STARTING, lanes.WORKING]
 
 

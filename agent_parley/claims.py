@@ -7,6 +7,7 @@ moved method reads. This module never imports `cli` at import time.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from pathlib import Path
 
@@ -55,6 +56,35 @@ def forge_mark(directory: Path, number: str, *, added: bool) -> bool:
     return held
 
 
+def forge_unclaim(repo: Path, directory: Path, number: str) -> bool:
+    """Removes the forge assignment a claim added, keeping the mark on failure.
+
+    The mark is read without being taken, and cleared only once the forge
+    confirms the removal, so a removal that fails is retried by the next
+    caller, `supervision.release_forge_marks` among them.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        directory: Private project state directory.
+        number: Bare repository issue number.
+
+    Returns:
+        Whether the forge removed an assignment the issue was marked for.
+    """
+    from agent_parley.cli import forge, json
+
+    try:
+        marks = json.loads((directory / FORGE_MARKS).read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(marks, dict) or marks.get(number) is not True:
+        return False
+    if not forge.unassign(repo, number):
+        return False
+    forge_mark(directory, number, added=False)
+    return True
+
+
 class ClaimsMixin(ReportsMixin):
     """Issue ledger transitions, claim forecasts and the work-order plan.
 
@@ -88,7 +118,7 @@ class ClaimsMixin(ReportsMixin):
         _, directory = self.project(repo)
         data = roster.read(directory)
         root = Path(data["root"]).resolve()
-        if repo.resolve() != root or roster.caller_lane(data):
+        if repo.resolve() != root or roster.from_lane(data):
             raise BridgeError(
                 "Live recovery approval must be recorded from the project "
                 "base checkout."
@@ -121,7 +151,9 @@ class ClaimsMixin(ReportsMixin):
 
         A claim additionally attempts a read-only forge lookup for the issue
         title. That lookup is optional context: an unavailable forge resolves
-        to no title and never blocks or fails the claim.
+        to no title and never blocks or fails the claim. The same forge
+        refuses a claim on an issue it reports closed, since that work is
+        already over; a forge that cannot be read allows the claim.
 
         A completed claim or release is then mirrored onto the host forge as
         an assignment, so the issue reads as worked outside Agent Parley. The
@@ -175,9 +207,11 @@ class ClaimsMixin(ReportsMixin):
         """
         from agent_parley.cli import (
             attachments,
+            budgets,
             change,
             forge,
             git,
+            issues,
             parse_issue,
             roster,
             snapshot,
@@ -193,7 +227,7 @@ class ClaimsMixin(ReportsMixin):
         if (
             action == "unblock"
             and lane == Path(data["root"]).resolve()
-            and not roster.caller_lane(data)
+            and not roster.from_lane(data)
         ):
             agent = roster.OPERATOR
         else:
@@ -227,6 +261,16 @@ class ClaimsMixin(ReportsMixin):
             if action == "claim"
             else None
         )
+        closed = (
+            forge.issue_completion(repo, parse_issue(number))
+            if action == "claim"
+            else None
+        )
+        if closed and closed.get("state") != "OPEN":
+            raise BridgeError(
+                f"Issue #{parse_issue(number)} is closed on the forge; "
+                "claim an open issue instead."
+            )
         carried = (
             self._carry(repo, directory, data, agent, to or "", remaining)
             if action == "offer"
@@ -243,7 +287,8 @@ class ClaimsMixin(ReportsMixin):
                 takeover = recovery.prepare_takeover(
                     directory, data, agent, parse_issue(number)
                 )
-                recovery.preflight(directory, repo, takeover["checkpoint"])
+                if takeover["checkpoint"]:
+                    recovery.preflight(directory, lane, takeover["checkpoint"])
         try:
             record = change(
                 directory,
@@ -269,6 +314,11 @@ class ClaimsMixin(ReportsMixin):
                     if action in ("claim", "request", "accept")
                     else None
                 ),
+                usage=(
+                    budgets.claim_reading(self.home, directory, data, agent)
+                    if action in ("claim", "accept")
+                    else None
+                ),
             )
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
@@ -279,11 +329,14 @@ class ClaimsMixin(ReportsMixin):
             from agent_parley import recovery
 
             if recovery.current_take(record):
-                record = recovery.restore(directory, repo, record)
+                record = recovery.restore(directory, lane, record)
             record = self._free_orphaned(data, record)
-            if not forge.assigned(repo, parse_issue(number)) and forge.assign(
+            others = issues.forge_assignees(directory, parse_issue(number))
+            if others:
+                record = {**record, "forge_assignees": others}
+            elif forge.assigned(
                 repo, parse_issue(number)
-            ):
+            ) is False and forge.assign(repo, parse_issue(number)):
                 forge_mark(directory, parse_issue(number), added=True)
             likely = self._claim_forecast(
                 repo, directory, data, agent, parse_issue(number)
@@ -291,8 +344,7 @@ class ClaimsMixin(ReportsMixin):
             if likely:
                 record = {**record, "forecast": likely}
         elif action == "release":
-            if forge_mark(directory, parse_issue(number), added=False):
-                forge.unassign(repo, parse_issue(number))
+            forge_unclaim(repo, directory, parse_issue(number))
         return record
 
     def _carry(
@@ -437,7 +489,9 @@ class ClaimsMixin(ReportsMixin):
         if previous not in data["participants"]:
             return record
         checkpoint = taken.get("checkpoint") or {}
-        source_claim = str(checkpoint.get("claim_id") or "")
+        source_claim = str(
+            checkpoint.get("claim_id") or taken.get("claim_id") or ""
+        )
         new_owner = str(record.get("owner") or "")
         if new_owner not in data["participants"]:
             return record
@@ -507,7 +561,14 @@ class ClaimsMixin(ReportsMixin):
         declared for this lane's provider. It is advice and nothing else. No
         ledger entry is written, no offer is made and no reservation is taken,
         so the lane still claims the issue it chooses through `issue claim`
-        and still races any peer that chose the same one.
+        and still races any peer that chose the same one. To make that race
+        rare, an issue another lane's published work names as its next lead
+        or first pull pick, through `supervision.named_leads`, ranks below
+        the issues no lane was pointed at, and the lead this lane's own
+        publication names, through `supervision.own_lead`, ranks first. A
+        candidate whose forecast paths run into a claim this lane holds ranks
+        above even that lead, and one whose forecast paths run into another
+        lane's live claim is held back, through `recommend.sharing`.
 
         Args:
             repo: Assigned worktree, which names the lane doing the reading.
@@ -522,12 +583,12 @@ class ClaimsMixin(ReportsMixin):
         """
         import sqlite3
 
-        from agent_parley.cli import forge, git, roster, store
+        from agent_parley.cli import forge, git, roster, store, supervision
 
         _, directory = self.project(repo)
         data = roster.read(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
-        agent = roster.resolve(data, lane)
+        agent = roster.resolve(data, lane, next_reader=True)
         participant = data["participants"][agent]
         forge.select(repo, data)
         try:
@@ -545,6 +606,9 @@ class ClaimsMixin(ReportsMixin):
                 held,
                 store.overlapping,
                 limit,
+                supervision.named_leads(directory, data, agent),
+                supervision.own_lead(directory, agent),
+                agent,
             ),
         }
 
@@ -671,6 +735,61 @@ class ClaimsMixin(ReportsMixin):
         result.update(recorded="offer", to=offer["to"], offer_id=offer["id"])
         return result
 
+    def followup_list(self, repo: Path) -> list[dict]:
+        """Lists the follow-up suggestions lanes left for the operator.
+
+        Args:
+            repo: Any checkout of the target repository.
+
+        Returns:
+            Each pending suggestion, oldest first, with its duplicates.
+
+        Raises:
+            BridgeError: If the repository has no project.
+        """
+        from agent_parley import followups
+
+        _, directory = self.project(repo)
+        return followups.pending(directory)
+
+    def followup_accept(
+        self, repo: Path, ident: str, *, milestone: str = "", to: str = ""
+    ) -> dict:
+        """Files one suggestion as an issue and offers it to an idle lane.
+
+        The decision that carried the suggestion's Telegram button is closed
+        once the issue is filed, so the button no longer answers. Closing it
+        is best effort; an unclosed one expires with the suggestion.
+
+        Args:
+            repo: Any checkout of the target repository.
+            ident: Suggestion identifier from ``followup list``.
+            milestone: Milestone title; the active milestone when empty.
+            to: Lane to offer the issue to; an idle lane when empty.
+
+        Returns:
+            What `followups.accept` returned.
+
+        Raises:
+            BridgeError: If the repository has no project, the suggestion is
+                unknown or expired, or the forge refused the filing.
+        """
+        from agent_parley import decisions, followups, roster
+
+        root, directory = self.project(repo)
+        accepted = followups.accept(
+            directory,
+            roster.read(directory),
+            root,
+            ident,
+            milestone=milestone,
+            to=to,
+        )
+        if accepted.get("decision"):
+            with contextlib.suppress(BridgeError, OSError, ValueError):
+                decisions.close(directory, accepted["decision"])
+        return accepted
+
     def issue_resolve(
         self,
         repo: Path,
@@ -718,6 +837,7 @@ class ClaimsMixin(ReportsMixin):
                 unresolved-completion escalation.
         """
         from agent_parley.cli import (
+            budgets,
             forge,
             issues,
             lifecycle,
@@ -782,7 +902,10 @@ class ClaimsMixin(ReportsMixin):
             outcome="release" if release else "complete",
             actor=roster.OPERATOR,
             reason=reason,
+            usage=budgets.claim_reading(self.home, directory, data, holder),
         )
+        if release:
+            forge_unclaim(Path(data["root"]), directory, issue)
         return {
             "issue": int(issue),
             "outcome": resolved["resolution"]["outcome"],
@@ -897,7 +1020,11 @@ class ClaimsMixin(ReportsMixin):
         }
 
     def work_plan(
-        self, repo: Path, action: str, path: Path | None = None
+        self,
+        repo: Path,
+        action: str,
+        path: Path | None = None,
+        force: bool = False,
     ) -> dict:
         """Applies, compares or reports the repository's work-order plan.
 
@@ -913,6 +1040,7 @@ class ClaimsMixin(ReportsMixin):
                 for apply.
             action: Apply, diff, or show.
             path: Plan file for apply and diff.
+            force: Whether apply restores edges accepted revisions removed.
 
         Returns:
             The recorded version for apply, the comparison for diff, or the
@@ -935,14 +1063,14 @@ class ClaimsMixin(ReportsMixin):
             data = roster.read(directory)
             checkout = Path(git(repo, "rev-parse", "--show-toplevel"))
             if checkout.resolve() != Path(data["root"]).resolve() or (
-                roster.caller_lane(data)
+                roster.from_lane(data)
             ):
                 raise BridgeError(
                     "Only the operator applies a plan, from the project base "
                     "checkout, because a plan sets the revision envelope "
                     "lanes are held to."
                 )
-        return plan.apply(directory, path)
+        return plan.apply(directory, path, force=force)
 
     def plan_revision(
         self,
@@ -960,8 +1088,9 @@ class ClaimsMixin(ReportsMixin):
 
         A proposal run from an assigned worktree is that lane's; one run from
         the project base checkout, outside every lane, is the operator's.
-        A lane running inside its own worktree cannot name a peer's worktree
-        as `--repo`, so it never proposes under the peer's name. Only the
+        A lane cannot name a peer's worktree as `--repo`: its working
+        directory and the lane credential it carries both name it, wherever
+        it runs, so it never proposes under the peer's name. Only the
         operator approves or rejects, so a lane can never widen the
         authority its own proposal needs.
 
@@ -990,16 +1119,19 @@ class ClaimsMixin(ReportsMixin):
         data = roster.read(directory)
         lane = Path(git(repo, "rev-parse", "--show-toplevel")).resolve()
         operator = lane == Path(data["root"]).resolve() and not (
-            roster.caller_lane(data)
+            roster.from_lane(data)
         )
         if action == "propose":
             by = roster.OPERATOR if operator else roster.resolve(data, lane)
-            caller = roster.caller_lane(data)
-            if not operator and caller not in (None, by):
-                raise BridgeError(
-                    f"{caller} cannot propose from {by}'s worktree; run the "
-                    "proposal from your own worktree."
-                )
+            for caller in (
+                roster.caller_lane(data),
+                roster.token_lane(self.home, data),
+            ):
+                if not operator and caller not in (None, by):
+                    raise BridgeError(
+                        f"{caller} cannot propose from {by}'s worktree; run "
+                        "the proposal from your own worktree."
+                    )
             return plan.propose(
                 directory,
                 by,

@@ -4,7 +4,15 @@ import json
 import re
 import sys
 
-from agent_parley import checkpoints, cli, metrics, roster, store, watch
+from agent_parley import (
+    checkpoints,
+    cli,
+    history,
+    metrics,
+    roster,
+    store,
+    watch,
+)
 
 DENY = {"hookSpecificOutput": {"permissionDecision": "deny"}}
 STAMPED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z (\w+) (.+)$")
@@ -67,6 +75,70 @@ def test_the_stream_starts_from_the_newest_twenty(bridge, repo, paired, capsys):
     assert len(lines) == 20
     assert lines[0] == ("denied", "denied tool-5 (observed)")
     assert lines[-1] == ("denied", "denied tool-24 (observed)")
+
+
+def test_the_backlog_left_out_never_reappears_on_a_later_poll():
+    records = [{"key": f"k{at}", "at": 1000.0 + at} for at in range(50)]
+    emitted = []
+    polls = []
+
+    def source(floor):
+        """Returns every record at or after the floor, oldest first."""
+        return [record for record in records if record["at"] >= floor]
+
+    def sleep(seconds):
+        """Counts polls and adds one record after the first."""
+        polls.append(seconds)
+        if len(polls) == 1:
+            records.append({"key": "late", "at": 1050.0})
+
+    watch.follow(
+        source,
+        emitted.append,
+        stop=lambda: len(polls) == 2,
+        sleep=sleep,
+    )
+    keys = [record["key"] for record in emitted]
+    assert keys == [f"k{at}" for at in range(30, 50)] + ["late"]
+
+
+def test_a_lane_keeps_its_mail_when_peers_fill_the_cap(
+    bridge, repo, paired, monkeypatch
+):
+    claude = registered(bridge, paired, "claude")
+    codex = registered(bridge, paired, "codex")
+    store.call(
+        bridge.home,
+        claude,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Mine",
+            "body_md": "One.",
+            "idempotency_key": "mine",
+        },
+    )
+    for number in range(3):
+        store.call(
+            bridge.home,
+            codex,
+            "send_message",
+            {
+                "to": ["claude"],
+                "subject": f"Peer {number}",
+                "body_md": ".",
+                "idempotency_key": f"peer-{number}",
+            },
+        )
+    monkeypatch.setattr(history, "MAX_RECORDS", 2)
+    directory = bridge.project(repo)[1]
+    collected = watch.collect(
+        bridge.home, directory, roster.read(directory), "claude"
+    )
+    assert any(
+        record["description"].startswith("mail sent: Mine")
+        for record in collected
+    )
 
 
 def test_since_widens_the_backlog(bridge, repo, paired, capsys):

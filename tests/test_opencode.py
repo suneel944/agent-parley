@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -150,6 +151,38 @@ def test_a_native_branch_switch_is_refused_in_plugin_schema(lane):
     assert "hookSpecificOutput" not in output
 
 
+@pytest.mark.parametrize(
+    ("command", "denied"),
+    [
+        ("git worktree add {wt}/fix -b fix/foo", False),
+        ("git -C .. worktree add {name}-wt/up", False),
+        ("git worktree add /tmp/x -b fix/foo", True),
+        ("git worktree add -b fix/foo ../beside", True),
+        ("git -C .. worktree add beside", True),
+        ("git worktree add ~/stray-wt", True),
+    ],
+)
+def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
+    path = Path(lane["lane"]).resolve()
+    home = Path("~/stray-wt").expanduser().resolve()
+    text = command.format(wt=f"{path}-wt", name=path.name)
+    output = fire(
+        lane,
+        "tool.execute.before",
+        {
+            "session_id": "ses_wt",
+            "cwd": str(path),
+            "tool_name": "bash",
+            "tool_input": {"command": text},
+        },
+    )
+    assert (output.get("decision") == "deny") is denied
+    if denied:
+        assert f"inside {path}-wt/" in output["reason"]
+    if "~" in command:
+        assert f"{home} is outside it" in output["reason"]
+
+
 def test_a_native_session_start_records_activity_and_session(lane):
     output = fire(
         lane,
@@ -257,6 +290,150 @@ def test_a_jsonc_only_configuration_is_refused_with_the_fix(bridge, tmp_path):
             bridge.hooks("lane", tmp_path),
             str(home),
         )
+
+
+def test_a_profile_overlay_keeps_every_file_and_resolves_instructions(
+    bridge, tmp_path
+):
+    home = tmp_path / "profile"
+    for relative in ("agent/a.md", "command/c.md", "AGENTS.md", "rules.md"):
+        (home / relative).parent.mkdir(parents=True, exist_ok=True)
+        (home / relative).write_text(relative)
+    (home / "node_modules" / "dep").mkdir(parents=True)
+    (home / ".git").mkdir()
+    write_json(
+        home / "opencode.json",
+        {"instructions": ["rules.md", "/abs/x.md", "https://x/y.md"]},
+    )
+    overlay = opencode.configure(
+        tmp_path,
+        "lane",
+        "http://127.0.0.1/mcp/",
+        bridge.hooks("lane", tmp_path),
+        str(home),
+    )
+    for relative in ("agent/a.md", "command/c.md", "AGENTS.md"):
+        assert (overlay / relative).read_text() == relative
+    assert (overlay / "plugin" / "agent-parley.js").exists()
+    assert not (overlay / "node_modules").exists()
+    assert not (overlay / ".git").exists()
+    assert overlay.stat().st_mode & 0o777 == 0o700
+    settings = json.loads((overlay / "opencode.json").read_text())
+    assert settings["instructions"] == [
+        str(home / "rules.md"),
+        "/abs/x.md",
+        "https://x/y.md",
+    ]
+    source = json.loads((home / "opencode.json").read_text())
+    assert source["instructions"][0] == "rules.md"
+
+
+def test_a_profile_that_already_ships_the_bridge_plugin_file_is_refused(
+    bridge, tmp_path
+):
+    home = tmp_path / "shadow"
+    (home / "plugin").mkdir(parents=True)
+    (home / "plugin" / "agent-parley.js").write_text("export {}")
+    with pytest.raises(BridgeError, match="rename it first"):
+        opencode.configure(
+            tmp_path,
+            "lane",
+            "http://127.0.0.1/mcp/",
+            bridge.hooks("lane", tmp_path),
+            str(home),
+        )
+
+
+def test_an_opted_in_overlay_allows_only_the_bridge_tools(
+    bridge, tmp_path, account
+):
+    plain = opencode.configure(
+        tmp_path,
+        "lane",
+        "http://127.0.0.1/mcp/",
+        bridge.hooks("lane", tmp_path),
+        str(account),
+    )
+    assert "permission" not in json.loads((plain / "opencode.json").read_text())
+    write_json(
+        account / "opencode.json",
+        {"permission": {"bash": "ask", "edit": "deny"}},
+    )
+    trusted = opencode.configure(
+        tmp_path,
+        "lane",
+        "http://127.0.0.1/mcp/",
+        bridge.hooks("lane", tmp_path),
+        str(account),
+        trusted=True,
+    )
+    settings = json.loads((trusted / "opencode.json").read_text())
+    assert settings["permission"] == {
+        "bash": "ask",
+        "edit": "deny",
+        "agent_parley_*": "allow",
+    }
+    assert json.loads((account / "opencode.json").read_text()) == {
+        "permission": {"bash": "ask", "edit": "deny"}
+    }
+
+
+def test_an_opt_in_over_a_non_object_permission_is_refused(
+    bridge, tmp_path, account
+):
+    write_json(account / "opencode.json", {"permission": "ask"})
+    with pytest.raises(BridgeError, match="permission settings"):
+        opencode.configure(
+            tmp_path,
+            "lane",
+            "http://127.0.0.1/mcp/",
+            bridge.hooks("lane", tmp_path),
+            str(account),
+            trusted=True,
+        )
+
+
+PLUGIN_RUN = """
+const { AgentParley } = await import(process.argv[1]);
+const hooks = await AgentParley({ client: {}, directory: "/lane" });
+await hooks.event({
+  event: { type: "session.created", properties: { info: { id: "s1" } } },
+});
+await hooks["tool.execute.before"](
+  { sessionID: "s1", tool: "bash" }, { args: {} }
+);
+const result = { title: "", output: "done", metadata: {} };
+await hooks["tool.execute.after"]({ sessionID: "s1", tool: "bash" }, result);
+const message = { parts: [] };
+await hooks["chat.message"]({ sessionID: "s1" }, message);
+console.log(JSON.stringify({ result: result.output, parts: message.parts }));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_context_from_every_event_reaches_the_session(tmp_path):
+    counter = tmp_path / "count"
+    reply = (
+        "import json, pathlib, sys; json.load(sys.stdin); "
+        f"p = pathlib.Path({str(counter)!r}); "
+        "n = int(p.read_text()) + 1 if p.exists() else 1; "
+        "p.write_text(str(n)); print(json.dumps({'context': f'Message {n}'}))"
+    )
+    plugin = tmp_path / "agent-parley.mjs"
+    plugin.write_text(
+        opencode.PLUGIN.replace(
+            "__COMMAND__", json.dumps([sys.executable, "-c", reply])
+        )
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", PLUGIN_RUN, plugin.as_uri()],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    shown = json.loads(result.stdout)
+    assert shown["result"] == "done\n\nMessage 1\n\nMessage 2\n\nMessage 3"
+    assert shown["parts"] == [{"type": "text", "text": "Message 4"}]
 
 
 def test_plugin_events_and_tool_names_reach_the_shared_parser():

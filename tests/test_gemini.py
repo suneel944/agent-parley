@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import gemini, roster, store
+from agent_parley import dialogs, gemini, hook, roster, store
 from agent_parley.state import BridgeError, write_json
 
 STUB = (
@@ -102,6 +102,38 @@ def test_a_native_branch_switch_is_refused_in_gemini_schema(lane):
     assert "owns this worktree" in output["reason"]
 
 
+@pytest.mark.parametrize(
+    ("command", "denied"),
+    [
+        ("git worktree add {wt}/fix -b fix/foo", False),
+        ("git -C .. worktree add {name}-wt/up", False),
+        ("git worktree add /tmp/x -b fix/foo", True),
+        ("git worktree add -b fix/foo ../beside", True),
+        ("git -C .. worktree add beside", True),
+        ("git worktree add ~/stray-wt", True),
+    ],
+)
+def test_a_worktree_add_outside_the_lane_wt_is_refused(lane, command, denied):
+    path = Path(lane["lane"]).resolve()
+    home = Path("~/stray-wt").expanduser().resolve()
+    text = command.format(wt=f"{path}-wt", name=path.name)
+    output = fire(
+        lane,
+        "BeforeTool",
+        {
+            "session_id": "session-wt",
+            "cwd": str(path),
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": text},
+        },
+    )
+    assert (output.get("decision") == "deny") is denied
+    if denied:
+        assert f"inside {path}-wt/" in output["reason"]
+    if "~" in command:
+        assert f"{home} is outside it" in output["reason"]
+
+
 def test_a_native_session_start_records_activity_and_session(lane):
     output = fire(
         lane,
@@ -133,6 +165,83 @@ def test_a_native_after_agent_without_coordination_ends_the_turn(lane):
     )
 
 
+def test_a_tool_permission_notification_records_the_lane_blocked(lane):
+    fire(
+        lane,
+        "SessionStart",
+        {"session_id": "session-3", "cwd": str(lane["lane"])},
+    )
+    output = fire(
+        lane,
+        "Notification",
+        {
+            "session_id": "session-3",
+            "cwd": str(lane["lane"]),
+            "notification_type": "ToolPermission",
+            "message": "Allow execution?",
+            "details": {"toolName": "run_shell_command", "command": "ls"},
+        },
+    )
+    assert output == {}
+    state = json.loads((lane["directory"] / "helper-activity.json").read_text())
+    assert state["activity"] == f"{dialogs.APPROVAL}: run_shell_command"
+    assert state["dialog"]["tool"] == "run_shell_command"
+
+
+def test_other_notifications_are_ignored_and_never_decide(lane):
+    fire(
+        lane,
+        "SessionStart",
+        {"session_id": "session-4", "cwd": str(lane["lane"])},
+    )
+    output = fire(
+        lane,
+        "Notification",
+        {
+            "session_id": "session-4",
+            "cwd": str(lane["lane"]),
+            "notification_type": "Idle",
+        },
+    )
+    assert output == {}
+    state = json.loads((lane["directory"] / "helper-activity.json").read_text())
+    assert state["activity"] == "working"
+    assert "dialog" not in state
+
+
+def test_a_tool_permission_payload_names_the_shared_tool():
+    assert gemini.payload(
+        {
+            "hook_event_name": "Notification",
+            "notification_type": "ToolPermission",
+            "details": {"toolName": "mcp_agent_parley_send_message"},
+        }
+    ) == {
+        "hook_event_name": "PermissionRequest",
+        "notification_type": "ToolPermission",
+        "details": {"toolName": "mcp_agent_parley_send_message"},
+        "tool_name": "mcp__agent_parley__send_message",
+        "tool_input": {"toolName": "mcp_agent_parley_send_message"},
+    }
+    assert gemini.payload(
+        {"hook_event_name": "Notification", "notification_type": "Idle"}
+    ) == {"hook_event_name": "Notification", "notification_type": "Idle"}
+    assert gemini.response({}) == {}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"hook_event_name": "BeforeTool", "tool_name": 5},
+        {"hook_event_name": ["BeforeTool"], "tool_name": "run_shell_command"},
+    ],
+)
+def test_a_wrongly_typed_field_passes_through_untranslated(value):
+    translated = gemini.payload(value)
+    assert translated["tool_name"] == value["tool_name"]
+    assert type(translated["hook_event_name"]) is type(value["hook_event_name"])
+
+
 def test_resume_without_a_recorded_session_is_refused(lane, bridge, repo):
     with pytest.raises(BridgeError, match="No usable native session"):
         bridge.launch("helper", repo, "Continue", "gemini", resume=True)
@@ -160,12 +269,12 @@ def test_system_policy_and_existing_hooks_survive_overlay(
         "hooks": {"BeforeTool": [{"hooks": [{"command": "native-policy"}]}]},
     }
     write_json(native, original)
-    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(native))
     result = gemini.configure(
         tmp_path,
         "lane",
         "http://127.0.0.1:42/mcp/",
         bridge.hooks("lane", tmp_path),
+        str(native),
     )
     overlay = json.loads(result.read_text())
     assert overlay["security"] == original["security"]
@@ -180,14 +289,51 @@ def test_system_policy_and_existing_hooks_survive_overlay(
 def test_disabled_native_hooks_refuse_launch(bridge, tmp_path, monkeypatch):
     native = tmp_path / "system.json"
     write_json(native, {"hooksConfig": {"enabled": False}})
-    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(native))
     with pytest.raises(BridgeError, match="disables hooks"):
         gemini.configure(
             tmp_path,
             "lane",
             "http://127.0.0.1/mcp/",
             bridge.hooks("lane", tmp_path),
+            str(native),
         )
+
+
+def test_relaunch_inside_a_lane_copies_native_policy_not_the_overlay(
+    lane, bridge, repo, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(lane["overlay"]))
+    assert bridge.launch("helper", repo, "Continue", "gemini") == 0
+    capture = json.loads((tmp_path / "capture.json").read_text())
+    settings = json.loads(Path(capture["settings"]).read_text())
+    lane_hooks = [
+        entry
+        for entry in settings["hooks"]["BeforeTool"]
+        if entry["hooks"][0]["command"].endswith("--adapter gemini")
+    ]
+    assert len(lane_hooks) == 1
+
+
+def test_inherited_environment_drops_lane_values_only(
+    bridge, monkeypatch, tmp_path
+):
+    native = tmp_path / "system.json"
+    overlay = bridge.home / "projects" / "key" / "helper-gemini-settings.json"
+    monkeypatch.setenv("GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(native))
+    monkeypatch.setenv("AMP_SETTINGS_FILE", str(overlay))
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "secret")
+    monkeypatch.setenv(hook.PARTICIPANT_ENV, "helper")
+    monkeypatch.setenv(hook.HOOK_PID_ENV, "1")
+    monkeypatch.setenv(hook.ANSWERED_ENV, "409")
+    environment = hook.inherited_environment(bridge.home)
+    assert environment["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] == str(native)
+    assert not {
+        "AMP_SETTINGS_FILE",
+        "AGENT_PARLEY_TOKEN",
+        hook.PARTICIPANT_ENV,
+        hook.HOOK_PID_ENV,
+        hook.ANSWERED_ENV,
+    } & set(environment)
 
 
 def test_native_before_tool_can_receive_denial_and_recover_via_mcp():
@@ -216,3 +362,24 @@ def test_native_before_tool_can_receive_denial_and_recover_via_mcp():
     assert gemini.response(
         {"decision": "block", "reason": "Restore branch"}
     ) == {"decision": "deny", "reason": "Restore branch"}
+
+
+def test_an_opted_in_gemini_lane_trusts_only_the_bridge_server(
+    lane, bridge, repo, capsys
+):
+    assert "trust" not in lane["settings"]["mcpServers"]["agent_parley"]
+    capsys.readouterr()
+    assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
+    assert "helper is a gemini lane" in capsys.readouterr().err
+    path = lane["directory"] / "project.json"
+    manifest = json.loads(path.read_text())
+    manifest.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
+    write_json(path, manifest)
+    lane["native"].write_text(
+        json.dumps({"mcpServers": {"docs": {"command": "docs-mcp"}}})
+    )
+    assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
+    assert "is a gemini lane" not in capsys.readouterr().err
+    servers = json.loads(lane["overlay"].read_text())["mcpServers"]
+    assert servers["agent_parley"]["trust"] is True
+    assert servers["docs"] == {"command": "docs-mcp"}

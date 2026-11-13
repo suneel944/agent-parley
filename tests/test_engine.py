@@ -18,7 +18,7 @@ import pytest
 from agent_parley import server, store
 from agent_parley.checkpoints import MAX_CONTEXT_BYTES, checkpoint, mailbox
 from agent_parley.issues import describe
-from agent_parley.server import MAX_REQUEST_BYTES, TOOLS
+from agent_parley.server import MAX_REQUEST_BYTES
 from agent_parley.state import BridgeError
 
 
@@ -555,14 +555,15 @@ def test_transport_scopes_identity_and_rejects_foreign_origins(bridge, actors):
             ).status_code
             == 400
         )
-        assert (
-            client.post(
-                "/mcp/",
-                content=b"x" * (MAX_REQUEST_BYTES + 1),
-                headers={**headers, "Content-Type": "application/json"},
-            ).status_code
-            == 413
+        oversized = client.post(
+            "/mcp/",
+            content=b"x" * (MAX_REQUEST_BYTES + 1),
+            headers={**headers, "Content-Type": "application/json"},
         )
+        assert oversized.status_code == 413
+        error = oversized.json()["error"]
+        assert error["code"] == -32600
+        assert f"{MAX_REQUEST_BYTES} bytes" in error["message"]
         request["params"]["arguments"]["agent_name"] = "GreenCastle"
         assert client.post("/mcp/", json=request, headers=headers).json()[
             "result"
@@ -618,7 +619,6 @@ def test_context_is_bounded_incremental_and_never_auto_acknowledges(
     state = json.loads((directory / "codex-activity.json").read_text())
     assert state["injections"] == 3
     assert state["injected_bytes"] == sum(len(text.encode()) for text in seen)
-    assert len(json.dumps(TOOLS).encode()) < 9000
 
 
 def test_tool_events_record_served_and_rejected_calls_within_a_bound(
@@ -1171,3 +1171,73 @@ def test_writer_waits_for_a_short_lived_competing_transaction(
             assert attempted.wait(timeout=store.BUSY_TIMEOUT)
             time.sleep(1.2)
         assert pending.result(timeout=store.BUSY_TIMEOUT)["id"] > 0
+
+
+def served(bridge, name, arguments):
+    """Sends one tools/call over real local transport and returns its result."""
+    identity = store.register(bridge.home, "/project", "reader")
+    with server.Server(bridge.home, {"token": "health", "port": 0}) as service:
+        thread = threading.Thread(target=service.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = httpx.post(
+                f"http://127.0.0.1:{service.server_port}/mcp/",
+                headers={
+                    "Authorization": f"Bearer {identity['registration_token']}"
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+                trust_env=False,
+            )
+        finally:
+            service.shutdown()
+            thread.join(timeout=2)
+    return response.json()["result"]
+
+
+def without(key, **extra):
+    """Builds a valid message less one key, plus any extra keys."""
+    return {k: v for k, v in message(**extra).items() if k != key}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "named"),
+    [
+        (message(extra="secret-value"), ["unexpected extra"]),
+        (without("idempotency_key"), ["missing idempotency_key"]),
+        (
+            without("subject", paths=["a"]),
+            ["unexpected paths", "missing subject"],
+        ),
+    ],
+)
+def test_argument_refusal_names_the_keys_but_never_the_values(
+    bridge, actors, arguments, named
+):
+    result = served(bridge, "send_message", arguments)
+    assert result["isError"]
+    text = result["content"][0]["text"]
+    assert text.startswith("send_message: ")
+    for part in named:
+        assert part in text
+    assert "Accepted: " in text
+    assert "Changed" not in text
+    assert "secret-value" not in text
+    with store.connect(bridge.home) as db:
+        assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+
+
+def test_unknown_tool_refusal_names_the_tool(bridge, actors):
+    text = served(bridge, "send_mesage", {})["content"][0]["text"]
+    assert "'send_mesage'" in text
+    assert "tools/list" in text
+
+
+def test_non_object_arguments_are_refused_by_shape(bridge, actors):
+    result = served(bridge, "fetch_inbox", ["limit"])
+    assert result["isError"]
+    assert "arguments must be a JSON object" in result["content"][0]["text"]

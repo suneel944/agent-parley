@@ -110,6 +110,25 @@ def test_a_reported_outcome_and_a_drifted_branch_select_lanes(
     ) == ["codex"]
 
 
+def test_a_retired_lane_is_never_selected(bridge, repo, paired):
+    store.initialize(bridge.home)
+    token = store.register(bridge.home, paired["root"], "codex")[
+        "registration_token"
+    ]
+    lane = store.authenticate(bridge.home, token)
+    store.call(bridge.home, lane, store.RETIRE, {})
+    directory, data = state(bridge, repo)
+    assert roster.retired(data["participants"]["codex"])
+
+    assert cli.matching_lanes(
+        bridge.home, directory, data, selector(all=True)
+    ) == ["claude"]
+    assert (
+        cli.matching_lanes(bridge.home, directory, data, selector(drifted=True))
+        == []
+    )
+
+
 def test_an_idle_selector_matches_no_freshly_started_lane(bridge, repo, paired):
     directory, data = state(bridge, repo)
 
@@ -341,6 +360,27 @@ def test_a_selected_merge_integrates_only_the_matched_lanes(
     assert "Integrated 1 of 1 lanes: claude." in report
     assert (repo / "first.txt").exists()
     assert not (repo / "second.txt").exists()
+
+
+def test_lanes_that_conflict_only_together_merge_nothing(bridge, repo, paired):
+    git(repo, "config", "user.name", "Bridge Test")
+    git(repo, "config", "user.email", "test@example.com")
+    worked(bridge, paired, "claude", "42", "shared.txt")
+    worked(bridge, paired, "codex", "43", "shared.txt")
+    head = git(repo, "rev-parse", "HEAD")
+    git_dir = Path(
+        git(repo, "rev-parse", "--path-format=absolute", "--git-dir")
+    )
+
+    preview = bridge.integrate(repo, preview=True)
+    assert "would conflict in: shared.txt" in preview
+    with pytest.raises(BridgeError, match="nothing merged") as refused:
+        bridge.integrate(repo)
+
+    assert "would conflict in: shared.txt" in str(refused.value)
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert not (git_dir / "MERGE_HEAD").exists()
+    assert git(repo, "status", "--porcelain") == ""
 
 
 def test_an_empty_selection_integrates_nothing(bridge, repo, paired):

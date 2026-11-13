@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import convergence, issues, store, supervision
+from agent_parley import (
+    convergence,
+    issues,
+    problems,
+    store,
+    supervision,
+)
 from agent_parley.state import BridgeError, write_json
 
 FAILURE = "FAILED tests/test_parser.py::test_split - AssertionError: 1 != 2"
@@ -71,6 +77,38 @@ def test_classify_reads_zero_counts_as_passing_and_keeps_no_text():
 )
 def test_only_failure_counts_and_hard_markers_are_failures(text, outcome):
     assert convergence.classify(text)[0] == outcome
+
+
+@pytest.mark.parametrize(
+    ("text", "outcome"),
+    [
+        ("make check failed, 41 passed", convergence.FAIL),
+        ("tests did not pass", convergence.FAIL),
+        ("pytest: 3 fail, 40 pass", convergence.FAIL),
+        ("gate not green yet", convergence.FAIL),
+        ("ci failing on test_wsl; lint ok", convergence.FAIL),
+        ("make check failed: ruff E501", convergence.FAIL),
+        ("error: build failed", convergence.FAIL),
+        ("exit 1", convergence.FAIL),
+        ("1 failed, 40 passed", convergence.FAIL),
+        ("412 passed in 30s", convergence.PASS),
+        ("make check: ok", convergence.PASS),
+        ("no regressions, tests pass", convergence.PASS),
+    ],
+)
+def test_negated_or_mixed_evidence_is_never_a_pass(text, outcome):
+    assert convergence.classify(text)[0] == outcome
+
+
+def test_a_failing_make_check_across_commits_reaches_the_approach():
+    outcome, mark = convergence.classify("make check failed")
+    entry = folded(
+        item(outcome, "a" * 40, 1.0, mark),
+        item(outcome, "b" * 40, 2.0, mark),
+        item(outcome, "c" * 40, 3.0, mark),
+    )
+    assert entry["failures"] == 3 and entry["repeats"] == 3
+    assert convergence.decide(entry, 4.0, 3, 14400) == convergence.APPROACH
 
 
 def test_ready_evidence_without_a_pass_word_is_not_a_pass():
@@ -334,6 +372,26 @@ def test_repeated_failure_escalates_once_while_the_lane_keeps_moving(
     assert shown["failures"] == 9 and shown["repeats"] == 9
     stored = (directory / convergence.PUBLICATION).read_text()
     assert "AssertionError" not in stored and "test_split" not in stored
+
+
+def test_status_and_problems_show_an_escalated_account(bridge, paired, claimed):
+    lane, directory = claimed["lane"], claimed["directory"]
+    for index in range(6):
+        failing(bridge, lane, f"change{index}")
+        if index % 3 == 2:
+            run_pass(bridge, directory)
+    assert run_pass(bridge, directory)["stage"] == convergence.ESCALATED
+    [lane_status] = [
+        participant
+        for participant in bridge.status_snapshot()["projects"][0][
+            "participants"
+        ]
+        if participant["participant"] == "claude"
+    ]
+    [claim] = lane_status["claims"]
+    assert claim["convergence"]["stage"] == convergence.ESCALATED
+    conditions = [row["condition"] for row in bridge.problems()]
+    assert problems.DIVERGING in conditions
 
 
 def test_useful_progress_records_a_milestone_and_sends_nothing(

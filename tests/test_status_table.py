@@ -8,6 +8,7 @@ import pytest
 
 from agent_parley import checkpoints, cli, store
 from agent_parley.state import write_json
+from agent_parley.status import BUCKETS
 
 
 def second_project(bridge, tmp_path):
@@ -37,7 +38,7 @@ def printed(capsys):
 
 
 def rows_of(lines):
-    """Returns the participant rows of every table in a reading."""
+    """Returns the participant rows of every table, past bucket headings."""
     rows = []
     inside = False
     for line in lines:
@@ -45,7 +46,7 @@ def rows_of(lines):
             inside = True
         elif not line or line.startswith("Hidden columns:"):
             inside = False
-        elif inside:
+        elif inside and line.partition(" (")[0].lower() not in BUCKETS:
             rows.append(line)
     return rows
 
@@ -76,6 +77,7 @@ def test_one_project_prints_one_table(bridge, repo, paired, capsys):
     ]
     assert sum(line.startswith("PARTICIPANT") for line in lines) == 1
     assert [row.split()[0] for row in rows_of(lines)] == ["claude", "codex"]
+    assert lines[lines.index(heading) + 1] == "Idle (2):"
     assert "Reported outcome" not in "\n".join(lines)
 
 
@@ -88,6 +90,19 @@ def test_several_projects_each_get_their_own_table(
     assert sum(line.startswith("PARTICIPANT") for line in lines) == 2
     assert f"Project: {other}" in lines
     assert f"Project: {repo}" in lines
+
+
+def test_projects_are_listed_in_root_order(
+    bridge, repo, paired, tmp_path, capsys
+):
+    other = second_project(bridge, tmp_path)
+    roots = sorted([str(repo), str(other)])
+    assert [
+        project["root"] for project in bridge.status_snapshot()["projects"]
+    ] == roots
+    bridge.status()
+    shown = [line for line in printed(capsys) if line.startswith("Project: ")]
+    assert shown == [f"Project: {root}" for root in roots]
 
 
 def test_a_named_participant_replaces_its_row_with_the_reading(

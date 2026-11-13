@@ -13,9 +13,11 @@ budget:
 * Served: `CONNECT_TIMEOUT` to reach the service, then at most
   `server.DECISION_SECONDS` until it answers with a decision or with
   `DECIDING`. `DECIDING` ends the hook immediately with no context, so a
-  slow decision costs 0.25 + 1.5 seconds and is never repeated. A decision
-  that injected coordination closes the reply after at most
-  `server.DELIVERY_SECONDS` more, once the lane records it as delivered.
+  slow decision costs 0.25 + 1.5 seconds and is never repeated. A tool
+  call a command guard refuses is answered with that denial instead. The client
+  confirms a whole reply with `RECEIPT`, and a decision that injected
+  coordination closes the reply after at most `server.DELIVERY_SECONDS`
+  more, once the lane records it as delivered.
 * Outage: the connection fails within `CONNECT_TIMEOUT`, then the in-process
   decision runs, which waits at most `checkpoints.LOCK_SECONDS` for the
   lane's checkpoint lock.
@@ -47,11 +49,24 @@ PATH = "/hook/"
 RAW_REPLY = "application/vnd.agent-parley.hook+raw"
 STATUS_HEADER = "X-Parley-Status"
 STDOUT_HEADER = "X-Parley-Stdout-Bytes"
+RECEIPT_HEADER = "X-Parley-Receipt"
+RECEIPT = "1"
 CLIENT_NAME = "hook-client.sh"
 RELAUNCH_STAMP = "relaunch.stamp"
 RELAUNCH_INTERVAL = 60.0
 HOOK_PID_ENV = "AGENT_PARLEY_HOOK_PID"
 ANSWERED_ENV = "AGENT_PARLEY_SERVICE_ANSWERED"
+PARTICIPANT_ENV = "AGENT_PARLEY_PARTICIPANT"
+LANE_ENV = frozenset(
+    {"AGENT_PARLEY_TOKEN", PARTICIPANT_ENV, HOOK_PID_ENV, ANSWERED_ENV}
+)
+OVERLAY_ENV = frozenset(
+    {
+        "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+        "OPENCODE_CONFIG_DIR",
+        "AMP_SETTINGS_FILE",
+    }
+)
 DECIDING = 202
 
 CLIENT_SCRIPT = r"""#!/usr/bin/env bash
@@ -77,6 +92,11 @@ while [ "$#" -gt 0 ]; do
 done
 
 payload="$(cat)"
+
+if [ "$adapter" = "copilot" ] \
+  && [ "$participant" != "${@PARTICIPANT_ENV@-}" ]; then
+  exit 0
+fi
 
 decide_in_process() {
   printf '%s' "$payload" | "@PYTHON@" -m agent_parley.hook "${arguments[@]}"
@@ -118,7 +138,8 @@ body="$body,\"payload\":$payload}"
 { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || decide_in_process
 printf 'POST @PATH@ HTTP/1.1\r\nHost: 127.0.0.1:%s\r\n'\
 'Authorization: Bearer %s\r\nContent-Type: application/json\r\n'\
-'Accept: @ACCEPT@\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
+'Accept: @ACCEPT@\r\n@receipt_header@: @RECEIPT@\r\n'\
+'Content-Length: %s\r\nConnection: close\r\n\r\n%s' \
   "$port" "$token" "${#body}" "$body" >&3 2>/dev/null || decide_in_process
 
 line=""
@@ -138,21 +159,29 @@ fi
 
 status=""
 stdout_bytes=""
+length=""
 while IFS= read -r -t @TIMEOUT@ line <&3; do
   line="${line%$'\r'}"
   [ -z "$line" ] && break
   case $line in
     "@status_header@: "*) status="${line#*: }" ;;
     "@stdout_header@: "*) stdout_bytes="${line#*: }" ;;
+    "Content-Length: "*) length="${line#*: }" ;;
   esac
 done
 [[ $status =~ ^[0-9]+$ ]] || decide_in_process
 [[ $stdout_bytes =~ ^[0-9]+$ ]] || decide_in_process
+[[ $length =~ ^[0-9]+$ ]] || decide_in_process
 
 reply=""
-IFS= read -r -t @TIMEOUT@ -d '' reply <&3
-result=$?
-[ "$result" -gt 128 ] && decide_in_process
+if [ "$length" -gt 0 ]; then
+  IFS= read -r -t @TIMEOUT@ -n "$length" -d '' reply <&3 \
+    || decide_in_process
+fi
+[ "${#reply}" -eq "$length" ] || decide_in_process
+trap '' PIPE
+printf '@RECEIPT@' >&3 2>/dev/null
+IFS= read -r -t @TIMEOUT@ -d '' line <&3
 exec 3<&- 3>&-
 printf '%s' "${reply:0:stdout_bytes}"
 printf '%s' "${reply:stdout_bytes}" >&2
@@ -186,7 +215,23 @@ def write_client(home: str, python: str) -> str:
     ``claude`` hook call arrived empty. ``cat`` reads descriptor 0 as it
     was given, for one short process. A
     payload past `MAX_INPUT_BYTES` goes straight to the in-process path,
-    which records it as oversize and allows the call.
+    which records it as oversize and runs only the guards its small fields
+    allow.
+
+    The reply body is read to its declared length and then confirmed with
+    `RECEIPT`, which the request announces in `RECEIPT_HEADER`. A write
+    into a connection the client stopped reading still succeeds into the
+    kernel's buffer, so only that byte tells the service the client holds
+    the context it injects; the service records mail as delivered only
+    after it arrives. The client then waits for the end of stream, which
+    the service sends once the delivery is recorded. ``read -N`` is absent
+    from Bash 3.2, so the body is read with ``-n`` and its length checked.
+
+    The script is staged in a sibling file and moved over the client in one
+    rename. Hooks keep starting while an upgrade rewrites the client, and a
+    hook that opened a file truncated in place read an empty or partial
+    script and failed with a shell parse error. Each hook now reads either
+    the old client or the new one whole.
 
     Args:
         home: Private bridge state root the client is written into.
@@ -205,12 +250,24 @@ def write_client(home: str, python: str) -> str:
         .replace("@DECIDING@", str(DECIDING))
         .replace("@MAX_INPUT@", str(MAX_INPUT_BYTES))
         .replace("@ANSWERED@", ANSWERED_ENV)
+        .replace("@PARTICIPANT_ENV@", PARTICIPANT_ENV)
         .replace("@status_header@", STATUS_HEADER)
         .replace("@stdout_header@", STDOUT_HEADER)
+        .replace("@receipt_header@", RECEIPT_HEADER)
+        .replace("@RECEIPT@", RECEIPT)
     )
-    with open(path, "w") as stream:
-        stream.write(script)
-    os.chmod(path, 0o755)
+    staged = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(staged, "w") as stream:
+            stream.write(script)
+        os.chmod(staged, 0o755)
+        os.replace(staged, path)
+    except BaseException:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -286,12 +343,18 @@ def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
         token: The lane's registration credential, sent as a bearer token.
         body: JSON request body.
 
+    A 200 reply read to its declared length is confirmed with `RECEIPT`,
+    which the request announces in `RECEIPT_HEADER`, and the end of stream
+    the service sends once it recorded the delivery is then awaited. A
+    reply that ran past `REPLY_TIMEOUT` is never confirmed, so the service
+    leaves the mail it carried unread for the lane's next event.
+
     Returns:
-        The response status and body; the service closes the connection
-        after one response, so the body ends at end of stream. A service
-        that answers from the headers alone, as it does for an oversized
-        body, may close its side before the body is fully written; the
-        reply it already sent is still read and returned.
+        The response status and body. A reply without a length ends at end
+        of stream. A service that answers from the headers alone, as it
+        does for an oversized body, may close its side before the body is
+        fully written; the reply it already sent is still read and
+        returned.
 
     Raises:
         OSError: If the connection is refused or a timeout passes.
@@ -304,26 +367,95 @@ def request(port: int, token: str, body: bytes) -> tuple[int, bytes]:
         f"Host: 127.0.0.1:{port}\r\n"
         f"Authorization: Bearer {token}\r\n"
         "Content-Type: application/json\r\n"
+        f"{RECEIPT_HEADER}: {RECEIPT}\r\n"
         f"Content-Length: {len(body)}\r\n"
         "Connection: close\r\n\r\n"
     ).encode()
-    chunks = []
+    received = bytearray()
+    expected = -1
     with socket.create_connection(
         ("127.0.0.1", port), timeout=CONNECT_TIMEOUT
     ) as sock:
         sock.settimeout(REPLY_TIMEOUT)
         try:
             sock.sendall(head + body)
-            while chunk := sock.recv(65536):
-                chunks.append(chunk)
+            while expected < 0 or len(received) < expected:
+                chunk = sock.recv(READ_BLOCK)
+                if not chunk:
+                    break
+                received += chunk
+                if expected < 0:
+                    expected = framed(received)
         except (BrokenPipeError, ConnectionResetError):
-            if not chunks:
+            if not received:
                 raise
-    header, _, reply = b"".join(chunks).partition(b"\r\n\r\n")
-    parts = header.split(b" ", 2)
-    if len(parts) < 2 or not parts[1].isdigit():
-        raise ValueError("reply has no status line")
+        header, _, reply = bytes(received).partition(b"\r\n\r\n")
+        parts = header.split(b" ", 2)
+        if len(parts) < 2 or not parts[1].isdigit():
+            raise ValueError("reply has no status line")
+        if parts[1] == b"200" and 0 <= expected <= len(received):
+            try:
+                sock.sendall(RECEIPT.encode())
+                while sock.recv(READ_BLOCK):
+                    pass
+            except OSError:
+                pass
     return int(parts[1]), reply
+
+
+def framed(received: bytearray) -> int:
+    """Returns how many bytes a reply spans once its headers have arrived.
+
+    Args:
+        received: Bytes of the reply read so far.
+
+    Returns:
+        The length of the headers plus the declared body, or -1 while the
+        headers are incomplete or declare no length, in which case the
+        reply ends at end of stream.
+    """
+    end = received.find(b"\r\n\r\n")
+    if end < 0:
+        return -1
+    for line in bytes(received[:end]).split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            text = value.strip()
+            return end + 4 + int(text) if text.isdigit() else -1
+    return -1
+
+
+def inherited_environment(home: str | os.PathLike[str]) -> dict[str, str]:
+    """Returns this process's environment without lane-only variables.
+
+    A lane's native client and every hook it runs carry the lane's token,
+    participant name, hook process and service status, and the overlay
+    paths its launch selected. A service start, lane resume or pool fill
+    started from inside a lane must not hand those to its own children: a
+    resumed Gemini lane would otherwise copy its previous overlay, which
+    already defines this bridge's server, as native system policy.
+
+    An overlay variable is dropped only when it names a path inside
+    ``home``, where launches write their overlays, so an operator's own
+    native system policy or configuration directory is still carried.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        A copy of the environment safe to give a detached child.
+    """
+    state = os.path.realpath(home)
+    environment = {}
+    for name, value in os.environ.items():
+        if name in LANE_ENV:
+            continue
+        if name in OVERLAY_ENV and value:
+            path = os.path.realpath(value)
+            if os.path.commonpath([state, path]) == state:
+                continue
+        environment[name] = value
+    return environment
 
 
 def relaunch(home: str) -> None:
@@ -343,6 +475,10 @@ def relaunch(home: str) -> None:
     backward clock step leaves, is read as expired rather than holding
     relaunch off until the clock catches up.
 
+    A recorded service whose identity cannot be read, as when ``ps``
+    times out on a loaded macOS host, is left running rather than raced
+    by a second start.
+
     A home with no record is left alone: nothing claimed to serve it, and
     the first start belongs to the lane launch or to the operator. The
     request is detached and never waited on, so the hook that made it
@@ -360,7 +496,12 @@ def relaunch(home: str) -> None:
     try:
         with open(os.path.join(home, "server.json")) as stream:
             record = json.load(stream)
-        if process.alive(record.get("pid"), record.get("start_ticks")):
+        if (
+            process.alive_or_unknown(
+                record.get("pid"), record.get("start_ticks")
+            )
+            is not False
+        ):
             return
         failures = int(record.get("failures", 0) or 0)
         interval = RELAUNCH_INTERVAL * 2 ** min(max(failures - 1, 0), 4)
@@ -373,6 +514,7 @@ def relaunch(home: str) -> None:
             pass
         subprocess.Popen(
             [sys.executable, "-m", "agent_parley", "--home", home, "up"],
+            env=inherited_environment(home),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -429,11 +571,21 @@ def main() -> int:
     in-process decision.
 
     A payload past `MAX_INPUT_BYTES` is never posted: the service would
-    refuse it, and the in-process path records it as oversize and allows
-    the call.
+    refuse it, and the in-process path records it as oversize and runs
+    only the guards its small fields allow.
+
+    A Copilot profile runs every hook registered in it for every session on
+    it, so a ``copilot`` hook whose participant is not the session's own,
+    named in `PARTICIPANT_ENV` by the launcher, emits nothing and succeeds.
+    A session the launcher did not start carries no name, so another lane's
+    hook never decides an operator's own session either.
     """
     raw, size = read_input(sys.stdin)
     selected = options(sys.argv[1:])
+    if selected.get("adapter") == "copilot" and selected.get(
+        "participant"
+    ) != os.environ.get(PARTICIPANT_ENV):
+        return 0
     if size > MAX_INPUT_BYTES:
         return fallback(raw, "oversize payload", size=size)
     if refused := os.environ.get(ANSWERED_ENV, ""):

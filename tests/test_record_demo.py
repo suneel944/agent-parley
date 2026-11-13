@@ -3,6 +3,8 @@
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
+import pytest
+
 from scripts import record_demo
 
 SVG = "{http://www.w3.org/2000/svg}"
@@ -10,16 +12,6 @@ SVG = "{http://www.w3.org/2000/svg}"
 
 def step(prompt="$", command="agent-parley top", output=("ready",)):
     return record_demo.Step(prompt, command, tuple(output))
-
-
-def test_captured_output_keeps_its_lines_and_drops_trailing_blanks():
-    assert record_demo.lines("one\ntwo\n\n\n") == ("one", "two")
-
-
-def test_a_line_wider_than_the_frame_wraps_the_way_a_terminal_wraps():
-    body = "x" * (record_demo.COLUMNS + 3)
-    wrapped = record_demo.lines(body)
-    assert wrapped == ("x" * record_demo.COLUMNS, "xxx")
 
 
 def test_a_short_step_is_shown_whole():
@@ -144,13 +136,51 @@ def test_the_asset_is_one_svg_showing_a_single_frame_at_a_time(tmp_path):
     assert "file_reservation_paths" in "".join(drawn)
 
 
-def test_the_committed_asset_is_the_one_the_readme_points_at():
+def test_a_cut_keeps_each_chosen_step_after_its_chapter_card():
+    lanes = record_demo.Card("CHAPTER 1", "Parallel lanes")
+    guardrails = record_demo.Card("CHAPTER 4", "Guardrails")
+    handoffs = record_demo.Card("CHAPTER 5", "Handoffs")
+    launch = record_demo.Step("$", "agent-parley run ada", (), caption="a")
+    status = record_demo.Step("$", "agent-parley status", (), caption="b")
+    hook = record_demo.Step("ada", "PreToolUse", (), caption="c")
+    offer = record_demo.Step("$", "agent-parley issue offer", (), caption="d")
+    captured = [lanes, launch, status, guardrails, hook, handoffs, offer]
+    chosen = record_demo.cut(captured, ("a", "b", "d"))
+    assert chosen == [lanes, launch, status, handoffs, offer]
+
+
+def test_a_cut_that_lost_a_caption_is_refused():
+    captured = [record_demo.Step("$", "agent-parley up", (), caption="a")]
+    with pytest.raises(RuntimeError, match="cut captions changed"):
+        record_demo.cut(captured, ("a", "gone"))
+
+
+def test_the_video_timeline_uses_the_recording_timing_and_framing():
+    card = record_demo.Card("CHAPTER 1", "Parallel lanes", ("one",))
+    rows = tuple(f"row {number}" for number in range(40)) + ("denied",)
+    captured = record_demo.Step(
+        "$", "agent-parley top --once", rows, caption="The dashboard."
+    )
+    document = record_demo.timeline([card, captured])
+    first, second = document["items"]
+    assert first["kind"] == "card" and first["start"] == 0.0
+    assert first["lines"] == ["one"]
+    assert second["start"] == card.seconds
+    assert second["seconds"] == round(record_demo.hold_seconds(captured), 3)
+    assert second["typing"] == round(record_demo.typing_seconds(captured), 3)
+    shown = [row for row, _ in second["rows"]]
+    assert shown == list(record_demo.frame(captured))
+    assert second["rows"][-1] == ["denied", record_demo.REFUSAL]
+    assert document["seconds"] == round(
+        card.seconds + record_demo.hold_seconds(captured), 3
+    )
+    assert document["columns"] == record_demo.COLUMNS
+
+
+def test_the_committed_asset_is_animated_and_private_path_free():
     root = Path(__file__).resolve().parents[1]
     asset = root / "docs" / "assets" / "demo.svg"
-    readme = (root / "README.md").read_text()
     assert asset.exists()
-    assert "docs/assets/demo.svg" in readme
-    assert "cdn.jsdelivr.net/gh/suneel944/agent-parley@main" in readme
     drawn = asset.read_text()
     assert "<animate" in drawn
     assert str(Path.home()) not in drawn

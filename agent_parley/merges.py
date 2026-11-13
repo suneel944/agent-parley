@@ -6,16 +6,18 @@ import json
 import shlex
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Sequence
 from pathlib import Path
 
-from agent_parley import lifecycle, policy, process, roster
+from agent_parley import approvals, lifecycle, policy, process, roster
 from agent_parley.checkpoints import (
     activity,
+    branch_head,
     current_branch,
     lane_branch,
     participant_liveness,
 )
+from agent_parley.issues import merge_claim
 from agent_parley.state import BridgeError, write_json
 from agent_parley.worktrees import GIT_SECONDS, drift, git, has_branch
 
@@ -123,6 +125,135 @@ def attributed_commits(root: Path, base: str, branch: str) -> list[str]:
     return refusals
 
 
+def predicted_conflicts(
+    root: Path, base: str, target: str
+) -> tuple[str, list[str]] | None:
+    """Predicts merging one commit onto another without touching a checkout.
+
+    `git merge-tree --write-tree` merges in the object store alone: it
+    writes the resulting tree as an unreferenced object and changes no ref,
+    index or working tree, so the base checkout is never left mid-merge.
+    Git before 2.38 lacks the option and answers with a usage error, and an
+    unrelated history or a timeout gives no prediction either; each returns
+    None so the caller keeps its unpredicted behavior.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        base: Commit the merge would land on.
+        target: Commit or branch the merge would carry.
+
+    Returns:
+        The resulting tree and no paths on a clean merge, an empty tree and
+        the conflicted paths on a conflict, or None when Git cannot predict.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                base,
+                target,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GIT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    lines = result.stdout.splitlines()
+    if result.returncode not in {0, 1} or not lines:
+        return None
+    if result.returncode == 0:
+        return lines[0], []
+    return "", list(dict.fromkeys(line for line in lines[1:] if line))
+
+
+def conflict_refusal(name: str, branch: str, paths: Sequence[str]) -> str:
+    """Builds the refusal for a lane whose merge is predicted to conflict.
+
+    Args:
+        name: Participant that owns the lane.
+        branch: Bridge branch the merge would carry.
+        paths: Paths the predicted merge leaves conflicted.
+
+    Returns:
+        The message naming the lane, its branch and the conflicted paths.
+    """
+    return (
+        f"Merging {branch} would conflict in: {', '.join(paths)}. Rebase "
+        f"{name}'s lane onto the base and resolve them there; nothing was "
+        "merged."
+    )
+
+
+def run_conflicts(
+    root: Path, lanes: Sequence[tuple[str, str]]
+) -> list[str] | None:
+    """Predicts an ordered run, each lane merged onto those before it.
+
+    A lane can merge cleanly onto the base alone and still conflict with
+    a lane merged ahead of it, so every clean prediction becomes an
+    unreferenced commit, with the base and the lane as its parents, that
+    the next lane is predicted against. A conflicting lane is left out of
+    the chain, as a refused lane would be. Only objects are written; no
+    ref, index or working tree changes.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        lanes: Each lane's participant and bridge branch, in merge order.
+
+    Returns:
+        One refusal per lane predicted to conflict, naming its paths, or
+        None when Git cannot predict the run.
+    """
+    base = "HEAD"
+    refusals = []
+    for name, branch in lanes:
+        predicted = predicted_conflicts(root, base, branch)
+        if predicted is None:
+            return None
+        tree, paths = predicted
+        if paths:
+            refusals.append(f"{name}: {conflict_refusal(name, branch, paths)}")
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=agent-parley",
+                    "-c",
+                    "user.email=agent-parley@localhost",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    base,
+                    "-p",
+                    branch,
+                    "-m",
+                    "Predicted lane merge",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=GIT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode or not result.stdout.strip():
+            return None
+        base = result.stdout.strip()
+    return refusals
+
+
 def merge_blockers(
     root: Path, lane: Path, name: str, branch: str, session: str = ""
 ) -> Iterator[str]:
@@ -132,7 +263,8 @@ def merge_blockers(
     collects every one of them, so both report a condition in the same
     words. The branch is examined first because nothing else can be
     inspected once it is gone, and iteration stops there. Every check reads;
-    none writes.
+    none writes, beyond the unreferenced tree `predicted_conflicts` stores
+    while it predicts whether the merge would conflict.
 
     Args:
         root: Common repository root, which is always the base checkout.
@@ -188,21 +320,32 @@ def merge_blockers(
             "Commit them in the lane first; merge only ever merges commits."
         )
     yield from attributed_commits(root, "HEAD", branch)
+    predicted = predicted_conflicts(root, "HEAD", branch)
+    if predicted and predicted[1]:
+        yield conflict_refusal(name, branch, predicted[1])
     if session:
         yield session_busy(name)
 
 
 def merge_preview(
-    root: Path, lane: Path, name: str, branch: str, session: str
+    root: Path,
+    lane: Path,
+    name: str,
+    branch: str,
+    session: str,
+    admission: Sequence[str] = (),
 ) -> str:
     """Reports what a lane merge would bring in and what would refuse it.
 
     The preview only reads: it records no merge commit, moves no branch,
     leaves the index and working tree of both checkouts alone, and never
     takes the participant's session lock, so previewing a lane while its
-    agent still works cannot make that session fail. It attempts no trial
-    merge either, so a preview that names no refusal says the merge is not
-    currently refused, never that it would apply without conflicts.
+    agent still works cannot make that session fail. Conflicts are
+    predicted in the object store by `predicted_conflicts`, so a lane that
+    would conflict is refused with its paths and one that would not is
+    reported as merging cleanly. On a Git too old to predict, a preview
+    that names no refusal says only that the merge is not currently
+    refused, never that it would apply without conflicts.
 
     The file summary keeps the leading space Git indents every one of its
     rows with, which reading stripped command output would otherwise take
@@ -215,6 +358,7 @@ def merge_preview(
         branch: Bridge branch the merge would integrate.
         session: Session state when the participant holds a running session,
             or an empty string when no session blocks the merge.
+        admission: Approval and claim refusals from `admission_refusals`.
 
     Returns:
         An account of the commits the merge would carry, the files they
@@ -250,6 +394,7 @@ def merge_preview(
     if actual != branch:
         blockers.append(drift(name, {"branch": branch}, actual))
     blockers += merge_blockers(root, lane, name, branch, session)
+    blockers += admission
     if blockers:
         report.append(refused)
         report += [f"- {blocker}" for blocker in blockers]
@@ -257,9 +402,13 @@ def merge_preview(
             f"Clear those, then run `agent-parley participant merge {name}`."
         )
     elif pending:
+        clean = (
+            "It merges cleanly."
+            if predicted_conflicts(root, "HEAD", branch) is not None
+            else "The preview merges nothing, so it cannot predict conflicts."
+        )
         report.append(
-            f"Nothing refuses this merge; it would land on {base}. The "
-            "preview merges nothing, so it cannot predict conflicts."
+            f"Nothing refuses this merge; it would land on {base}. {clean}"
         )
     return "\n".join(report)
 
@@ -444,7 +593,11 @@ def reported_ready(directory: Path) -> set[str]:
 def ready_lanes(
     directory: Path, data: dict, state: dict
 ) -> dict[str, list[str]]:
-    """Maps every lane whose latest report is ready to the issues it holds.
+    """Maps every lane whose latest report is ready to the issues it merges.
+
+    Only claims reported ready, or awaiting integration recovery, are the
+    ones `merge_claim` can pick, so only their dependency edges order a run.
+    A lane's other claims, still running, never add a lane edge.
 
     Args:
         directory: Private state directory for the common repository.
@@ -453,7 +606,7 @@ def ready_lanes(
 
     Returns:
         One entry per participant whose latest report is the ready state,
-        carrying the issues that participant currently holds.
+        carrying the ready or recovering issues that participant holds.
     """
     return {
         name: sorted(
@@ -461,6 +614,8 @@ def ready_lanes(
                 number
                 for number, record in state["issues"].items()
                 if record["owner"] == name
+                and lifecycle.state(record)["state"]
+                in (lifecycle.READY, lifecycle.RECOVERY)
             ),
             key=int,
         )
@@ -507,12 +662,13 @@ def group_lanes(
 def lane_refusals(
     root: Path, directory: Path, participant: dict, name: str
 ) -> list[str]:
-    """Collects every condition that refuses one lane's merge right now.
+    """Collects every Git and session condition refusing one lane's merge.
 
-    The conditions are exactly the ones `participant merge --preview` lists,
-    read the same way and in the same words, so a bulk preflight can never
-    admit a lane the single-lane command would refuse. Every check reads; the
-    participant's session lock is never taken.
+    The conditions are the ones `participant merge --preview` lists, read
+    the same way and in the same words. A bulk preflight adds
+    `admission_refusals`, so it can never admit a lane the single-lane
+    command would refuse. Every check reads; the participant's session lock
+    is never taken.
 
     Args:
         root: Common repository root, which is always the base checkout.
@@ -542,6 +698,136 @@ def lane_refusals(
             and integration_holds(root, held)
         ):
             refusals.append(integration_hold(root, directory, held))
+    return refusals
+
+
+def stale_ready(name: str, issue: str) -> str:
+    """Builds the refusal for a lane that committed after reporting ready.
+
+    Args:
+        name: Participant that owns the lane.
+        issue: Issue whose ready report the lane head no longer matches.
+
+    Returns:
+        The message both a merge and its preflight report.
+    """
+    return (
+        f"{name} committed since issue #{issue} was reported ready; record a "
+        "new report before merging."
+    )
+
+
+def dependency_refusal(
+    state: dict, issue: str, earlier: Collection[str] = ()
+) -> str:
+    """Names the work one issue still waits on before it can be merged.
+
+    `lifecycle.complete` refuses an issue that still waits, so merging its
+    work first would leave the base holding an integration it can never
+    record complete. A blocker held by a lane that the same ordered run
+    merges earlier is integrated first and is not counted.
+
+    Args:
+        state: Published issue ledger.
+        issue: Issue whose work would be merged.
+        earlier: Issues held by lanes an ordered run merges before this one.
+
+    Returns:
+        The refusal naming each wait and the lane holding it, or an empty
+        string when the issue waits on nothing outside ``earlier``.
+    """
+    records = state["issues"]
+    waits = [
+        number
+        for number in records.get(issue, {}).get("blocked_by", [])
+        if number not in earlier
+    ]
+    if not waits:
+        return ""
+    named = []
+    for number in waits:
+        owner = records.get(number, {}).get("owner")
+        named.append(f"#{number}" + (f" (held by {owner})" if owner else ""))
+    return (
+        f"Issue #{issue} still waits on {', '.join(named)} to be verified "
+        "complete; integrate those first or drop the edge with "
+        f"`agent-parley issue unblock {issue} --on {waits[0]}`."
+    )
+
+
+def admission_refusals(
+    root: Path,
+    directory: Path,
+    data: dict,
+    state: dict,
+    name: str,
+    earlier: Collection[str] = (),
+) -> list[str]:
+    """Collects the approval and claim conditions that refuse a lane merge.
+
+    These are the refusals `participant merge` reaches before it merges
+    anything: a missing operator approval, no single ready claim, a claim
+    not reported ready, a lane that committed after its ready report, and
+    a claim that still waits on incomplete work. Reading them up front lets
+    a preview name them and a group preflight refuse the whole group before
+    its first merge. Every check reads.
+
+    Args:
+        root: Common repository root, which is always the base checkout.
+        directory: Private state directory for the common repository.
+        data: Project manifest holding the roster and approval policy.
+        state: Published issue ledger.
+        name: Participant that owns the lane.
+        earlier: Issues held by lanes an ordered run merges before this one.
+
+    Returns:
+        One refusal message per unmet condition, empty when none applies.
+    """
+    participant = data["participants"][name]
+    refusals = []
+    if "merge" in data["approval"]:
+        try:
+            reviewed = approvals.review(
+                directory,
+                data,
+                name,
+                branch_head(root, participant["branch"]),
+            )
+        except BridgeError as unreadable:
+            refusals.append(str(unreadable))
+        else:
+            refused = approvals.refusal(name, "merge", reviewed)
+            if refused:
+                refusals.append(refused)
+    try:
+        claim = merge_claim(directory, name)
+    except BridgeError as ambiguous:
+        return [*refusals, str(ambiguous)]
+    if claim["issue"] is None:
+        return refusals
+    issue = str(claim["issue"])
+    execution = lifecycle.state(state["issues"].get(issue, {}))
+    repairing = False
+    if execution["state"] == lifecycle.RECOVERY:
+        try:
+            held = integration_record(directory)
+        except BridgeError:
+            held = None
+        repairing = (
+            held is not None
+            and integration_owner(directory, held) == name
+            and integration_holds(root, held)
+        )
+    if execution["state"] != lifecycle.READY and not repairing:
+        return [*refusals, f"Issue #{issue} is not reported ready."]
+    source = execution.get("source_commit") or execution.get("commit")
+    lane = Path(participant["lane"])
+    if source and lane.exists() and git(lane, "rev-parse", "HEAD") != source:
+        refusals.append(stale_ready(name, issue))
+    if not repairing:
+        waits = dependency_refusal(state, issue, earlier)
+        if waits:
+            refusals.append(waits)
     return refusals
 
 
@@ -590,9 +876,10 @@ def outside_prerequisites(
 
     A selection narrows what a run attempts; it never lifts a recorded
     dependency. Every issue a selected lane holds is read for the issues it
-    waits on, and each one that no selected lane holds is named here. The
-    ledger records no completion, so a prerequisite nobody holds is reported
-    as released rather than as finished work.
+    waits on, and each one that no selected lane holds is named here. A
+    prerequisite whose execution is verified complete reads as completed;
+    one that nobody holds without that completion reads as released, which
+    tells the operator somebody dropped it rather than finished it.
 
     Args:
         state: Published issue ledger.
@@ -611,12 +898,14 @@ def outside_prerequisites(
     }
     lines = []
     for issue in sorted(waited, key=int):
-        owner = state["issues"].get(issue, {}).get("owner", "")
-        satisfied = (
-            f"held by {owner}, so it is not satisfied here"
-            if owner
-            else "released, so no lane still holds it"
-        )
+        record = state["issues"].get(issue, {})
+        owner = record.get("owner", "")
+        if owner:
+            satisfied = f"held by {owner}, so it is not satisfied here"
+        elif lifecycle.state(record)["state"] == lifecycle.COMPLETE:
+            satisfied = "completed, so it is satisfied"
+        else:
+            satisfied = "released, so no lane still holds it"
         lines.append(
             f"#{issue} is a prerequisite outside this selection, {satisfied}."
         )

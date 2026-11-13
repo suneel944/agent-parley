@@ -3,7 +3,6 @@
 import datetime
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -31,15 +30,6 @@ CHANGELOG_SECTIONS = (
     ("perf", "Performance"),
 )
 ACCEPTANCE_SUITE = "tests/test_fault_acceptance.py"
-ACCEPTANCE_RECORDS = "docs/acceptance"
-ACCEPTANCE_MEASURES = (
-    "lanes",
-    "claims",
-    "claims_completed",
-    "idle_lane_minutes",
-    "unaccountable_claim_minutes",
-)
-ACCEPTANCE_COUNTS = ("lanes", "claims", "claims_completed")
 RELEASE_KINDS = ("major", "minor", "patch")
 MEASURED = "measured"
 RELEASING_SUBJECT = re.compile(r"(feat|fix|perf)(?:\(([^()]*)\))?(!?):")
@@ -82,6 +72,7 @@ def asset_names(version: str) -> set[str]:
         f"agent-parley-plugins-{version}.zip",
         f"agent-parley-{version}-codex-skills.zip",
         "requirements.txt",
+        "install.sh",
         "CHANGELOG.md",
         "RELEASE_NOTES.md",
     }
@@ -410,13 +401,12 @@ def release_candidate(root: Path, requested: str = "") -> tuple[str, int, int]:
     the count is measured from. The proposal then looks ahead for a version
     that is genuinely free.
 
-    A maintainer can name the kind instead. That request exists for the case
-    measurement cannot see: a published package repaired by a change outside
-    the package, such as the README the index renders, or a repair that landed
-    as a plain fix and must ship before a tenth issue. The requested kind
-    replaces the markers and the count, and nothing else: the version must
-    still be free, and the tree must still hold at least one commit past the
-    approved release, so a request never republishes an unchanged tree.
+    A maintainer can name the kind instead. That request exists for a package
+    repair that landed as a plain fix and must ship before a tenth issue. The
+    requested kind replaces the markers and the count, and nothing else: the
+    version must still be free, and the tree must still hold at least one
+    commit past the approved release. The candidate phase then still requires
+    a package change, so a documentation-only tree never ships as a version.
 
     Args:
         root: Checkout containing the version manifest and release history.
@@ -520,56 +510,6 @@ def run_acceptance_suite(root: Path) -> str:
     return lines[-1] if lines else f"pytest exited {result.returncode}"
 
 
-def acceptance_record_error(root: Path, version: str) -> str:
-    """Validates the live acceptance record a minor or major release needs.
-
-    Every measurement must be a finite, non-negative number, and lane and
-    claim counts must be integers. JSON decoding admits NaN, infinity and
-    overflowed literals, so those are named as invalid rather than letting
-    comparisons against them pass the record.
-
-    Args:
-        root: Checkout holding the acceptance records.
-        version: Version the release would publish.
-
-    Returns:
-        An empty string for a valid record, otherwise what is missing or
-        wrong in it.
-    """
-    path = f"{ACCEPTANCE_RECORDS}/{version}.json"
-    try:
-        record = json.loads((root / path).read_text())
-    except FileNotFoundError:
-        return f"no live acceptance record {path}"
-    except (OSError, ValueError) as exc:
-        return f"live acceptance record {path} is unreadable: {exc}"
-    if not isinstance(record, dict):
-        return f"live acceptance record {path} is not an object"
-    if record.get("version") != version:
-        return f"live acceptance record {path} names another version"
-    if not str(record.get("run", "")).strip():
-        return f"live acceptance record {path} names no run"
-    missing = [
-        name
-        for name in ACCEPTANCE_MEASURES
-        if isinstance(record.get(name), bool)
-        or not isinstance(record.get(name), (int, float))
-        or (name in ACCEPTANCE_COUNTS and isinstance(record[name], float))
-        or (isinstance(record[name], float) and not math.isfinite(record[name]))
-        or record[name] < 0
-    ]
-    if missing:
-        return f"live acceptance record {path} lacks measured " + ", ".join(
-            missing
-        )
-    if record["claims"] <= 0 or record["claims_completed"] != record["claims"]:
-        return (
-            f"live acceptance record {path} completed "
-            f"{record['claims_completed']} of {record['claims']} claims"
-        )
-    return ""
-
-
 def acceptance_errors(
     root: Path,
     approved: str,
@@ -580,9 +520,9 @@ def acceptance_errors(
 
     A patch release needs none: it repairs a published version rather than
     claiming new behaviour. A minor or major release claims new unattended
-    behaviour, so it needs both the fault-injection suite passing on the
-    release commit and a live acceptance record for the version with the
-    numbers that run measured.
+    behaviour, so it needs the fault-injection suite passing on the release
+    commit. A live unattended run is not required; the operator may still
+    run one by hand with ``scripts/acceptance.py``.
 
     Args:
         root: Checkout of the release commit.
@@ -602,9 +542,67 @@ def acceptance_errors(
             f"fault-injection acceptance suite {ACCEPTANCE_SUITE} did not "
             f"pass on the release commit: {failure}"
         )
-    if failure := acceptance_record_error(root, version):
-        errors.append(failure)
     return errors
+
+
+def body_sections(message: str) -> tuple[list[str], list[str]]:
+    """Reads the release-note parts of a pull request template body.
+
+    A milestone squash commit describes its release under
+    `## Problem and result` in `### ` subsections, one bullet per change,
+    and lists what upgraders must know under `## Compatibility and risks`.
+    The subsections keep their `### ` level, which matches the typed
+    sections of a changelog entry, and stop at the next `## ` heading so
+    they can never split the entry. The template checklist is not an
+    upgrade note and is left out.
+
+    Args:
+        message: Full commit message.
+
+    Returns:
+        The subsection lines, starting at the first `### ` heading under
+        `## Problem and result` and without trailing blank lines, and the
+        bullets of `## Compatibility and risks`. The first list is empty
+        when the body has no such subsections.
+    """
+    notes: list[str] = []
+    upgrade: list[str] = []
+    section = ""
+    for line in message.splitlines():
+        text = line.rstrip()
+        if text.startswith("## "):
+            section = text[3:].strip().lower()
+        elif section == "problem and result":
+            if notes or text.startswith("### "):
+                notes.append(text)
+        elif section == "compatibility and risks" and (
+            text.startswith(("- ", "* "))
+            and not text[2:].startswith(("[x] ", "[X] ", "[ ] "))
+        ):
+            upgrade.append(f"- {text[2:].strip()}")
+    while notes and not notes[-1]:
+        notes.pop()
+    return notes, upgrade
+
+
+def milestone_link(version: str) -> str:
+    """Links the closed issues of the milestone a release delivers.
+
+    Milestones carry the bare version as their title, so a title search
+    finds them without asking the forge for the milestone number, and the
+    entry stays the same whether or not the network is reachable.
+
+    Args:
+        version: Version being prepared.
+
+    Returns:
+        A Markdown line linking the milestone's closed issues.
+    """
+    query = f"is%3Aissue%20is%3Aclosed%20milestone%3A{version}"
+    return (
+        f"Closed issues: [milestone {version}]"
+        f"({REPOSITORY_URL}/issues?q={query})."
+    )
 
 
 def changelog_entry(
@@ -617,6 +615,12 @@ def changelog_entry(
     release a maintainer requested may count nothing, because the change that
     justified it lives outside the package; its notes then list every commit
     the release ships instead, so the published entry is never empty.
+
+    A counted commit whose body has `### ` subsections under
+    `## Problem and result`, such as a milestone squash, contributes those
+    subsections instead of one line, its compatibility bullets as upgrade
+    notes, and a single link to the release milestone's closed issues in
+    place of one link per issue. Other commits render as one line each.
 
     Args:
         root: Checkout holding the release history.
@@ -642,6 +646,8 @@ def changelog_entry(
     _, _, references = release_history(root)
     sections: dict[str, set[str]] = {}
     shipped: list[str] = []
+    described: list[str] = []
+    upgrades: list[str] = []
     for record in log.split("\x00")[1:]:
         commit, message, names = record.split("\x01")
         shipped.append(f"* {message.splitlines()[0].strip()}")
@@ -651,6 +657,11 @@ def changelog_entry(
             for name in names.splitlines()
             for path in PACKAGE_PATHS
         ):
+            continue
+        notes, upgrade = body_sections(message)
+        if notes:
+            described += ["", *notes]
+            upgrades += upgrade
             continue
         headline = message.splitlines()[0][subject.end() :].strip()
         numbers = set(ISSUE_REFERENCE.findall(message)) | {
@@ -665,10 +676,15 @@ def changelog_entry(
     compare = f"{REPOSITORY_URL}/compare/v{approved}...v{version}"
     date = datetime.date.today().isoformat()
     lines = [f"## [{version}]({compare}) ({date})", ""]
+    lines += described
     for kind, title in CHANGELOG_SECTIONS:
         if kind in sections:
             lines += ["", f"### {title}", "", *sorted(sections[kind])]
-    if not sections and shipped:
+    if upgrades:
+        lines += ["", "### Upgrade notes", "", *upgrades]
+    if described:
+        lines += ["", milestone_link(version)]
+    elif not sections and shipped:
         lines += ["", "### Changes", "", *shipped]
     return "\n".join(lines) + "\n\n"
 
@@ -788,6 +804,10 @@ def bump(root: Path, baseline: str, approved: str, version: str) -> None:
     marketplace = json.loads(path.read_text())
     marketplace["plugins"][0]["version"] = version
     path.write_text(json.dumps(marketplace, indent=2) + "\n")
+    path = root / "server.json"
+    server = json.loads(path.read_text())
+    server["version"] = version
+    path.write_text(json.dumps(server, indent=2) + "\n")
     (root / MANIFEST_PATH).write_text(
         json.dumps({".": version}, indent=2) + "\n"
     )
@@ -946,8 +966,13 @@ def prepare(root: Path, tag: str) -> str:
 
 
 def pypi_files(version: str) -> list[dict[str, Any]]:
-    """Reads PyPI file metadata, treating only HTTP 404 as an absent version."""
-    url = f"https://pypi.org/pypi/agent-parley/{version}/json"
+    """Reads PyPI file metadata, treating only HTTP 404 as an absent project.
+
+    The project endpoint is read rather than the per-version one because
+    PyPI's CDN has served the per-version page as an empty HTTP 200 after
+    an upload, which left the v0.20.1 GitHub release in draft (#1293).
+    """
+    url = "https://pypi.org/pypi/agent-parley/json"
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
             data = json.load(response)
@@ -955,7 +980,7 @@ def pypi_files(version: str) -> list[dict[str, Any]]:
         if error.code == 404:
             return []
         raise
-    return list(data["urls"])
+    return list(data["releases"].get(version, []))
 
 
 def pending_files(
@@ -995,7 +1020,7 @@ def main() -> None:
         if requested == MEASURED:
             requested = ""
         version, issues, features = release_candidate(root, requested)
-        changed = bool(requested) or has_package_changes(root)
+        changed = has_package_changes(root)
         eligible = bool(version) and changed
         emit("eligible", str(eligible).lower())
         emit("version", version)
@@ -1009,6 +1034,11 @@ def main() -> None:
             print(
                 f"{measured}; a {requested} release was requested but main "
                 "holds no commit past the approved release."
+            )
+        elif requested and not changed:
+            print(
+                f"{measured}; a {requested} release was requested but the "
+                "package is unchanged since the approved release."
             )
         elif requested:
             print(

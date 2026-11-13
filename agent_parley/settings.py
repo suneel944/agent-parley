@@ -39,9 +39,11 @@ class SettingsMixin(BridgeCore):
             An account of the configured gate.
 
         Raises:
-            BridgeError: If the repository has no project yet, or the command
-                is not a usable argument list.
+            BridgeError: If the repository has no project yet, the command
+                is not a usable argument list, or a change comes from a lane
+                or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, shlex, write_json
 
         root, directory = self.project(repo, create=False)
@@ -49,6 +51,9 @@ class SettingsMixin(BridgeCore):
         if command is None:
             configured = data["verify"]
         else:
+            unattended.operator_only(
+                repo, root, data, "The verification command is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["verify"] = roster.verify_command(command)
@@ -83,9 +88,11 @@ class SettingsMixin(BridgeCore):
             An account of the configured requirement.
 
         Raises:
-            BridgeError: If the repository has no project yet, or a step is
-                not one the gate can stand in front of.
+            BridgeError: If the repository has no project yet, a step is not
+                one the gate can stand in front of, or a change comes from a
+                lane or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import approvals, lock, roster, write_json
 
         root, directory = self.project(repo, create=False)
@@ -93,6 +100,9 @@ class SettingsMixin(BridgeCore):
         if steps is None:
             required = data["approval"]
         else:
+            unattended.operator_only(
+                repo, root, data, "The approval requirement is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["approval"] = roster.approval_steps(steps)
@@ -111,6 +121,108 @@ class SettingsMixin(BridgeCore):
             "records a decision on the lane's current ready report."
         )
 
+    def resume_opt_in(
+        self,
+        repo: Path,
+        participant: str = "",
+        bridge_tools: bool | None = None,
+        auto_mode: bool | None = None,
+    ) -> str:
+        """Reports or records the opt-ins a service resume of a lane needs.
+
+        A lane the service resumes has nobody at the keyboard, so
+        the service withholds the resume until the operator records
+        `approve_bridge_tools` or `auto_mode`. Both stay explicit operator
+        choices that default to off; this writes the same manifest fields
+        `roster.approval_opt_in` validates, for the project under
+        `supervision` or for one lane, so no one edits private state by hand.
+
+        A lane-scoped opt-in its adapter cannot carry is refused rather than
+        recorded to no effect: `auto_mode` on a lane that is not `claude`,
+        and `approve_bridge_tools` on an adapter `roster.APPROVAL` gives no
+        way to pass it.
+
+        Args:
+            repo: Any checkout of the target repository.
+            participant: Lane to record the opt-in on, or empty for the
+                project default a lane entry overrides.
+            bridge_tools: New `approve_bridge_tools` value, or None to keep it.
+            auto_mode: New `auto_mode` value, or None to keep it.
+
+        Returns:
+            One line per affected lane with both effective opt-ins.
+
+        Raises:
+            BridgeError: If the repository has no project yet, the named
+                participant is not in it, or its adapter cannot carry the
+                requested opt-in, or a change comes from a lane or a
+                process holding a lane's token.
+        """
+        from agent_parley import dialogs, unattended
+        from agent_parley.cli import lock, roster, write_json
+
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        changes = {
+            key: value
+            for key, value in (
+                (dialogs.PRE_APPROVE, bridge_tools),
+                (dialogs.AUTO_MODE, auto_mode),
+            )
+            if value is not None
+        }
+        if participant and participant not in data["participants"]:
+            raise BridgeError(
+                f"{participant} is not a participant in this project.",
+                next_command="agent-parley participant list",
+            )
+        adapter = ""
+        if participant and (bridge_tools or auto_mode):
+            lane = data["participants"][participant]
+            try:
+                adapter = roster.provider(
+                    self.home, lane.get("provider", participant)
+                )["adapter"]
+            except BridgeError:
+                adapter = ""
+        if auto_mode and adapter not in ("", "claude"):
+            raise BridgeError(
+                f"{participant} is a {adapter} lane, and auto_mode starts the "
+                "claude CLI's own auto permission mode, which the "
+                f"{adapter} CLI does not have; auto_mode was not recorded."
+            )
+        if bridge_tools and adapter and roster.APPROVAL.get(adapter) is None:
+            raise BridgeError(
+                f"{participant} is a {adapter} lane, and the {adapter} CLI "
+                "offers no per-server tool approval the launch could pass, "
+                "so recording one would change nothing; resume the lane in "
+                f"your own terminal with agent-parley run {participant} "
+                "--resume."
+            )
+        if changes:
+            unattended.operator_only(
+                repo, root, data, "The service resume opt-in is set"
+            )
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                target = (
+                    data["participants"][participant]
+                    if participant
+                    else data.setdefault("supervision", {})
+                )
+                target.update(changes)
+                write_json(directory / "project.json", data)
+        names = [participant] if participant else sorted(data["participants"])
+        if not names:
+            return f"{root} has no participants yet."
+        state = {True: "on", False: "off"}
+        return "\n".join(
+            f"{name}: {dialogs.PRE_APPROVE} "
+            f"{state[dialogs.pre_approved(data, name)]}, "
+            f"{dialogs.AUTO_MODE} {state[dialogs.auto_mode(data, name)]}"
+            for name in names
+        )
+
     def initialization(self, repo: Path, command: str | None = None) -> str:
         """Reports or records the command every new lane runs before starting.
 
@@ -127,9 +239,11 @@ class SettingsMixin(BridgeCore):
             An account of the configured command.
 
         Raises:
-            BridgeError: If the repository has no project yet, or the command
-                is not a usable argument list.
+            BridgeError: If the repository has no project yet, the command
+                is not a usable argument list, or a change comes from a lane
+                or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, shlex, write_json
 
         root, directory = self.project(repo, create=False)
@@ -137,6 +251,9 @@ class SettingsMixin(BridgeCore):
         if command is None:
             configured = data["initialize"]
         else:
+            unattended.operator_only(
+                repo, root, data, "The lane initialization command is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["initialize"] = roster.verify_command(
@@ -153,6 +270,71 @@ class SettingsMixin(BridgeCore):
             f"{root} runs `{shlex.join(configured)}` in every new lane "
             "before its agent starts. AGENT_PARLEY_BASE names the base "
             "checkout while it runs."
+        )
+
+    def pool(self, repo: Path, size: int | None = None) -> str:
+        """Reports or records how many prepared spare worktrees to keep.
+
+        Recording a size starts a detached fill, so the command returns at
+        once and `status` shows the spares as they become ready. Size zero
+        keeps none; the spares already prepared are removed by the next
+        `gc` sweep.
+
+        Args:
+            repo: Any checkout of the target repository.
+            size: Spare worktrees to keep, or None to report the current
+                setting without changing it.
+
+        Returns:
+            An account of the configured pool and its spares.
+
+        Raises:
+            BridgeError: If the repository has no project yet, the size is
+                out of range, or a change comes from a lane or a process
+                holding a lane's token.
+        """
+        from agent_parley import pool, unattended
+        from agent_parley.cli import lock, roster, write_json
+
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if size is not None:
+            unattended.operator_only(
+                repo, root, data, "The spare worktree pool is set"
+            )
+            with lock(directory / "setup.lock"):
+                data = roster.read(directory)
+                data["pool"] = roster.pool_size(size)
+                write_json(directory / "project.json", data)
+            pool.replenish(self.home, root, directory)
+        configured = int(data.get("pool") or 0)
+        line = pool.summary_line(pool.reading(directory, data))
+        if not configured:
+            return f"{root} keeps no spare worktrees." + (
+                f" {line}." if line else ""
+            )
+        return (
+            f"{root} keeps {configured} spare worktrees prepared from the "
+            f"current base for new lanes. {line}."
+        )
+
+    def fill_pool(self, repo: Path) -> str:
+        """Brings the spare worktree pool to its configured size now.
+
+        Args:
+            repo: Any checkout of the target repository.
+
+        Returns:
+            The pool's status line once the fill finished.
+        """
+        from agent_parley import pool
+        from agent_parley.cli import roster
+
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        pool.fill(root, directory, data)
+        return pool.summary_line(pool.reading(directory, data)) or (
+            f"{root} keeps no spare worktrees."
         )
 
     def commands(self, repo: Path) -> dict:
@@ -198,24 +380,83 @@ class SettingsMixin(BridgeCore):
             An account of the configured prefix and the names it produces.
 
         Raises:
-            BridgeError: If the repository has no project yet, or the prefix
-                is not a usable Git ref path component.
+            BridgeError: If the repository has no project yet, the prefix
+                is not a usable Git ref path component, or a change comes
+                from a lane or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if prefix is not None:
+            unattended.operator_only(
+                repo, root, data, "The lane branch prefix is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["branch_prefix"] = roster.branch_prefix(prefix)
                 write_json(directory / "project.json", data)
         configured = data["branch_prefix"]
+        base = data.get("integration_base")
         return (
             f"{root} creates lane branches as "
             f"{configured}/{directory.name}/lane-N. A lane branch carries no "
             "participant, provider or account name. Existing lanes keep the "
-            "branch they were created with."
+            "branch they were created with. "
+            + (
+                f"Pull requests merged into {base} land the claims they close."
+                if base
+                else "No integration base is recorded."
+            )
+        )
+
+    def integration_branch(self, repo: Path, branch: str) -> str:
+        """Records the branch a milestone's pull requests merge into.
+
+        The forge closes an issue only when its pull request merges into the
+        default branch, so a milestone integrated on another branch leaves
+        every claim open until it crosses. With this branch recorded, the
+        supervisor counts a pull request merged into it that closes a claimed
+        issue by keyword as that claim's landed work, and asks the operator
+        once to open the crossing pull request when every claim has landed.
+        Only the operator records it, because it ends claims.
+
+        Args:
+            repo: Any checkout of the target repository.
+            branch: Integration branch, or an empty string to remove it.
+
+        Returns:
+            An account of the recorded integration base.
+
+        Raises:
+            BridgeError: If the repository has no project yet, the branch is
+                not one Git branch name, or the change comes from a lane or
+                a process holding a lane's token.
+        """
+        from agent_parley import unattended
+        from agent_parley.cli import lock, roster, write_json
+
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        unattended.operator_only(
+            repo, root, data, "The integration base is set"
+        )
+        accepted = roster.integration_base(branch)
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            data.pop("integration_base", None)
+            if accepted:
+                data["integration_base"] = accepted
+            write_json(directory / "project.json", data)
+        if not accepted:
+            return (
+                f"{root} records no integration base; only issues the forge "
+                "closes end claims."
+            )
+        return (
+            f"{root} integrates into {accepted}: a pull request merged into "
+            "it that closes a claimed issue by keyword lands that claim."
         )
 
     def tracker(self, repo: Path, name: str | None = None) -> str:
@@ -234,14 +475,17 @@ class SettingsMixin(BridgeCore):
             An account of the forge in use and what it can do.
 
         Raises:
-            BridgeError: If the repository has no project yet, or the name is
-                not a known forge.
+            BridgeError: If the repository has no project yet, the name is
+                not a known forge, or a change comes from a lane or a process
+                holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import forge, lock, roster, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if name is not None:
+            unattended.operator_only(repo, root, data, "The forge is set")
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["forge"] = roster.forge_choice(name)
@@ -277,14 +521,19 @@ class SettingsMixin(BridgeCore):
             An account of the declared resources.
 
         Raises:
-            BridgeError: If the repository has no project yet, or a name is
-                not a scheme and a name such as ``port:5432``.
+            BridgeError: If the repository has no project yet, a name is
+                not a scheme and a name such as ``port:5432``, or a change
+                comes from a lane or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, shlex, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if declared is not None:
+            unattended.operator_only(
+                repo, root, data, "The declared resources are set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 data["resources"] = roster.resources(shlex.split(declared))
@@ -319,14 +568,19 @@ class SettingsMixin(BridgeCore):
             An account of the recorded defaults.
 
         Raises:
-            BridgeError: If the repository has no project yet, or a default is
-                not a usable window or budget.
+            BridgeError: If the repository has no project yet, a default is
+                not a usable window or budget, or a change comes from a lane
+                or a process holding a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import lock, roster, write_json
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
         if defaults is not None:
+            unattended.operator_only(
+                repo, root, data, "The deadline defaults are set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 merged = {
@@ -342,9 +596,9 @@ class SettingsMixin(BridgeCore):
         recorded = data["deadlines"]
         if not recorded:
             return (
-                f"{root} records no deadline defaults, so a claim, an offer "
-                "or an acknowledgement carries a deadline only when it passes "
-                "--within."
+                f"{root} records no deadline defaults, so a claim, an offer, "
+                "a takeover request or an acknowledgement carries a deadline "
+                "only when it passes --within."
             )
         windows = ", ".join(
             f"{field} {int(recorded[field])}s"
@@ -386,10 +640,13 @@ class SettingsMixin(BridgeCore):
             its consumption against the limits that apply.
 
         Raises:
-            BridgeError: If the record does not exist or a limit is unusable.
+            BridgeError: If the record does not exist, a limit is unusable,
+                or a participant or project change comes from a lane or a
+                process holding a lane's token.
         """
         import sqlite3
 
+        from agent_parley import unattended
         from agent_parley.cli import budgets, lock, roster, store, write_json
 
         if scope == "provider":
@@ -399,8 +656,11 @@ class SettingsMixin(BridgeCore):
                 roster.provider(self.home, name).get("budget") or {}
             )
             return f"provider {name} " + self._budget_account(recorded)
-        _, directory = self.project(repo, create=False)
+        root, directory = self.project(repo, create=False)
         if changes is not None:
+            unattended.operator_only(
+                repo, root, roster.read(directory), "A budget is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 if scope == "project":
@@ -412,7 +672,8 @@ class SettingsMixin(BridgeCore):
                     if participant is None:
                         raise BridgeError(
                             f"{name} is not a participant in this project; "
-                            "run agent-parley participant list."
+                            "run agent-parley participant list.",
+                            next_command="agent-parley participant list",
                         )
                     participant["budget"] = roster.merged_budget(
                         participant.get("budget") or {}, changes
@@ -424,7 +685,8 @@ class SettingsMixin(BridgeCore):
         if name not in data["participants"]:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-parley participant list."
+                "run agent-parley participant list.",
+                next_command="agent-parley participant list",
             )
         try:
             usage = store.usage(self.home, data["root"])
@@ -437,6 +699,57 @@ class SettingsMixin(BridgeCore):
             f"{name} "
             + self._budget_account(own)
             + f" Standing: {standing}. A budget informs and does not gate."
+        )
+
+    def price(self, repo: Path, name: str, per_mtok: float | None) -> str:
+        """Reports or records the operator's price on one provider.
+
+        A price turns a recorded token count into an estimated spend in
+        `report usage`; nothing is fetched from a vendor. Only the operator
+        records one: a process holding a lane's token is refused wherever
+        it runs, and so is a command run from a lane's worktree, the same
+        boundary every operator-only project setting keeps.
+
+        Args:
+            repo: Directory the command runs from.
+            name: Provider the price belongs to.
+            per_mtok: Price per million tokens, 0 to remove it, or None to
+                report the recorded price.
+
+        Returns:
+            An account of the recorded price.
+
+        Raises:
+            BridgeError: If the provider is unknown, the price is unusable,
+                or a change comes from a lane or a process holding a lane's
+                token.
+        """
+        import os
+
+        from agent_parley import unattended
+        from agent_parley.cli import roster
+
+        if per_mtok is not None:
+            if os.environ.get(roster.LANE_TOKEN):
+                raise BridgeError(
+                    "A price is recorded from an operator shell, never from "
+                    f"a process holding a lane's {roster.LANE_TOKEN}."
+                )
+            try:
+                root, directory = self.project(repo, create=False)
+            except BridgeError:
+                root = None
+            if root is not None:
+                unattended.operator_only(
+                    repo, root, roster.read(directory), "A price is recorded"
+                )
+            roster.provider_price(self.home, name, per_mtok)
+        recorded = roster.provider(self.home, name).get("price")
+        if not recorded:
+            return f"provider {name} has no price; report usage shows no spend."
+        return (
+            f"provider {name} price {recorded['per_mtok']:g} per million "
+            "tokens; report usage shows spend as an estimate."
         )
 
     def enforce(self, repo: Path, changes: dict | None = None) -> str:
@@ -459,13 +772,18 @@ class SettingsMixin(BridgeCore):
             An account of the enforced limits and the run's standing.
 
         Raises:
-            BridgeError: If the repository has no project or a limit is
-                unusable.
+            BridgeError: If the repository has no project, a limit is
+                unusable, or a change comes from a lane or a process holding
+                a lane's token.
         """
+        from agent_parley import unattended
         from agent_parley.cli import budgets, lock, roster, write_json
 
-        _, directory = self.project(repo, create=False)
+        root, directory = self.project(repo, create=False)
         if changes is not None:
+            unattended.operator_only(
+                repo, root, roster.read(directory), "A run budget is set"
+            )
             with lock(directory / "setup.lock"):
                 data = roster.read(directory)
                 before = dict(data.get("run_budget") or {})

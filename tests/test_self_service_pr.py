@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import evidence, forge, metrics, roster, store
+from agent_parley import (
+    blueprints,
+    evidence,
+    forge,
+    metrics,
+    roster,
+    store,
+    unattended,
+)
 from agent_parley.cli import git
 from agent_parley.state import BridgeError, lock, write_json
 
@@ -223,3 +231,28 @@ def test_each_unmet_condition_refuses_the_lane_by_name(
     assert git(repo, "branch", "--remotes") == ""
     assert not ready["created"].exists()
     assert opened_records(directory, "codex") == []
+
+
+def test_a_blueprint_pull_request_node_opens_it_through_self_service(
+    bridge, repo, ready, tmp_path, monkeypatch
+):
+    monkeypatch.delenv(unattended.LANE_TOKEN, raising=False)
+    directory = ready["directory"]
+    allow_self_service(directory)
+    path = tmp_path / "open.json"
+    path.write_text(
+        json.dumps({"nodes": [{"name": "open", "kind": "pull-request"}]})
+    )
+    blueprints.define(bridge, repo, "open", path)
+
+    assert "done at open; passed open" in blueprints.start(
+        bridge, repo, "codex", "open", "42"
+    )
+    assert git(
+        ready["remote"], "log", "-1", "--pretty=%s", ready["branch"]
+    ) == ("feat: add the lane feature")
+    assert ready["marker"].exists()
+    body = created_options(ready["created"])["--body"]
+    assert "Opened by codex itself" in body
+    run = blueprints.for_lane(directory, "codex")["42"]
+    assert "https://github.com/example/agent-parley/pull/7" in run["output"]

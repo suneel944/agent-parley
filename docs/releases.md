@@ -7,9 +7,9 @@ its annotated tag, and dispatches the separate publication workflow. There is
 no proposal pull request. A tag push alone does not publish anything; an
 existing tag can be dispatched explicitly for recovery.
 
-Release 0.4.0 was published on 2026-09-13. All six GitHub bundle assets passed
-checksum verification, and downloaded PyPI wheel and source archive hashes
-matched the GitHub packages. See the
+Historical record: release 0.4.0 was published on 2026-09-13. All six GitHub
+bundle assets passed checksum verification, and downloaded PyPI wheel and
+source archive hashes matched the GitHub packages. See the
 [successful publication run](https://github.com/suneel944/agent-parley/actions/runs/34775070514).
 
 Published descriptions for 0.1.0, 0.1.1, 0.2.0, 0.3.0 and 0.4.0 are curated
@@ -28,6 +28,16 @@ validated bodies and commit messages. Both default body sources then retain
 the references. This check uses read-only CI metadata; repository squash
 settings are only visible with broader repository access. Explicit merge API
 message overrides must also preserve the issue references from the PR body.
+
+A crossing merge is a releasing PR into main that changes the package and
+references more than one issue. PR hygiene also requires its body to group the
+notes under `### ` headings in `## Problem and result`, because a flat body
+publishes one-line notes. When it has a milestone, the milestone title must be
+the version its own references measure: ten or more issues make a minor
+release, a `!` marker a major one, and fewer a patch, skipping retired numbers.
+Units that reached main directly since the approved tag are not added. PR #1372
+crossed 0.21.1 with 18 issues and flat bullets; the release counter cut 0.22.0
+with one-line notes.
 
 PR [#161](https://github.com/suneel944/agent-parley/pull/161) closed seven issues,
 but its squash commit `4edd3fc6ed0f77bf516008b7d2f16f4fef578415` omitted their
@@ -143,7 +153,8 @@ proposed only when the measured work reaches a release marker and the package
 differs from the approved release. Commit `436c2b5` measures zero under every
 one of those conditions. Removing the proposal pull request therefore removed a
 review step that was never what stopped the incident; the guard that did is
-`python3 -m scripts.release_publish candidate`, which anyone can run locally
+the candidate phase of `scripts.release_publish`, which anyone can run locally
+as `GITHUB_OUTPUT=/dev/null python3 -m scripts.release_publish candidate`
 and which every push to `main` runs before anything else happens.
 
 GitHub and PyPI were checked during recovery. Both retained valid 0.1.1 package
@@ -190,9 +201,15 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
    proposed and the step reports the counts it measured. Counting is local and
    repeatable: it reads Git history; selecting an available version
    additionally queries the release services described below.
-   `python3 -m scripts.release_publish candidate` performs those checks before
-   any merge. Every push to `main` runs it, and a push that reaches no marker
-   ends there.
+   `python3 -m scripts.release_publish candidate` performs those checks. It
+   appends its results to the file `GITHUB_OUTPUT` names and stops with
+   `KeyError: 'GITHUB_OUTPUT'` when that variable is unset, so a local run
+   points it at a scratch file:
+   `GITHUB_OUTPUT=/dev/null python3 -m scripts.release_publish candidate`.
+   An optional `RELEASE_KIND` of `patch`, `minor` or `major` requests that
+   kind instead of the measurement, as a manual Auto version dispatch does;
+   `measured` or an empty value keeps the measurement. Every push to `main` runs it after the
+   push lands, and a push that reaches no marker ends there.
 2. The chosen number must be free. Previously consumed versions cannot be
    reused, including a deleted or yanked 0.1.2. A release that lands on an
    unavailable version advances to the next free version of the same kind
@@ -206,27 +223,30 @@ on its own after an eligible push to `main`, and what to inspect afterwards.
 3. A minor or major release needs acceptance evidence; a patch release does
    not. `uv run --locked python -m scripts.release_publish evidence` runs the
    fault-injection acceptance suite, `tests/test_fault_acceptance.py`, on the
-   release commit and reads the live acceptance record
-   `docs/acceptance/X.Y.Z.json` for the proposed version. The suite drives
-   stub clients through a lane killed mid-claim, a service restart, a usage
-   limit dialog, a permission prompt on resume, a full disk under the logs
-   and a dropped `Stop` event, and fails unless every claim completes with
-   idle lane-minutes and unaccountable claim-minutes under its limits. It
-   also runs in `make check`, so a pull request that breaks it is red before
-   any release. The live record is written from a real unattended run with
-   native clients, the run #366 describes, and holds `version`, `run` (a link
-   to the run's report), and the measured `lanes`, `claims`,
-   `claims_completed`, `idle_lane_minutes` and `unaccountable_claim_minutes`;
-   every claim the run took must have completed. A missing suite pass or a
-   missing or incomplete record fails the run before the markers are raised,
-   with one line per missing piece of evidence, so a count of release units
-   alone can never publish a minor version again.
+   release commit. The phase reads the proposed version from
+   `RELEASE_VERSION`, which Auto version takes from the candidate step, and
+   stops with `KeyError: 'RELEASE_VERSION'` without it; a local run sets it,
+   as in `RELEASE_VERSION=X.Y.Z uv run --locked python -m
+   scripts.release_publish evidence`. The suite drives stub clients through
+   a lane killed mid-claim, a service restart, a usage limit dialog, a permission prompt
+   on resume, a full disk under the logs and a dropped `Stop` event, and
+   fails unless every claim completes with idle lane-minutes and
+   unaccountable claim-minutes under its limits. It also runs in
+   `make check`, so a pull request that breaks it is red before any
+   release. A suite failure stops the run before the markers are raised,
+   so a count of release units alone can never publish a minor version.
+   A live unattended run with native clients is not required; it took at
+   least a day per minor release, so the maintainer runs it by hand when
+   wanted (see [acceptance.md](acceptance.md)). Records under
+   `docs/acceptance/` from earlier releases stay as history.
 4. `python3 -m scripts.release_publish bump` raises every version marker the
    policy gate compares and prepends a changelog entry built from the same
    commits the measurement counted, so the published notes and the decision to
    release describe the same work. The policy gate then runs against the
    raised markers, so a marker the bump forgets fails the run instead of
-   reaching a release.
+   reaching a release. Like `evidence`, the phase reads the target version
+   from `RELEASE_VERSION`, which must be `MAJOR.MINOR.PATCH` and differ from
+   the approved release.
 5. The release application commits `chore(main): release X.Y.Z` to `main`,
    creates the annotated tag `vX.Y.Z` and pushes both. That commit subject is
    the loop guard: `Auto version` skips it, so a release cannot trigger another
@@ -249,11 +269,12 @@ candidate step proposes the next free version of that kind and skips the
 markers and the issue count, but everything after it is the push path
 unchanged, so the version is still checked for availability, the markers are
 still raised and gated, and `Release` is still dispatched for the tag. The
-request refuses when `main` holds no commit past the approved release, so it
-cannot republish an unchanged tree. Use it when the published package is
-broken by something measurement cannot see, such as the README the index
-renders, or when a repair landed as a plain `fix:` and must not wait for a
-tenth issue:
+request refuses when `main` holds no commit past the approved release, and
+when nothing under `agent_parley/`, `plugins/agent-parley/` or the
+`[project]` table changed since it, so documentation, workflow and tooling
+changes never ship as a version on their own; they ride the next release that
+changes the package. Use it when a package repair landed as a plain `fix:` and
+must not wait for a tenth issue:
 
 ```bash
 gh workflow run release-version.yml --ref main --field kind=patch
@@ -261,6 +282,14 @@ gh workflow run release-version.yml --ref main --field kind=patch
 
 When the request counts no product commit, the changelog entry lists every
 commit the release ships under `Changes` instead of the typed sections.
+A counted commit whose body has `### ` subsections under
+`## Problem and result`, such as a milestone squash, contributes those
+subsections and their bullets instead of one line. The bullets of its
+`## Compatibility and risks` section, without the template checklist, become
+`Upgrade notes`, and one line links the closed issues of the milestone named
+after the version through a title search rather than the milestone number,
+so the entry needs no network. Other commits keep one line each with one link
+per issue.
 Dispatching `Release` by hand with an existing tag is the retry and
 republication route; it never creates a version.
 
@@ -288,7 +317,8 @@ deployment succeeds.
 ## Retry contract
 
 The GitHub bundle is the canonical artifact set. It contains exactly the wheel,
-source archive, plugin ZIP, requirements, changelog, release notes and SHA256SUMS.
+source archive, plugin ZIP, Codex skills ZIP (`-codex-skills.zip`),
+requirements, the install script, changelog, release notes and SHA256SUMS.
 The checksum manifest is uploaded last, and its digest is passed between jobs.
 Paths, duplicate entries, extra files and hash mismatches stop publication.
 An existing complete bundle is reused byte for byte, even when a subsequent
@@ -314,8 +344,9 @@ version automatically.
 
 The gate proves the protocol with synthetic clients and proves nothing about
 a day of real native clients. The unattended acceptance run in
-[acceptance.md](acceptance.md) closes that gap on the maintainer's machine,
-and its report is attached to the release it validates.
+[acceptance.md](acceptance.md) closes that gap on the maintainer's machine.
+It is optional: a release does not require it, and the maintainer runs it by
+hand when wanted.
 
 `make check` includes real temporary Git repositories for tag resolution and
 history and migration checks, plus simulated GitHub/PyPI failures for retry
@@ -330,7 +361,8 @@ The migration audit of 2026-09-10 ran Release Please 17.6.0 against the
 published curated branch using read-only GitHub requests and the proposed scan
 boundary. It stopped at the mapped release and built zero release proposals.
 That audit is historical: versioning no longer runs Release Please, and the
-equivalent check today is `python3 -m scripts.release_publish candidate`, which
+equivalent check today is
+`GITHUB_OUTPUT=/dev/null python3 -m scripts.release_publish candidate`, which
 counts local Git history and checks version availability when a release marker
 is reached. It does not open pull requests, tag commits, dispatch workflows,
 or upload packages.

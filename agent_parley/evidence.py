@@ -7,11 +7,44 @@ import time
 from pathlib import Path
 
 from agent_parley import checkpoints, issues, store
-from agent_parley.state import write_json
+from agent_parley.state import write_json, write_text
 
 SECTION_START = "<!-- agent-parley:evidence:start -->"
 SECTION_END = "<!-- agent-parley:evidence:end -->"
 SECTION_HEADING = "## Recorded review evidence"
+REVIEW_RETAINED = 20
+
+
+def prune(directory: Path, keep: int = REVIEW_RETAINED) -> list[str]:
+    """Deletes review evidence beyond the newest heads.
+
+    Each pushed head leaves a `review-<head>.json` summary and its
+    `review-<head>-events.jsonl` export. Only the newest `keep` summaries by
+    modification time are kept; an older summary is deleted together with
+    its export, so the state directory holds a bounded number of them.
+
+    Args:
+        directory: Project state directory holding the evidence.
+        keep: Number of most recent heads whose evidence is retained.
+
+    Returns:
+        Names of the deleted files.
+    """
+    summaries = sorted(
+        directory.glob("review-*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    removed = []
+    for summary in summaries[keep:]:
+        export = summary.with_name(f"{summary.stem}-events.jsonl")
+        for path in (summary, export):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            removed.append(path.name)
+    return removed
 
 
 def collect(
@@ -146,8 +179,11 @@ def publish(directory: Path, record: dict) -> str:
     encoded = "".join(json.dumps(event) + "\n" for event in record["events"])
     digest = hashlib.sha256(encoded.encode()).hexdigest()
     export = directory / f"review-{record['head']}-events.jsonl"
-    export.write_text(encoded, encoding="utf-8")
-    write_json(directory / f"review-{record['head']}.json", record)
+    write_text(export, encoded)
+    summary = {key: value for key, value in record.items() if key != "events"}
+    summary.update(events_file=export.name, events_sha256=digest)
+    write_json(directory / f"review-{record['head']}.json", summary)
+    prune(directory)
     gate = record.get("gate")
     gate_text = (
         f"Verification executed in the lane: `{gate['command']}`; "

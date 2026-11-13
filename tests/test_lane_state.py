@@ -132,6 +132,77 @@ def test_a_store_without_lane_states_reads_no_record(home):
         assert lanes.history(db, ROOT) == []
 
 
+def queued(ts, state=lanes.WORKING, session=""):
+    """Builds one spooled hook observation of the claude lane."""
+    return {
+        "ts": ts,
+        "lane": "claude",
+        "source": "PostToolUse",
+        "state": state,
+        "evidence": "tool",
+        "session": session,
+    }
+
+
+def test_queued_work_older_than_a_direct_stop_leaves_it_stopped(home):
+    with store.connect(home, write=True) as db:
+        lanes.transition(db, ROOT, "claude", lanes.WORKING, now=10.0)
+        lanes.transition(db, ROOT, "claude", lanes.STOPPED, now=12.0)
+        changed = lanes.apply(db, ROOT, [queued(11.0)])
+        record = lanes.read(db, ROOT, "claude")
+        moves = lanes.history(db, ROOT, "claude", kind="transition")
+        skipped = lanes.history(db, ROOT, "claude", kind="superseded")
+    assert changed == 0
+    assert record["state"] == lanes.STOPPED
+    assert record["since"] == 12.0
+    assert [item["target"] for item in moves] == [lanes.WORKING, lanes.STOPPED]
+    assert [(item["source"], item["target"]) for item in skipped] == [
+        (lanes.STOPPED, lanes.WORKING)
+    ]
+
+
+def test_queued_evidence_older_than_a_reclaim_leaves_it_reclaimed(home):
+    with store.connect(home, write=True) as db:
+        lanes.transition(db, ROOT, "claude", lanes.WORKING, now=10.0)
+        lanes.transition(db, ROOT, "claude", lanes.STOPPED, now=12.0)
+        lanes.transition(db, ROOT, "claude", lanes.DEAD, now=13.0)
+        lanes.transition(db, ROOT, "claude", lanes.RECLAIMED, now=14.0)
+        lanes.apply(db, ROOT, [queued(11.0, session="s1")])
+        record = lanes.read(db, ROOT, "claude")
+    assert record["state"] == lanes.RECLAIMED
+    assert record["since"] == 14.0
+
+
+def test_queued_evidence_never_moves_a_reclaimed_lane(home):
+    with store.connect(home, write=True) as db:
+        lanes.transition(db, ROOT, "claude", lanes.STOPPED, now=10.0)
+        lanes.transition(db, ROOT, "claude", lanes.RECLAIMED, now=11.0)
+        changed = lanes.apply(db, ROOT, [queued(20.0, session="s2")])
+        record = lanes.read(db, ROOT, "claude")
+    assert changed == 0
+    assert record["state"] == lanes.RECLAIMED
+    assert record["since"] == 11.0
+
+
+def test_queued_evidence_newer_than_the_record_applies_in_order(home):
+    with store.connect(home, write=True) as db:
+        lanes.transition(db, ROOT, "claude", lanes.STARTING, now=10.0)
+        changed = lanes.apply(
+            db,
+            ROOT,
+            [queued(11.0), queued(12.0, state=lanes.IDLE)],
+        )
+        record = lanes.read(db, ROOT, "claude")
+        moves = lanes.history(db, ROOT, "claude", kind="transition")
+    assert changed == 2
+    assert record["state"] == lanes.IDLE
+    assert [item["target"] for item in moves] == [
+        lanes.STARTING,
+        lanes.WORKING,
+        lanes.IDLE,
+    ]
+
+
 def test_status_reports_the_lane_condition_from_the_record(bridge, paired):
     store.initialize(bridge.home)
     root = paired["root"]

@@ -1,6 +1,8 @@
 """Checks review measurements against real retained coordination records."""
 
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -105,3 +107,45 @@ def test_refresh_is_idempotent_across_repeated_pushes():
     twice = evidence.refresh(once, rendered("two"))
     assert once == twice
     assert "Commit: `one`." not in twice
+
+
+def measured(head: str) -> dict:
+    return {
+        "head": head,
+        "since": 0.0,
+        "until": 1.0,
+        "denials": {},
+        "reservations": [],
+        "reservation_conflicts": 0,
+        "store_available": False,
+        "events": [{"ts": 1.0, "decision": "deny", "reason_class": "x"}],
+    }
+
+
+def test_publish_stores_the_slice_once_atomically_and_bounds_retention(
+    tmp_path,
+):
+    keep = evidence.REVIEW_RETAINED
+    text = ""
+    for index in range(keep + 5):
+        head = f"h{index:02}"
+        text = evidence.publish(tmp_path, measured(head))
+        stamp = time.time() - 1000 + index
+        for name in (f"review-{head}.json", f"review-{head}-events.jsonl"):
+            os.utime(tmp_path / name, (stamp, stamp))
+    pairs = sorted(path.name for path in tmp_path.glob("review-*.json"))
+    exports = sorted(path.name for path in tmp_path.glob("review-*.jsonl"))
+    assert len(pairs) == keep
+    assert len(exports) == keep
+    assert "review-h04.json" not in pairs
+    assert "review-h04-events.jsonl" not in exports
+    assert "review-h05.json" in pairs
+    last = f"h{keep + 4:02}"
+    export = tmp_path / f"review-{last}-events.jsonl"
+    assert export.stat().st_mode & 0o777 == 0o600
+    digest = hashlib.sha256(export.read_bytes()).hexdigest()
+    assert f"SHA-256 `{digest}`" in text
+    record = json.loads((tmp_path / f"review-{last}.json").read_text())
+    assert "events" not in record
+    assert record["events_file"] == export.name
+    assert record["events_sha256"] == digest

@@ -1,7 +1,6 @@
 """Adapts native Gemini CLI settings and hooks without changing permissions."""
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -14,7 +13,19 @@ EVENTS = {
     "AfterTool": "PostToolUse",
     "AfterAgent": "Stop",
     "SessionEnd": "SessionEnd",
+    "Notification": "PermissionRequest",
 }
+TOOL_PERMISSION = "ToolPermission"
+"""Notification type Gemini raises when it shows a tool confirmation.
+
+Only that type is translated to the shared ``PermissionRequest`` event; it
+reports the wait and never answers it. Every other notification keeps its
+native name, which the shared checkpoints record as an ignored event. The
+payload shape follows Gemini's hook reference and has not been confirmed
+in a live trial, so ``roster.UNAVAILABLE_HOOKS`` still lists
+``PermissionRequest`` for this adapter and the dialog watcher stays the
+authoritative reading.
+"""
 
 
 def configure(
@@ -23,6 +34,7 @@ def configure(
     url: str,
     hooks: dict,
     source_path: str | None = None,
+    trusted: bool = False,
 ) -> Path:
     """Copies native system policy into a lane-private settings overlay.
 
@@ -35,7 +47,12 @@ def configure(
         name: Validated participant name.
         url: Authenticated loopback MCP endpoint.
         hooks: Common checkpoint hook definitions.
-        source_path: Native system policy selected by the launch environment.
+        source_path: Native system policy the launch environment selects
+            once lane overlays are removed from it; Gemini's default
+            location when unset, whatever this process's environment
+            exports.
+        trusted: Whether the operator opted this lane in to pre-approving
+            the bridge's own tools, which marks only its server as trusted.
 
     Returns:
         Path for GEMINI_CLI_SYSTEM_SETTINGS_PATH in this launch only.
@@ -48,10 +65,7 @@ def configure(
         if sys.platform == "darwin"
         else "/etc/gemini-cli/settings.json"
     )
-    source = Path(
-        source_path
-        or os.environ.get("GEMINI_CLI_SYSTEM_SETTINGS_PATH", default)
-    )
+    source = Path(source_path or default)
     settings = json.loads(source.read_text()) if source.exists() else {}
     if not isinstance(settings, dict):
         raise BridgeError("Gemini system settings must be an object.")
@@ -69,6 +83,8 @@ def configure(
         "httpUrl": url,
         "headers": {"Authorization": "Bearer ${AGENT_PARLEY_TOKEN}"},
     }
+    if trusted:
+        servers["agent_parley"]["trust"] = True
     for native, common in EVENTS.items():
         existing = configured.setdefault(native, [])
         if not isinstance(existing, list):
@@ -87,13 +103,38 @@ def configure(
 
 
 def payload(value: dict) -> dict:
-    """Translates Gemini events and MCP names for shared checkpoints."""
+    """Translates Gemini events and MCP names for shared checkpoints.
+
+    A ``Notification`` whose ``notification_type`` is ``ToolPermission``
+    becomes ``PermissionRequest``, naming the tool from its ``details``;
+    any other notification is passed on under its native name. An event
+    or tool name that is not text is passed on unchanged, for the shared
+    checkpoint to refuse rather than for this translation to raise.
+
+    Args:
+        value: Native Gemini hook input.
+
+    Returns:
+        The event in the shared checkpoint schema.
+    """
     translated = dict(value)
-    translated["hook_event_name"] = EVENTS.get(
-        value.get("hook_event_name", ""), value.get("hook_event_name", "")
-    )
-    tool = value.get("tool_name", "")
-    if tool.startswith("mcp_agent_parley_"):
+    native = value.get("hook_event_name", "")
+    if native == "Notification":
+        if value.get("notification_type") != TOOL_PERMISSION:
+            return translated
+        details = value.get("details")
+        details = details if isinstance(details, dict) else {}
+        translated["tool_name"] = str(
+            details.get("tool_name")
+            or details.get("toolName")
+            or details.get("name")
+            or ""
+        )
+        translated["tool_input"] = details.get("tool_input", details)
+    if isinstance(native, str):
+        translated["hook_event_name"] = EVENTS.get(native, native)
+    tool = translated.get("tool_name", "")
+    if isinstance(tool, str) and tool.startswith("mcp_agent_parley_"):
         translated["tool_name"] = tool.replace(
             "mcp_agent_parley_", "mcp__agent_parley__", 1
         )

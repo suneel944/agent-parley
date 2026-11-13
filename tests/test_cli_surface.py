@@ -1,11 +1,14 @@
 """Checks the version, show and list verbs the command surface offers."""
 
+import argparse
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, protocol, roster, store, views
+from agent_parley import BridgeError, cli, protocol, roster, start, store, views
+from agent_parley.cli import git
 
 NEW_COMMANDS = (
     ("version",),
@@ -27,6 +30,7 @@ NEW_COMMANDS = (
     ("status", "--help"),
     ("top", "--help"),
     ("approval", "show", "--help"),
+    ("approval", "resume", "--help"),
     ("branch", "show", "--help"),
     ("forge", "show", "--help"),
     ("state", "show", "--help"),
@@ -102,9 +106,18 @@ def test_version_command_reports_the_state_directory(
     assert document["state_directory"] == str(bridge.home)
 
 
-def test_bare_invocation_prints_grouped_help(monkeypatch, capsys):
-    printed = text(monkeypatch, capsys)
-    headings = [title for title, _ in cli.COMMAND_GROUPS]
+def help_text(monkeypatch, capsys):
+    """Runs `--help` and returns its printed text."""
+    monkeypatch.setattr(sys, "argv", ["agent-parley", "--help"])
+    with pytest.raises(SystemExit) as exit_status:
+        cli.main()
+    assert exit_status.value.code == 0
+    return capsys.readouterr().out
+
+
+def test_help_prints_grouped_commands(monkeypatch, capsys):
+    printed = help_text(monkeypatch, capsys)
+    headings = [cli.START_HERE[0]] + [title for title, _ in cli.COMMAND_GROUPS]
     positions = [printed.index(f"{title}:") for title in headings]
     assert positions == sorted(positions)
     assert "Other:" not in printed
@@ -112,16 +125,165 @@ def test_bare_invocation_prints_grouped_help(monkeypatch, capsys):
 
 
 def test_grouped_help_lists_every_declared_command(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["agent-parley", "--help"])
-    with pytest.raises(SystemExit) as exit_status:
+    printed = help_text(monkeypatch, capsys)
+    monkeypatch.setattr(sys, "argv", ["agent-parley", "-h"])
+    with pytest.raises(SystemExit):
         cli.main()
-    assert exit_status.value.code == 0
-    printed = capsys.readouterr().out
-    assert printed == text(monkeypatch, capsys)
+    assert printed == capsys.readouterr().out
     grouped = {name for _, names in cli.COMMAND_GROUPS for name in names}
     for name in grouped:
         assert f"  {name} " in printed
     assert "__complete" not in printed
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("issue", "show", "829"),
+        ("participant", "show", "claude-2"),
+        ("gc", "--dry-run"),
+        ("issue", "release", "829"),
+    ),
+)
+def test_outside_a_checkout_names_repo(
+    tmp_path, monkeypatch, capsys, arguments
+):
+    outside = tmp_path / "plain"
+    outside.mkdir()
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.chdir(outside)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(tmp_path / "home"), *arguments],
+    )
+    assert cli.main() == 1
+    assert capsys.readouterr().err == (
+        "agent-parley: not inside a Git repository; pass --repo PATH or "
+        "run from the checkout\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "usage"),
+    (
+        (("say",), "usage: agent-parley say "),
+        (("report",), "usage: agent-parley report "),
+        (("history",), "usage: agent-parley history "),
+        (("mail", "send"), "usage: agent-parley mail send "),
+    ),
+)
+def test_missing_argument_prints_the_command_usage(
+    tmp_path, monkeypatch, capsys, arguments, usage
+):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(tmp_path / "home"), *arguments],
+    )
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    assert stopped.value.code == 2
+    printed = capsys.readouterr().err
+    assert printed.startswith(usage)
+    assert f"\nagent-parley {arguments[0]}" in printed
+
+
+def test_every_subcommand_action_carries_help():
+    parser, _ = cli.root_parser(None)
+    pending = [((), parser)]
+    bare = []
+    while pending:
+        path, current = pending.pop()
+        for action in current._actions:
+            if not isinstance(action, argparse._SubParsersAction):
+                continue
+            helped = {
+                id(action.choices[choice.dest])
+                for choice in action._choices_actions
+            }
+            for name, child in action.choices.items():
+                if id(child) not in helped:
+                    bare.append(" ".join((*path, name)))
+                pending.append(((*path, name), child))
+    assert bare == []
+
+
+def test_every_argument_carries_help():
+    parser, _ = cli.root_parser(None)
+    pending = [((), parser)]
+    bare = []
+    while pending:
+        path, current = pending.pop()
+        for action in current._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for name, child in action.choices.items():
+                    pending.append(((*path, name), child))
+            elif not action.help:
+                named = action.option_strings or [action.dest]
+                bare.append(" ".join((*path, named[0])))
+    assert bare == []
+
+
+def test_demo_help_describes_the_demo(monkeypatch, capsys):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(sys, "argv", ["agent-parley", "demo", "--help"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    described = " ".join(capsys.readouterr().out.split())
+    assert "stub lanes in a throwaway sandbox" in described
+    assert "press q or Ctrl-C to stop early" in described
+
+
+def test_every_surface_names_a_stopped_service_the_same_way(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    store.initialize(bridge.home)
+    lane = paired["lanes"]["claude"]
+    monkeypatch.chdir(lane)
+    printed = []
+    for arguments in (
+        ("status",),
+        ("top", "--once"),
+        ("problems",),
+        ("doctor",),
+    ):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["agent-parley", "--home", str(bridge.home), *arguments],
+        )
+        cli.main()
+        printed.append(capsys.readouterr().out.lower())
+    found = start.look(bridge.home, Path(lane))
+    printed.append(start.render(found).lower())
+    for output in printed:
+        assert "service" in output
+        assert protocol.STOPPED in output
+
+
+@pytest.mark.parametrize(
+    ("command", "described"),
+    (
+        ("issue", "Ask the holder of an issue to hand it to this lane."),
+        ("participant", "Push the lane branch and open or locate its pull"),
+        ("mail", "Search this lane's mail."),
+        ("unattended", "Integrate one eligible lane under the policy."),
+        ("approval", "Show which steps require a recorded approval first."),
+        ("decision", "List or search the decisions recorded for this"),
+    ),
+)
+def test_group_help_describes_each_action(
+    monkeypatch, capsys, command, described
+):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(sys, "argv", ["agent-parley", command, "--help"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert described in " ".join(capsys.readouterr().out.split())
 
 
 def test_status_accepts_repo_as_the_project_selector(
@@ -407,7 +569,7 @@ def test_an_alias_parses_to_the_canonical_arguments(canonical, alias):
 
 
 def test_help_names_the_canonical_command_for_each_alias(monkeypatch, capsys):
-    printed = " ".join(text(monkeypatch, capsys).split())
+    printed = " ".join(help_text(monkeypatch, capsys).split())
     assert "`mail send` is a compatibility alias" in printed
     assert "`reclaim` is a compatibility alias" in printed
     assert "`decision` queries the recorded ones" in printed
@@ -509,7 +671,9 @@ def test_provider_show_reports_one_definition(bridge, monkeypatch, capsys):
         ],
     )
     assert cli.main() == 1
-    assert "Unknown provider" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "Unknown provider" in error
+    assert error.splitlines()[-1] == "next: agent-parley provider list"
 
 
 def test_credentials_show_redacts_every_recorded_value(
@@ -552,6 +716,29 @@ def test_credentials_show_redacts_every_recorded_value(
     assert "Environment: ANTHROPIC_BASE_URL=<redacted>" in printed
     assert "Required from shell: ANTHROPIC_API_KEY" in printed
     assert "{" not in printed
+    listed = envelope(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "credentials",
+            "list",
+            "--json",
+        ),
+        "credentials",
+    )
+    assert listed["credentials"][0]["env"] == ["ANTHROPIC_BASE_URL=<redacted>"]
+    listing = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "credentials",
+        "list",
+    )
+    assert "example.invalid" not in listing
+    assert "ANTHROPIC_BASE_URL=<redacted>" in listing
 
 
 def test_provider_show_prints_labeled_fields(bridge, monkeypatch, capsys):
@@ -578,7 +765,14 @@ def test_provider_show_prints_labeled_fields(bridge, monkeypatch, capsys):
 def test_credentials_show_reports_an_empty_profile_in_words(
     bridge, monkeypatch, capsys
 ):
-    roster.define_credential(bridge.home, "bare", "", [], [])
+    (bridge.home / roster.CREDENTIALS).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "entries": {"bare": {"home": "", "env": [], "require_env": []}},
+            }
+        )
+    )
     printed = text(
         monkeypatch,
         capsys,
@@ -593,7 +787,110 @@ def test_credentials_show_reports_an_empty_profile_in_words(
         "Config home: none",
         "Environment: none",
         "Required from shell: none",
+        "Account: selects no account",
     ]
+
+
+def test_credentials_add_without_a_selector_exits_2_and_writes_nothing(
+    bridge, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "credentials",
+            "add",
+            "work",
+        ],
+    )
+    with pytest.raises(SystemExit) as exited:
+        cli.main()
+    assert exited.value.code == 2
+    assert roster.EMPTY_CREDENTIAL in capsys.readouterr().err
+    assert not (bridge.home / roster.CREDENTIALS).exists()
+
+
+def test_unknown_credentials_show_ends_on_an_add_with_a_selector(
+    bridge, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "credentials",
+            "show",
+            "work",
+        ],
+    )
+    assert cli.main() == 1
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        "next: agent-parley credentials add work --config-home ~/.claude-work"
+    )
+
+
+def test_a_lane_name_that_names_no_provider_points_at_provider_flag(
+    bridge, repo
+):
+    with pytest.raises(BridgeError) as raised:
+        bridge.add_participant(repo, "ada")
+    assert "a new lane name needs --provider" in str(raised.value)
+    assert raised.value.next_command == (
+        "agent-parley run ada --provider claude"
+    )
+    bridge.add_participant(repo, "ada", "claude")
+    assert "ada" in roster.read(bridge.project(repo)[1])["participants"]
+
+
+def test_mail_list_from_the_main_checkout_names_as(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "mail",
+            "list",
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert "--as NAME" in lines[0]
+    assert lines[-1] == "next: agent-parley mail list --as claude"
+
+
+@pytest.mark.parametrize(
+    "command", [("say", "nobody", "hi"), ("watch", "nobody")]
+)
+def test_say_and_watch_to_an_unknown_lane_end_on_the_participant_list(
+    bridge, repo, paired, monkeypatch, capsys, command
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            *command,
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert "nobody is not a participant" in lines[0]
+    assert lines[-1] == "next: agent-parley participant list"
 
 
 def test_detail_clips_long_values_on_a_narrow_terminal(
@@ -905,7 +1202,14 @@ def test_state_show_prints_the_archive_manifest(
     assert document["manifest"]["projects"][0]["root"] == paired["root"]
 
 
+@pytest.mark.filterwarnings("ignore:subprocess \\d+ is still running")
 def test_up_and_down_report_the_service_as_json(bridge, monkeypatch, capsys):
+    """Starts and stops the service in this process.
+
+    `up` leaves the service it started running on purpose and drops its
+    process handle, so the handle warns when collected here; a launcher
+    that exits never sees it.
+    """
     started = envelope(
         run(monkeypatch, capsys, "--home", str(bridge.home), "up", "--json"),
         "up",
@@ -994,3 +1298,396 @@ def test_a_duration_option_rejects_a_non_finite_window(
     assert f"--within: invalid duration value: '{text}'" in (
         capsys.readouterr().err
     )
+
+
+def test_approval_resume_records_the_service_resume_opt_ins(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    from agent_parley import supervision
+
+    def resume(*flags):
+        return text(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "approval",
+            "resume",
+            *flags,
+            "--repo",
+            str(repo),
+        )
+
+    directory = bridge.project(repo)[1]
+    assert "claude: approve_bridge_tools off, auto_mode off" in resume()
+    shown = resume("--bridge-tools", "on", "--participant", "claude")
+    assert shown.strip() == "claude: approve_bridge_tools on, auto_mode off"
+    assert roster.read(directory)["participants"]["claude"][
+        "approve_bridge_tools"
+    ]
+    assert not supervision.opt_in_missing(
+        bridge.home, roster.read(directory), "claude"
+    )
+    shown = resume("--auto-mode", "on")
+    assert "codex: approve_bridge_tools off, auto_mode on" in shown
+    assert roster.read(directory)["supervision"]["auto_mode"] is True
+    resume("--bridge-tools", "off", "--participant", "claude")
+    assert "claude: approve_bridge_tools off, auto_mode on" in resume()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "approval",
+            "resume",
+            "--participant",
+            "nobody",
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() != 0
+    assert "nobody is not a participant" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("name", "flag", "message"),
+    [
+        ("codex", "--auto-mode", "codex lane, and auto_mode starts"),
+        ("amper", "--bridge-tools", "the amp CLI offers no per-server"),
+    ],
+)
+def test_approval_resume_refuses_an_opt_in_the_lane_cannot_carry(
+    bridge, repo, paired, monkeypatch, capsys, name, flag, message
+):
+    bridge.add_participant(repo, "amper", "amp", None)
+    directory = bridge.project(repo)[1]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "approval",
+            "resume",
+            flag,
+            "on",
+            "--participant",
+            name,
+            "--repo",
+            str(repo),
+        ],
+    )
+    assert cli.main() != 0
+    assert message in capsys.readouterr().err
+    lane = roster.read(directory)["participants"][name]
+    assert "auto_mode" not in lane
+    assert "approve_bridge_tools" not in lane
+    resume = bridge.resume_opt_in(repo, participant="codex", bridge_tools=True)
+    assert resume == "codex: approve_bridge_tools on, auto_mode off"
+
+
+def test_setup_confirms_in_plain_text_and_json_carries_the_envelope(
+    bridge, repo, monkeypatch, capsys
+):
+    printed = text(
+        monkeypatch, capsys, "--home", str(bridge.home), "setup", str(repo)
+    )
+    assert not printed.startswith("{")
+    lines = printed.splitlines()
+    assert lines[0] == f"Root: {repo.resolve()}"
+    assert [line.split(":")[0] for line in lines] == [
+        "Root",
+        "Base",
+        "Forge",
+        "Verify",
+        "Init",
+        "Next",
+    ]
+    assert lines[3] == "Verify: none; participant merge runs no gate"
+    assert lines[4] == "Init: none"
+    assert lines[-1] == "Next: agent-parley run claude"
+    document = envelope(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "setup",
+            str(repo),
+            "--json",
+        ),
+        "setup",
+    )
+    assert document["root"] == str(repo.resolve())
+    assert lines[1] == f"Base: {document['base'][:12]}"
+
+
+def test_setup_suggests_the_gate_its_committed_makefile_declares(
+    bridge, repo, monkeypatch, capsys
+):
+    (repo / "Makefile").write_text("lint:\n\ttrue\ncheck: lint\n\ttrue\n")
+    git(repo, "add", "Makefile")
+    git(
+        repo,
+        "-c",
+        "user.name=Bridge Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "Add a check target",
+    )
+    printed = text(
+        monkeypatch, capsys, "--home", str(bridge.home), "setup", str(repo)
+    )
+    assert "Verify: none; participant merge runs no gate" in printed
+    assert 'Suggested: agent-parley verify set "make check"' in printed
+    assert printed.splitlines()[-1].startswith("Next: ")
+    assert roster.read(bridge.project(repo)[1])["verify"] == []
+
+
+def test_setup_records_the_gate_and_init_under_the_operator_guard(
+    bridge, repo, monkeypatch, capsys
+):
+    monkeypatch.chdir(repo)
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "setup",
+        str(repo),
+        "--verify",
+        "make check",
+        "--init",
+        "uv sync",
+    )
+    assert "Verify: make check" in printed
+    assert "Init: uv sync" in printed
+    assert "Suggested:" not in printed
+    stored = roster.read(bridge.project(repo)[1])
+    assert stored["verify"] == ["make", "check"]
+    assert stored["initialize"] == ["uv", "sync"]
+    document = run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "setup",
+        str(repo),
+        "--json",
+    )
+    assert document["verify"] == ["make", "check"]
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "setup",
+            str(repo),
+            "--verify",
+            "true",
+        ],
+    )
+    assert cli.main() != 0
+    assert "AGENT_PARLEY_TOKEN" in capsys.readouterr().err
+    assert roster.read(bridge.project(repo)[1])["verify"] == ["make", "check"]
+
+
+def test_credentials_add_names_its_settings_without_values(
+    bridge, tmp_path, monkeypatch, capsys
+):
+    config = tmp_path / "claude-work"
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "credentials",
+        "add",
+        "work",
+        "--config-home",
+        str(config),
+        "--env",
+        "WORK_REGION=eu-west",
+        "--require-env",
+        "WORK_TOKEN",
+    )
+    assert printed == (
+        f"Defined credential profile work (config home {config}; "
+        "sets WORK_REGION; requires WORK_TOKEN).\n"
+        "Next: agent-parley run claude --credentials work\n"
+    )
+    assert "eu-west" not in printed
+    document = envelope(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "credentials",
+            "add",
+            "home",
+            "--require-env",
+            "HOME_TOKEN",
+            "--json",
+        ),
+        "credentials",
+    )
+    assert [entry["name"] for entry in document["credentials"]] == [
+        "home",
+        "work",
+    ]
+
+
+def test_provider_add_confirms_in_plain_text_and_json_carries_the_envelope(
+    bridge, monkeypatch, capsys
+):
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "provider",
+        "add",
+        "claude-work",
+        "--adapter",
+        "claude",
+        "--executable",
+        "claude",
+    )
+    assert printed == (
+        "Defined provider claude-work (claude adapter; runs claude).\n"
+        "Next: agent-parley provider show claude-work\n"
+    )
+    document = envelope(
+        run(
+            monkeypatch,
+            capsys,
+            "--home",
+            str(bridge.home),
+            "provider",
+            "add",
+            "codex-work",
+            "--adapter",
+            "codex",
+            "--executable",
+            "codex",
+            "--json",
+        ),
+        "providers",
+    )
+    names = [entry["name"] for entry in document["providers"]]
+    assert "claude-work" in names and "codex-work" in names
+
+
+RESOLVED = {
+    "issue": 42,
+    "outcome": "complete",
+    "holder": "claude",
+    "owner": None,
+    "state": "complete",
+    "evidence": {
+        "branch": "parley/claude",
+        "state": "MERGED",
+        "observed_at": 1760000000.0,
+    },
+}
+
+
+def test_issue_resolve_says_what_it_ended_and_json_carries_the_envelope(
+    bridge, repo, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli.Bridge, "issue_resolve", lambda *args, **kwargs: dict(RESOLVED)
+    )
+    arguments = (
+        "--home",
+        str(bridge.home),
+        "issue",
+        "resolve",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    printed = text(monkeypatch, capsys, *arguments)
+    assert printed == (
+        "Resolved issue #42: recorded complete, ending claude's claim on "
+        "parley/claude (merged).\n"
+        "Next: agent-parley issue show 42\n"
+    )
+    document = envelope(
+        run(monkeypatch, capsys, *arguments, "--json"), "issue_resolve"
+    )
+    assert document["outcome"] == "complete"
+    assert document["evidence"]["observed_at"] == "2025-10-09T08:53:20Z"
+
+
+def test_issue_resolve_release_says_the_work_went_back_to_the_queue(
+    bridge, repo, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli.Bridge,
+        "issue_resolve",
+        lambda *args, **kwargs: {**RESOLVED, "outcome": "release"},
+    )
+    printed = text(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "issue",
+        "resolve",
+        "42",
+        "--release",
+        "--repo",
+        str(repo),
+    )
+    assert printed.startswith("Resolved issue #42: returned to the queue, ")
+
+
+def test_issue_recover_says_what_it_approved_and_json_carries_the_envelope(
+    bridge, repo, monkeypatch, capsys
+):
+    approval = {
+        "id": "authorization:c1:s1",
+        "issue": "42",
+        "claim_id": "c1",
+        "owner": "claude",
+        "session_id": "s1",
+        "reason": "stuck on capacity",
+        "authorized_by": "operator",
+        "authorized_at": 1760000000.0,
+    }
+    monkeypatch.setattr(
+        cli.Bridge, "authorize_recovery", lambda *args: dict(approval)
+    )
+    arguments = (
+        "--home",
+        str(bridge.home),
+        "issue",
+        "recover",
+        "42",
+        "--reason",
+        "stuck on capacity",
+        "--repo",
+        str(repo),
+    )
+    printed = text(monkeypatch, capsys, *arguments)
+    assert printed == (
+        "Recovery approved for issue #42: claude's claim stops once a "
+        "matching capacity observation is published; nothing has moved "
+        "yet.\n"
+    )
+    document = envelope(
+        run(monkeypatch, capsys, *arguments, "--json"), "issue_recover"
+    )
+    assert document["claim_id"] == "c1"
+    assert document["authorized_at"] == "2025-10-09T08:53:20Z"

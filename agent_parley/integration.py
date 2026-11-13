@@ -32,7 +32,9 @@ MERGE_BUSY = "Another merge into the base checkout is running; retry later."
 class IntegrationMixin(MailMixin):
     """Lane merges, bulk integration order, and operator decisions."""
 
-    def merge(self, repo: Path, name: str, renew: bool = False) -> str:
+    def merge(
+        self, repo: Path, name: str, renew: bool = False, issue: str = ""
+    ) -> str:
         """Merges one participant's bridge branch into the base checkout.
 
         Merges serialize on `merge.lock`. The shared setup lock is held only
@@ -47,6 +49,8 @@ class IntegrationMixin(MailMixin):
             renew: Whether the operator grants the recorded unverified
                 integration a fresh set of attempts. Accepted only from the
                 base checkout, never from an assigned worktree.
+            issue: Claimed issue whose work is merged, or empty to take the
+                lane's only ready claim.
 
         Returns:
             An account of what was merged.
@@ -55,10 +59,11 @@ class IntegrationMixin(MailMixin):
             BridgeError: If the lane drifted, if the participant holds a
                 running session, if the project requires an operator approval
                 the lane's current ready report does not have, if the
-                repository's verification command fails, if the base carries
-                an unverified integration this lane may not repair or whose
-                attempts are used, or if the merge cannot complete unattended.
-            subprocess.TimeoutExpired: If verification exceeds its timeout.
+                repository's verification command fails or times out, if the
+                base carries an unverified integration this lane may not
+                repair or whose attempts are used, or if the merge cannot
+                complete unattended.
+            subprocess.TimeoutExpired: If a Git query exceeds its timeout.
         """
         from agent_parley.cli import lock, roster
 
@@ -71,20 +76,26 @@ class IntegrationMixin(MailMixin):
                 if participant is None:
                     raise BridgeError(
                         f"{name} is not a participant in this project; "
-                        "run agent-parley participant list."
+                        "run agent-parley participant list.",
+                        next_command="agent-parley participant list",
                     )
             if renew:
                 self._from_base(repo, root, data, "Recovery attempts are")
-            return self._integrate_lane(root, directory, data, name, renew)
+            return self._integrate_lane(
+                root, directory, data, name, renew, issue=issue
+            )
 
     def _from_base(
         self, repo: Path, root: Path, data: dict, subject: str
     ) -> None:
-        """Refuses an operator decision made inside an assigned worktree.
+        """Refuses an operator decision made by a lane.
 
-        This is the command-line boundary between the operator and the
-        lanes, not an operating-system one: a program running as the same
-        user can write coordination state directly.
+        `roster.from_lane` also reads a lane's coordination credential, so a
+        lane that changes directory to the base checkout is still refused,
+        as `unattended.operator_only` refuses it. This is the command-line
+        boundary between the operator and the lanes, not an operating-system
+        one: a program running as the same user can write coordination state
+        directly.
 
         Args:
             repo: Checkout the command runs in.
@@ -93,7 +104,8 @@ class IntegrationMixin(MailMixin):
             subject: What is decided, as the start of the refusal.
 
         Raises:
-            BridgeError: If the command runs inside an assigned worktree.
+            BridgeError: If the command runs inside an assigned worktree,
+                names one as its checkout, or runs with a lane's token.
         """
         from agent_parley.cli import git, roster
 
@@ -102,11 +114,12 @@ class IntegrationMixin(MailMixin):
             Path(lane["lane"]).resolve()
             for lane in data["participants"].values()
         }
-        if here in lanes or roster.caller_lane(data):
+        if here in lanes or roster.from_lane(data):
             raise BridgeError(
-                f"{subject} recorded from the base checkout at {root}, never "
-                "from an assigned worktree, so a lane does not decide its own "
-                "work."
+                f"{subject} recorded from an operator shell in the base "
+                f"checkout at {root}, never from an assigned worktree or a "
+                f"process holding a lane's {roster.LANE_TOKEN}, so a lane "
+                "does not decide its own work."
             )
 
     def verify_recovery(self, repo: Path) -> str:
@@ -128,9 +141,9 @@ class IntegrationMixin(MailMixin):
         Raises:
             BridgeError: If run from an assigned worktree, if the base holds
                 a merge in progress or uncommitted changes, if the gate
-                fails, or if the gate moves HEAD or changes the tree. The
-                record stands in every case.
-            subprocess.TimeoutExpired: If verification exceeds its timeout.
+                fails or times out, or if the gate moves HEAD or changes the
+                tree. The record stands in every case.
+            subprocess.TimeoutExpired: If a Git query exceeds its timeout.
         """
         from agent_parley.cli import git, lock, merges, roster, verify_base
 
@@ -157,7 +170,9 @@ class IntegrationMixin(MailMixin):
             if git(root, "status", "--porcelain"):
                 raise BridgeError(
                     f"The base checkout at {root} has uncommitted changes. "
-                    f"Commit or remove them yourself first. {stands}"
+                    f"Commit or remove them yourself first. {stands}",
+                    next_command=f"git -C {quoted} stash push "
+                    "--include-untracked",
                 )
             head = git(root, "rev-parse", "HEAD")
             if held["command"]:
@@ -314,6 +329,8 @@ class IntegrationMixin(MailMixin):
         renew: bool = False,
         *,
         expected: tuple[str, str] | None = None,
+        issue: str = "",
+        verified: tuple[str, str] | None = None,
     ) -> str:
         """Runs the gate and merges one lane while its session is excluded.
 
@@ -322,9 +339,10 @@ class IntegrationMixin(MailMixin):
         command merges it on.
 
         An attempt is recorded before the merge starts and cleared only when
-        the exact resulting commit passes the post-merge gate, so a conflict,
-        a failed gate or a crash leaves a durable account of an unverified
-        base. While it stands no other lane is integrated, and a retry by the
+        the exact resulting commit passes the post-merge gate and the claim
+        is recorded complete, so a conflict, a failed gate, a crash or a busy
+        issue ledger leaves a durable account the lane's retry finishes.
+        While it stands no other lane is integrated, and a retry by the
         lane that may repair it skips the pre-merge gate, whose failure the
         record already names, and verifies the exact result instead.
 
@@ -337,6 +355,13 @@ class IntegrationMixin(MailMixin):
             expected: Claim generation and ready source commit an earlier
                 authorization was bound to, rechecked under the session
                 lock; None when the caller bound none.
+            issue: Claimed issue whose work is merged, or empty to take the
+                lane's only ready claim.
+            verified: Base commit and merged tree a gate already passed
+                outside `merge.lock`, or None. With it the pre-merge gate
+                is replaced by a check that the base is still that commit,
+                and the post-merge gate is skipped when the merge
+                reproduces that tree; any other result is gated as usual.
 
         Returns:
             An account of what was merged.
@@ -344,16 +369,17 @@ class IntegrationMixin(MailMixin):
         Raises:
             BridgeError: If the project requires an operator approval the
                 lane's current ready report does not have, if the claim or
-                source commit differs from ``expected``, if the gate fails,
+                source commit differs from ``expected``, if the base moved
+                from the commit ``verified`` names, if the gate fails,
                 if the base carries an unverified integration this attempt may
                 not continue, or if the merge cannot complete unattended.
         """
         from agent_parley.cli import (
-            exact_claim,
             git,
             lifecycle,
             lock,
             merge_branch,
+            merge_claim,
             merges,
             metrics,
             roster,
@@ -373,11 +399,12 @@ class IntegrationMixin(MailMixin):
                     "nothing was merged. Retry the merge."
                 )
             self._require_approval(directory, data, name, "merge")
-            claim = exact_claim(directory, name)
+            claim = merge_claim(directory, name, issue)
             held = self._held_integration(root, directory, name, claim, renew)
             source_commit = ""
             if claim["issue"] is not None:
-                record = snapshot(directory)["issues"][str(claim["issue"])]
+                ledger = snapshot(directory)
+                record = ledger["issues"][str(claim["issue"])]
                 execution = lifecycle.state(record)
                 if execution["state"] != lifecycle.READY and not (
                     held and execution["state"] == lifecycle.RECOVERY
@@ -388,6 +415,9 @@ class IntegrationMixin(MailMixin):
                 source_commit = (
                     execution.get("source_commit") or execution["commit"]
                 )
+                waits = merges.dependency_refusal(ledger, str(claim["issue"]))
+                if waits and held is None:
+                    raise BridgeError(waits)
             if expected is not None and (
                 claim["claim_id"],
                 source_commit,
@@ -396,7 +426,13 @@ class IntegrationMixin(MailMixin):
                     f"{name}'s claim or ready commit changed after the "
                     "integration was authorized; nothing was merged."
                 )
-            if data["verify"] and held is None:
+            if verified is not None and held is None:
+                if git(root, "rev-parse", "HEAD") != verified[0]:
+                    raise BridgeError(
+                        f"The base moved from {verified[0][:12]} after the "
+                        "candidate was verified; nothing was merged."
+                    )
+            elif data["verify"] and held is None:
                 base_commit = git(root, "rev-parse", "HEAD")
                 verify_base(root, data["verify"])
                 if git(root, "rev-parse", "HEAD") != base_commit or git(
@@ -411,10 +447,7 @@ class IntegrationMixin(MailMixin):
                 source_commit
                 and git(lane, "rev-parse", "HEAD") != source_commit
             ):
-                raise BridgeError(
-                    f"{name} committed since issue #{claim['issue']} was "
-                    "reported ready; record a new report before merging."
-                )
+                raise BridgeError(merges.stale_ready(name, str(claim["issue"])))
             blocker = next(
                 merges.merge_blockers(root, lane, name, participant["branch"]),
                 "",
@@ -468,7 +501,11 @@ class IntegrationMixin(MailMixin):
             integrated = git(root, "rev-parse", "HEAD")
             entry["result"] = integrated
             merges.record_integration(directory, entry)
-            if data["verify"]:
+            if data["verify"] and not (
+                verified is not None
+                and held is None
+                and git(root, "rev-parse", "HEAD^{tree}") == verified[1]
+            ):
                 try:
                     verify_base(root, data["verify"], integrated=True)
                 except BridgeError as failure:
@@ -499,20 +536,45 @@ class IntegrationMixin(MailMixin):
                             "complete."
                         ),
                     )
+            if claim["issue"] is not None and claim["claim_id"]:
+                try:
+                    lifecycle.complete(
+                        directory,
+                        str(claim["issue"]),
+                        claim["claim_id"],
+                        integrated,
+                        data["verify"],
+                        source_commit,
+                    )
+                except (BridgeError, OSError) as failure:
+                    detail = merges.diagnostic(
+                        f"verified but not recorded complete: {failure}"
+                    )
+                    merges.record_integration(
+                        directory, {**entry, "detail": detail}
+                    )
+                    waits = ""
+                    with contextlib.suppress(BridgeError, OSError):
+                        waits = merges.dependency_refusal(
+                            snapshot(directory), str(claim["issue"])
+                        )
+                    remedy = (
+                        f". {waits}"
+                        if waits
+                        else f"; run `agent-parley participant merge {name}` "
+                        "again to record the completion."
+                    )
+                    raise BridgeError(
+                        f"{merged}\nThe merge at {integrated[:12]} passed "
+                        f"the gate, but issue #{claim['issue']} could not "
+                        f"be recorded complete: {failure}\nThe integration "
+                        f"record stands{remedy}"
+                    ) from None
             merges.clear_integration(directory, entry["attempt"], integrated)
             if held:
                 merged += (
                     f" Recovery verified {integrated[:12]} on attempt "
                     f"{entry['attempt']} of {entry['limit']}."
-                )
-            if claim["issue"] is not None and claim["claim_id"]:
-                lifecycle.complete(
-                    directory,
-                    str(claim["issue"]),
-                    claim["claim_id"],
-                    integrated,
-                    data["verify"],
-                    source_commit,
                 )
             metrics.record_report(
                 directory,
@@ -553,6 +615,7 @@ class IntegrationMixin(MailMixin):
             merge_preview,
             merges,
             roster,
+            snapshot,
         )
 
         root, directory = self.project(repo)
@@ -562,7 +625,8 @@ class IntegrationMixin(MailMixin):
             if participant is None:
                 raise BridgeError(
                     f"{name} is not a participant in this project; "
-                    "run agent-parley participant list."
+                    "run agent-parley participant list.",
+                    next_command="agent-parley participant list",
                 )
             session = lane_session(directory, name)
         report = merge_preview(
@@ -571,6 +635,9 @@ class IntegrationMixin(MailMixin):
             name,
             participant["branch"],
             session,
+            merges.admission_refusals(
+                root, directory, data, snapshot(directory), name
+            ),
         )
         try:
             held = merges.integration_record(directory)
@@ -698,7 +765,10 @@ class IntegrationMixin(MailMixin):
         `participant merge --preview` reports, and each merge then runs
         through the single-lane path, so no lane is integrated on easier terms
         than it would be alone. A group is admitted whole or not at all: one
-        refused member leaves the group unmerged. Execution is still ordered
+        refused member leaves the group unmerged. The whole run is predicted
+        first with `merges.run_conflicts`, each lane onto the lanes before
+        it, and a run any lane would conflict in merges nothing and names
+        the lanes and paths. Execution is still ordered
         rather than atomic, so a merge or gate failure part way through stops
         the run and leaves the earlier merge commits in place; the report then
         names what was integrated, what refused and what was not attempted.
@@ -732,6 +802,7 @@ class IntegrationMixin(MailMixin):
             lane_dependencies,
             lane_refusals,
             lock,
+            merges,
             plan,
             roster,
             snapshot,
@@ -765,15 +836,47 @@ class IntegrationMixin(MailMixin):
                     )
                 waits = lane_dependencies(state, candidates)
                 sequence = plan.order(waits, "Lane dependencies")
+                admitted: dict[str, list[str]] = {}
+                earlier: set[str] = set()
+                for name in sequence:
+                    admitted[name] = merges.admission_refusals(
+                        root, directory, data, state, name, frozenset(earlier)
+                    )
+                    earlier.update(candidates[name])
                 refusals = {
                     name: lane_refusals(
                         root, directory, data["participants"][name], name
                     )
+                    + admitted[name]
                     for name in sequence
                 }
+            conflicts = merges.run_conflicts(
+                root,
+                [
+                    (name, data["participants"][name]["branch"])
+                    for name in sequence
+                ],
+            )
             if preview:
                 return self._integration_preview(
-                    root, directory, data, subject, sequence
+                    root,
+                    directory,
+                    data,
+                    subject,
+                    sequence,
+                    admitted,
+                    conflicts or [],
+                )
+            if conflicts:
+                raise BridgeError(
+                    "\n".join(
+                        [
+                            f"{subject}: nothing merged, because merging "
+                            "the lanes in dependency order "
+                            f"({', '.join(sequence)}) would conflict:",
+                            *(f"- {conflict}" for conflict in conflicts),
+                        ]
+                    )
                 )
             if group and any(refusals.values()):
                 raise BridgeError(group_refusal(group, sequence, refusals))
@@ -831,8 +934,14 @@ class IntegrationMixin(MailMixin):
         data: dict,
         subject: str,
         sequence: list[str],
+        admitted: dict[str, list[str]],
+        conflicts: Sequence[str] = (),
     ) -> str:
-        """Reports the ordered plan and every candidate's own preview."""
+        """Reports the ordered plan and every candidate's own preview.
+
+        Conflicts predicted for the run as a whole, which a lane's own
+        preview against the base cannot show, are named after the plan.
+        """
         from agent_parley.cli import lane_session, merge_preview
 
         report = [
@@ -841,6 +950,12 @@ class IntegrationMixin(MailMixin):
             + ".",
             "Preview only: nothing is merged and no lane is verified.",
         ]
+        if conflicts:
+            report.append(
+                "Merging them in this order would conflict, so a run "
+                "merges nothing:"
+            )
+            report += [f"- {conflict}" for conflict in conflicts]
         for name in sequence:
             participant = data["participants"][name]
             report.append(f"\n{name}:")
@@ -851,6 +966,7 @@ class IntegrationMixin(MailMixin):
                     name,
                     participant["branch"],
                     lane_session(directory, name),
+                    admitted[name],
                 )
             )
         return "\n".join(report)
@@ -905,7 +1021,7 @@ class IntegrationMixin(MailMixin):
                 continue
             try:
                 outcome = self._integrate_lane(root, directory, data, name)
-            except BridgeError as failure:
+            except (BridgeError, subprocess.TimeoutExpired) as failure:
                 stopped = name
                 report.append(f"- {name}: stopped. {failure}")
                 continue
@@ -947,8 +1063,9 @@ class IntegrationMixin(MailMixin):
         Raises:
             BridgeError: If the command runs inside a lane, if the
                 participant is unknown, if the lane has no current ready
-                report, if a rejection carries no reason, or if the decision
-                cannot be recorded.
+                report, if the lane committed after that report, if a
+                rejection carries no reason, or if the decision cannot be
+                recorded.
         """
         from agent_parley.cli import approvals, roster
 
@@ -957,7 +1074,8 @@ class IntegrationMixin(MailMixin):
         if name not in data["participants"]:
             raise BridgeError(
                 f"{name} is not a participant in this project; "
-                "run agent-parley participant list."
+                "run agent-parley participant list.",
+                next_command="agent-parley participant list",
             )
         if decision == approvals.REJECTED and not reason.strip():
             raise BridgeError(
@@ -972,6 +1090,14 @@ class IntegrationMixin(MailMixin):
                 "the lane to report ready, then record the decision."
             )
         bound = reviewed["binding"]
+        if reviewed["commit"] and reviewed["commit"] != bound["head"]:
+            raise BridgeError(
+                f"{name}'s report {reviewed['report']} describes "
+                f"{reviewed['commit'][:12]}, but {bound['branch']} is at "
+                f"{bound['head'][:12] or 'an unreadable commit'}: the lane "
+                f"has committed since report {reviewed['report']}; have it "
+                "report again, then record the decision."
+            )
         approvals.remember(
             directory,
             name,

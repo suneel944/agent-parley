@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 
 from agent_parley.policy import has_attribution
-from scripts import codex_bundle, release_publish
+from scripts import check_mcp_manifests, codex_bundle, release_publish
 
 TOLERATED_WARNINGS = frozenset({"protocol"})
 
@@ -21,6 +21,8 @@ VALIDATOR_FAILED = 2
 README_BLOB_PREFIX = "https://github.com/suneel944/agent-parley/blob/main/"
 
 README_LINK = re.compile(r"\]\(([^)\s]+)\)|href=\"([^\"]+)\"")
+
+ACTION_PIN = re.compile(r"uses:\s*([\w.-]+/[\w./-]+)@([0-9a-f]{40})")
 
 
 def contribution_errors(root: Path) -> list[str]:
@@ -165,6 +167,40 @@ def duplicate_paragraph_errors(root: Path) -> list[str]:
     return errors
 
 
+def action_pin_errors(root: Path) -> list[str]:
+    """Checks that each pinned GitHub Action uses one commit everywhere.
+
+    A bump applied by hand to some workflows can leave another one, such as
+    the release workflow, on an older commit of the same action.
+
+    Args:
+        root: Repository root holding the ``.github`` tree.
+
+    Returns:
+        One message per action pinned to more than one commit, naming every
+        commit and the files that use it.
+    """
+    github = root / ".github"
+    paths = sorted(
+        [*github.glob("workflows/*.yml"), *github.glob("actions/**/*.yml")]
+    )
+    pins: dict[str, dict[str, list[str]]] = {}
+    for path in paths:
+        for action, sha in ACTION_PIN.findall(path.read_text()):
+            files = pins.setdefault(action, {}).setdefault(sha, [])
+            name = str(path.relative_to(root))
+            if name not in files:
+                files.append(name)
+    return [
+        f"{action} is pinned to several commits: "
+        + "; ".join(
+            f"{sha} in {', '.join(files)}" for sha, files in sorted(by.items())
+        )
+        for action, by in sorted(pins.items())
+        if len(by) > 1
+    ]
+
+
 def frontmatter(text: str) -> dict[str, str]:
     """Returns the scalar fields of a leading document block.
 
@@ -302,6 +338,7 @@ def main() -> None:
         contribution_errors(root)
         + readme_link_errors(root)
         + duplicate_paragraph_errors(root)
+        + action_pin_errors(root)
     )
     for message in sys.argv[1:]:
         if has_attribution(Path(message).read_text()):
@@ -354,6 +391,7 @@ def main() -> None:
         if json.loads(path.read_text())["version"] != metadata["version"]:
             errors.append(f"{client} plugin version differs from package")
     errors.extend(codex_bundle.manifest_errors(root))
+    errors.extend(check_mcp_manifests.manifest_errors(root))
     errors.extend(plugin_validation_errors(root))
     marketplace = json.loads(
         (root / ".claude-plugin/marketplace.json").read_text()

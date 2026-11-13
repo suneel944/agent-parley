@@ -26,6 +26,7 @@ from agent_parley import (
     roster,
     server,
     store,
+    supervision,
 )
 from agent_parley.state import lock, write_json
 
@@ -61,19 +62,6 @@ def registered(request):
         store.initialize(bridge.home)
         for name in ("claude", "codex"):
             asyncio.run(bridge.identity(name, paired))
-
-
-@pytest.fixture
-def service(bridge):
-    """Serves the bridge's configured loopback port on a thread."""
-    with server.Server(bridge.home, bridge.config) as instance:
-        thread = threading.Thread(target=instance.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield instance
-        finally:
-            instance.shutdown()
-            thread.join(timeout=2)
 
 
 def importable():
@@ -446,16 +434,9 @@ def test_a_stale_service_answers_the_hook_with_a_fallback_status(
 
 
 @pytest.fixture
-def watched_service(bridge):
+def watched_service(threaded_service):
     """Serves on a thread the test watches return when the service stops."""
-    with server.Server(bridge.home, bridge.config) as instance:
-        thread = threading.Thread(target=instance.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield instance, thread
-        finally:
-            instance.shutdown()
-            thread.join(timeout=2)
+    return threaded_service
 
 
 def hook_request(bridge, lane, payload):
@@ -554,7 +535,7 @@ def test_status_names_the_drift_a_stale_service_reports(
     moved_sources(monkeypatch)
     bridge.status()
     printed = capsys.readouterr().out
-    assert "Server: not ready" in printed
+    assert "Service: not ready" in printed
     assert f"Code: {protocol.STALE}" in printed
     assert protocol.RELAUNCH in printed
 
@@ -1017,6 +998,17 @@ def test_the_shell_client_asks_for_a_timeout_bash_3_2_accepts(bridge):
     assert '\\"hook_pid\\":$AGENT_PARLEY_HOOK_PID' in script.read_text()
 
 
+def test_rewriting_the_client_leaves_a_reader_the_whole_old_script(bridge):
+    script = Path(hook.write_client(str(bridge.home), sys.executable))
+    old = script.read_text()
+    with script.open() as reader:
+        hook.write_client(str(bridge.home), "/opt/other/python3")
+        assert reader.read() == old
+    assert "/opt/other/python3" in script.read_text()
+    assert script.stat().st_mode & 0o777 == 0o755
+    assert [path.name for path in script.parent.glob("*.tmp")] == []
+
+
 @pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
 def test_the_launcher_configures_the_shell_client(bridge, repo, paired):
     lane = Path(paired["lanes"]["codex"])
@@ -1109,6 +1101,25 @@ def test_no_relaunch_is_asked_for_without_a_recorded_service(
         bridge.home / "server.json",
         {"pid": os.getpid(), "start_ticks": process.start_ticks(os.getpid())},
     )
+    hook.relaunch(str(bridge.home))
+    assert asked == []
+    assert not (bridge.home / hook.RELAUNCH_STAMP).exists()
+
+
+def test_no_relaunch_is_asked_for_while_the_service_identity_is_unknown(
+    bridge, monkeypatch
+):
+    def timed_out(field, pid):
+        raise process.IdentityUnknown("ps timed out")
+
+    write_json(
+        bridge.home / "server.json",
+        {"pid": os.getpid(), "start_ticks": "Wed Sep 10 11:22:33 2026"},
+    )
+    monkeypatch.setattr(
+        process, "PLATFORM", process.darwin_platform(timed_out, timed_out)
+    )
+    asked = requests(monkeypatch)
     hook.relaunch(str(bridge.home))
     assert asked == []
     assert not (bridge.home / hook.RELAUNCH_STAMP).exists()
@@ -1304,6 +1315,54 @@ def test_a_decision_past_its_deadline_is_never_decided_again(
     assert len(events(lane.parent)) == 1
 
 
+@pytest.mark.parametrize(
+    ("command", "refused"),
+    [
+        ("git switch other", True),
+        ("git worktree add /tmp/elsewhere", True),
+        (
+            "git commit -m fix --trailer "
+            + json.dumps("Co-Authored-By:" + " Codex <bot@example.com>"),
+            True,
+        ),
+        ("agent-parley budget resume", True),
+        ("ls", False),
+    ],
+)
+def test_a_guarded_command_is_refused_past_the_deadline(
+    bridge, repo, paired, service, monkeypatch, command, refused
+):
+    branch = checkpoints.current_branch
+
+    def slow(lane):
+        time.sleep(server.DECISION_SECONDS + 1.5)
+        return branch(lane)
+
+    monkeypatch.setattr(server.checkpoints, "current_branch", slow)
+    lane = Path(paired["lanes"]["codex"])
+    started = time.monotonic()
+    served = run_hook(
+        bridge,
+        lane.parent,
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": str(lane),
+            "session_id": "s1",
+        },
+    )
+    assert time.monotonic() - started < checkpoints.HOOK_TIMEOUT
+    assert served.returncode == 0, served.stderr
+    answered = json.loads(served.stdout)
+    if refused:
+        details = answered["hookSpecificOutput"]
+        assert details["permissionDecision"] == "deny"
+    else:
+        assert answered == {}
+    settled(lane.parent, 1)
+
+
 def test_an_abandoned_stop_leaves_its_coordination_undelivered(
     bridge, repo, paired, service, monkeypatch
 ):
@@ -1347,6 +1406,133 @@ def test_an_abandoned_stop_leaves_its_coordination_undelivered(
     assert state["activity"] == "working"
 
 
+def mailed(bridge, lane, subject):
+    """Sends one message from ``claude`` to ``codex``."""
+    identity = json.loads((lane.parent / "claude-identity.json").read_text())
+    actor = store.authenticate(bridge.home, identity["registration_token"])
+    store.call(
+        bridge.home,
+        actor,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": subject,
+            "body_md": "Read this.",
+            "idempotency_key": subject,
+        },
+    )
+
+
+def unread(bridge, paired):
+    return checkpoints.mailbox(bridge.home, paired["root"], "codex")["unread"]
+
+
+def counted_deliveries(monkeypatch):
+    """Counts the deliveries the service records."""
+    recorded = []
+    deliver = server.checkpoints.deliver
+
+    def counting(*args, **kwargs):
+        recorded.append(args)
+        return deliver(*args, **kwargs)
+
+    monkeypatch.setattr(server.checkpoints, "deliver", counting)
+    return recorded
+
+
+def test_a_reply_the_client_never_confirms_leaves_its_mail_unread(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    lane = Path(paired["lanes"]["codex"])
+    mailed(bridge, lane, "Unconfirmed change")
+    recorded = counted_deliveries(monkeypatch)
+    identity = json.loads((lane.parent / "codex-identity.json").read_text())
+    port = bridge.config["port"]
+    body = json.dumps(
+        {
+            "directory": str(lane.parent),
+            "participant": "codex",
+            "payload": {**START, "cwd": str(lane)},
+        }
+    ).encode()
+    head = (
+        f"POST {hook.PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+        f"Authorization: Bearer {identity['registration_token']}\r\n"
+        "Content-Type: application/json\r\n"
+        f"{hook.RECEIPT_HEADER}: {hook.RECEIPT}\r\n"
+        f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+    ).encode()
+    reply = b""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(head + body)
+        while chunk := sock.recv(65536):
+            reply += chunk
+    assert reply.split(b" ", 2)[1] == b"200"
+    assert b"Unconfirmed change" in reply
+    assert recorded == []
+    assert unread(bridge, paired) == 1
+    assert "reply was not confirmed by the client" in capsys.readouterr().out
+    served = run_hook(bridge, lane.parent, {**START, "cwd": str(lane)})
+    context = json.loads(served.stdout)["hookSpecificOutput"]
+    assert "Unconfirmed change" in context["additionalContext"]
+    assert len(recorded) == 1
+    assert unread(bridge, paired) == 0
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+def test_a_shell_client_past_its_timeout_leaves_the_mail_for_later(
+    bridge, repo, paired, service, monkeypatch, capsys
+):
+    lane = Path(paired["lanes"]["codex"])
+    mailed(bridge, lane, "Late change")
+    recorded = counted_deliveries(monkeypatch)
+    authorize = server.Handler._authorize
+
+    def slow(self):
+        time.sleep(hook.SHELL_TIMEOUT - server.DECISION_SECONDS + 0.3)
+        return authorize(self)
+
+    monkeypatch.setattr(server.Handler, "_authorize", slow)
+    stalling(monkeypatch, server.DECISION_SECONDS - 0.2)
+    payload = {**START, "cwd": str(lane), "session_id": "s1"}
+    late = run_shell(bridge, lane.parent, payload)
+    assert late.returncode == 0, late.stderr
+    printed = ""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not (
+        " undelivered " in printed or " expired " in printed
+    ):
+        time.sleep(0.05)
+        printed += capsys.readouterr().out
+    assert recorded == []
+    if "Late change" not in late.stdout:
+        assert unread(bridge, paired) == 1
+    monkeypatch.setattr(server.Handler, "_authorize", authorize)
+    monkeypatch.setattr(server.checkpoints, "serve", checkpoints.serve)
+    if "Late change" not in late.stdout:
+        served = run_shell(bridge, lane.parent, payload)
+        assert "Late change" in served.stdout
+    assert unread(bridge, paired) == 0
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="requires bash")
+@pytest.mark.parametrize("client", ["module", "shell"])
+def test_a_confirmed_reply_records_its_delivery_once(
+    bridge, repo, paired, service, monkeypatch, capsys, client
+):
+    lane = Path(paired["lanes"]["codex"])
+    mailed(bridge, lane, "Confirmed change")
+    recorded = counted_deliveries(monkeypatch)
+    payload = {**START, "cwd": str(lane), "session_id": "s1"}
+    run = run_shell if client == "shell" else run_hook
+    served = run(bridge, lane.parent, payload)
+    context = json.loads(served.stdout)["hookSpecificOutput"]
+    assert "Confirmed change" in context["additionalContext"]
+    assert len(recorded) == 1
+    assert unread(bridge, paired) == 0
+    assert "not confirmed" not in capsys.readouterr().out
+
+
 def test_a_delivery_for_an_ended_session_is_discarded(bridge, repo, paired):
     lane = Path(paired["lanes"]["codex"])
     write_json(
@@ -1378,6 +1564,7 @@ def test_a_lane_only_records_events_while_one_is_abandoned(
 ):
     deciding = checkpoints.serve
     asked = stalling(monkeypatch, server.DECISION_SECONDS * 2)
+    monkeypatch.setattr(hook, "REPLY_TIMEOUT", server.DECISION_SECONDS + 10)
     lane = Path(paired["lanes"]["codex"])
     identity = json.loads((lane.parent / "codex-identity.json").read_text())
     token = identity["registration_token"]
@@ -1673,6 +1860,49 @@ def test_an_oversize_payload_is_allowed_and_recorded(
     assert (
         f"PreToolUse payload of {len(json.dumps(payload))}" in (entry["cause"])
     )
+
+
+def test_an_oversize_write_into_a_peer_reservation_is_refused(
+    bridge, repo, paired, service
+):
+    lane = Path(paired["lanes"]["codex"])
+    identity = json.loads((lane.parent / "claude-identity.json").read_text())
+    actor = store.authenticate(bridge.home, identity["registration_token"])
+    store.call(
+        bridge.home,
+        actor,
+        "file_reservation_paths",
+        {"paths": ["big.json"], "ttl_seconds": 300, "exclusive": True},
+    )
+    answered = run_hook(bridge, lane.parent, written(lane, 2_000_000))
+    assert answered.returncode == 0, answered.stderr
+    details = json.loads(answered.stdout)["hookSpecificOutput"]
+    assert details["permissionDecision"] == "deny"
+    assert "big.json" in details["permissionDecisionReason"]
+    entry = events(lane.parent)[-1]
+    assert entry["reason_class"] == "oversize_payload"
+    assert entry["decision"] == "deny"
+
+
+@pytest.mark.parametrize("client", ["python", "shell"])
+def test_an_oversize_command_is_refused(bridge, repo, paired, service, client):
+    if client == "shell" and not shutil.which("bash"):
+        pytest.skip("requires bash")
+    lane = Path(paired["lanes"]["codex"])
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "s1",
+        "cwd": str(lane),
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo " + "x" * 2_000_000},
+    }
+    runner = run_shell if client == "shell" else run_hook
+    answered = runner(bridge, lane.parent, payload)
+    assert answered.returncode == 0, answered.stderr
+    details = json.loads(answered.stdout)["hookSpecificOutput"]
+    assert details["permissionDecision"] == "deny"
+    assert "script file" in details["permissionDecisionReason"]
+    assert events(lane.parent)[-1]["decision"] == "deny"
 
 
 def test_a_post_tool_use_carrying_a_large_write_exits_zero(
@@ -2019,3 +2249,99 @@ def test_a_foreign_process_editing_as_the_lane_is_denied(bridge, repo, paired):
     assert "session s1" in decision["permissionDecisionReason"]
     assert "session s2" in decision["permissionDecisionReason"]
     assert events(directory)[-1]["reason_class"] == "session_mismatch"
+
+
+def test_a_forked_session_is_bound_once_the_recorded_process_exits(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    old, recorded = held_process()
+    fork, forked = held_process()
+    try:
+        write_json(
+            directory / "codex-activity.json",
+            {
+                "session_id": "s1",
+                "session_pid": recorded.pid,
+                "session_ticks": recorded.ticks,
+                "activity": "idle",
+                "updated": time.time() - 60,
+            },
+        )
+        fork_event = {**ALLOW, "session_id": "s2", "cwd": str(lane)}
+        checkpoints.checkpoint(
+            bridge.home, directory, "codex", fork_event, forked
+        )
+        assert events(directory)[-1]["reason_class"] == "session_mismatch"
+        release(old)
+        assert supervision.presence(directory, "codex")["process_alive"] is (
+            False
+        )
+
+        assert supervision.rebind_sessions(bridge.home, directory, paired) == [
+            "codex"
+        ]
+
+        state = checkpoints.activity(directory, "codex")
+        assert state["session_id"] == "s2"
+        assert state["session_pid"] == fork.pid
+        assert state["rebound"]["pid"] == fork.pid
+        assert "foreign_session" not in state
+        assert supervision.presence(directory, "codex")["process_alive"]
+        checkpoints.checkpoint(
+            bridge.home,
+            directory,
+            "codex",
+            fork_event,
+            forked,
+            record_only=True,
+        )
+        assert events(directory)[-1]["reason_class"] == "observed"
+        state = checkpoints.activity(directory, "codex")
+        assert state["activity"] == "working"
+    finally:
+        if old.poll() is None:
+            release(old)
+        release(fork)
+
+
+def test_an_undelivered_wake_is_noted_in_the_next_hook_context(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["codex"])
+    directory = lane.parent
+    own = process.ServerProcess(os.getpid(), process.start_ticks(os.getpid()))
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "session_id": "s1",
+            "session_pid": own.pid,
+            "session_ticks": own.ticks,
+            "activity": "idle",
+            "updated": time.time() - 60,
+        },
+    )
+    supervision.store_wake(
+        bridge.home,
+        directory,
+        paired["root"],
+        "codex",
+        {
+            "at": time.time(),
+            "attempts": 1,
+            "backlog": ["1"],
+            "result": supervision.WAKE_UNAVAILABLE,
+        },
+    )
+    prompt = {**PROMPT, "session_id": "s1", "cwd": str(lane)}
+
+    output = checkpoints.checkpoint(
+        bridge.home, directory, "codex", prompt, own
+    )
+
+    context = output["hookSpecificOutput"]["additionalContext"]
+    assert "wake attempted at " in context
+    assert "not delivered: no launcher answered" in context
+    again = checkpoints.checkpoint(bridge.home, directory, "codex", prompt, own)
+    assert "not delivered" not in json.dumps(again)

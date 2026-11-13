@@ -2,10 +2,11 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, history, issues, store
+from agent_parley import cli, history, issues, lifecycle, store
 from agent_parley.state import BridgeError
 
 
@@ -53,7 +54,100 @@ def test_every_claim_generation_carries_its_own_identifier(
         "codex",
     ]
     assert held[0]["ended"] is not None and held[0]["seconds"] >= 0
+    accepted_at = issues.snapshot(directory)["issues"]["42"]["history"][-1]
+    assert accepted_at["action"] == "accept"
+    assert held[1]["ended"] == accepted_at["at"]
     assert held[-1]["ended"] is None
+
+
+def ledger(directory, record):
+    """Publishes one synthetic issue record as issue 42."""
+    (directory / "issues.json").write_text(
+        json.dumps({"revision": 1, "issues": {"42": record}})
+    )
+
+
+@pytest.mark.parametrize("action", ["complete", "resolve"])
+def test_a_finished_issue_leaves_no_generation_held(tmp_path, action):
+    record = {"owner": None, "claim_id": None}
+    lifecycle.append_history(
+        record,
+        {"action": "claim", "actor": "alpha", "at": 1000.0, "claim_id": "c1"},
+    )
+    lifecycle.append_history(
+        record,
+        {"action": action, "actor": "operator", "at": 2000.0, "owner": None},
+    )
+    ledger(tmp_path, record)
+    held = history.holdings(tmp_path, "42")
+    assert held == [
+        {
+            "participant": "alpha",
+            "claim_id": "c1",
+            "started": 1000.0,
+            "ended": 2000.0,
+            "seconds": 1000,
+        }
+    ]
+
+
+def test_a_capped_history_still_names_the_owner_an_accept_moved_to(
+    tmp_path,
+):
+    record = {"owner": "beta", "claim_id": "c2"}
+    lifecycle.append_history(
+        record,
+        {"action": "claim", "actor": "alpha", "at": 1000.0, "claim_id": "c1"},
+    )
+    lifecycle.append_history(
+        record, {"action": "offer", "actor": "alpha", "at": 2000.0}
+    )
+    lifecycle.append_history(
+        record,
+        {
+            "action": "accept",
+            "actor": "beta",
+            "at": 3000.0,
+            "owner": "beta",
+            "claim_id": "c2",
+        },
+    )
+    for step in range(60):
+        lifecycle.append_history(
+            record,
+            {"action": "block", "actor": "beta", "at": 4000.0 + step},
+        )
+    ledger(tmp_path, record)
+    held = history.holdings(tmp_path, "42")
+    assert [generation["participant"] for generation in held] == [
+        "alpha",
+        "beta",
+    ]
+    assert held[0]["ended"] == 3000.0
+    assert held[-1]["claim_id"] == "c2" and held[-1]["ended"] is None
+
+
+def test_an_owner_missing_from_history_is_reported_as_the_holder(tmp_path):
+    record = {
+        "owner": "beta",
+        "claim_id": "c2",
+        "history": [
+            {
+                "action": "claim",
+                "actor": "alpha",
+                "at": 1000.0,
+                "claim_id": "c1",
+            }
+        ],
+    }
+    ledger(tmp_path, record)
+    held = history.holdings(tmp_path, "42")
+    assert [generation["participant"] for generation in held] == [
+        "alpha",
+        "beta",
+    ]
+    assert held[0]["ended"] is not None
+    assert held[-1]["claim_id"] == "c2" and held[-1]["ended"] is None
 
 
 def test_history_of_an_issue_lists_its_transitions(bridge, repo, paired):
@@ -169,6 +263,60 @@ def test_records_without_a_recorded_claim_carry_no_claim_suffix(
     assert "; claim c-1" in history.describe([], held)
 
 
+def test_the_row_cap_applies_after_the_lane_filter_and_says_so(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    claude = registered(bridge, paired, "claude")
+    codex = registered(bridge, paired, "codex")
+    store.call(
+        bridge.home,
+        claude,
+        "send_message",
+        {
+            "to": ["codex"],
+            "subject": "Mine",
+            "body_md": "One.",
+            "idempotency_key": "mine",
+        },
+    )
+    for number in range(3):
+        store.call(
+            bridge.home,
+            codex,
+            "send_message",
+            {
+                "to": ["claude"],
+                "subject": f"Peer {number}",
+                "body_md": ".",
+                "idempotency_key": f"peer-{number}",
+            },
+        )
+    monkeypatch.setattr(history, "MAX_RECORDS", 2)
+    mine = bridge.history(repo, "participant", "claude", kinds=("message",))
+    assert [record["detail"] for record in mine["records"]] == ["Mine"]
+    assert mine["truncated"] is False
+    peer = bridge.history(repo, "participant", "codex", kinds=("message",))
+    assert len(peer["records"]) == 2
+    assert peer["truncated"] is True
+    arguments = ("--home", str(bridge.home), "history", "participant")
+    printed = run(monkeypatch, capsys, *arguments, "codex", "--repo", str(repo))
+    assert printed.splitlines()[-1] == (
+        "Older records omitted; narrow with --since."
+    )
+    document = json.loads(
+        run(
+            monkeypatch,
+            capsys,
+            *arguments,
+            "claude",
+            "--repo",
+            str(repo),
+            "--json",
+        )
+    )
+    assert document["truncated"] is False
+
+
 def test_filters_and_windows_narrow_the_listing(bridge, repo, paired):
     claude = paired["lanes"]["claude"]
     bridge.issue(claude, "claim", "42")
@@ -226,3 +374,72 @@ def test_history_reads_and_reports_as_json(
 def test_an_unknown_participant_is_refused(bridge, repo, paired):
     with pytest.raises(BridgeError, match="not a participant"):
         bridge.history(repo, "participant", "absent")
+
+
+def test_a_read_finds_no_store_and_creates_none(bridge):
+    database = bridge.home / store.DATABASE
+    database.unlink(missing_ok=True)
+    with pytest.raises(BridgeError, match="agent-parley up"):
+        with store.connect(bridge.home):
+            pass
+    assert not database.exists()
+
+
+def test_status_then_history_on_a_fresh_project_leaves_no_store(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    database = bridge.home / store.DATABASE
+    database.unlink(missing_ok=True)
+    monkeypatch.chdir(repo)
+    run(monkeypatch, capsys, "--home", str(bridge.home), "status")
+    printed = run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "history",
+        "issue",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    printed += run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "issue",
+        "show",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    assert "sqlite" not in printed.lower()
+    assert not database.exists()
+
+
+def test_history_reads_an_empty_store_file_as_absent(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    (bridge.home / store.DATABASE).write_bytes(b"")
+    printed = run(
+        monkeypatch,
+        capsys,
+        "--home",
+        str(bridge.home),
+        "issue",
+        "show",
+        "42",
+        "--repo",
+        str(repo),
+    )
+    assert "file_reservations" not in printed
+
+
+def test_no_query_needs_the_sqlite_3_38_unixepoch_function():
+    package = Path(history.__file__).parent
+    assert [
+        path.name
+        for path in sorted(package.glob("*.py"))
+        if "unixepoch(" in path.read_text()
+    ] == []

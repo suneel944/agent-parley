@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from agent_parley import attachments, roster, store
 from agent_parley.state import BridgeError, lock
@@ -141,8 +142,68 @@ def _project_locks(directories: list[Path]) -> Iterator[None]:
         yield
 
 
+def _exportable_tables(db: sqlite3.Connection) -> list[str]:
+    """Names every real table an export must scope to the kept projects.
+
+    The list is read from `sqlite_master` rather than a fixed tuple so a
+    table added later is scoped automatically instead of copied whole. A
+    virtual table and the shadow tables SQLite keeps for it are left out:
+    `_snapshot` drops them before scoping, since they carry no ownership
+    column of their own.
+
+    Args:
+        db: Open connection on the staged copy of the store.
+
+    Returns:
+        Real table names in the order SQLite created them.
+    """
+    rows = db.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY rowid"
+    ).fetchall()
+    virtual = {
+        name
+        for name, sql in rows
+        if sql and sql.upper().startswith("CREATE VIRTUAL TABLE")
+    }
+    return [
+        name
+        for name, _ in rows
+        if name not in virtual
+        and not name.startswith("sqlite_")
+        and not any(name.startswith(f"{owner}_") for owner in virtual)
+    ]
+
+
+def _drop_derived(db: sqlite3.Connection) -> None:
+    """Drops every trigger and virtual table from a staged store copy.
+
+    Args:
+        db: Open connection on the staged copy of the store.
+    """
+    rows = db.execute(
+        "SELECT type, name FROM sqlite_master WHERE type='trigger' "
+        "OR (type='table' AND upper(sql) LIKE 'CREATE VIRTUAL TABLE%')"
+    ).fetchall()
+    for kind, name in rows:
+        db.execute(f'DROP {kind.upper()} IF EXISTS "{name}"')
+
+
 def _snapshot(home: Path, destination: Path, roots: set[str]) -> None:
-    """Copies the store through the backup interface, scoped to roots."""
+    """Copies the store through the backup interface, scoped to roots.
+
+    Every trigger and virtual table is dropped from the copy before rows are
+    scoped. The full-text index holds the whole body of a message that
+    spilled to an attachment while its content row keeps only the opening
+    slice, so deleting another project's row cannot remove every word it
+    indexed. An import never reads the archived index: the target store's
+    own triggers index each row it inserts, and the merge rebuilds the
+    index afterwards.
+
+    Args:
+        home: Private bridge state root.
+        destination: Path the scoped copy of the store is written to.
+        roots: Canonical roots of the projects the copy keeps.
+    """
     with contextlib.closing(
         sqlite3.connect(home / store.DATABASE, timeout=store.BUSY_TIMEOUT)
     ) as source:
@@ -150,22 +211,33 @@ def _snapshot(home: Path, destination: Path, roots: set[str]) -> None:
             source.backup(copy)
     with contextlib.closing(sqlite3.connect(destination)) as copy:
         copy.execute("PRAGMA journal_mode=DELETE")
+        _drop_derived(copy)
         kept = [
             int(row[0])
             for row in copy.execute("SELECT id,human_key FROM projects")
             if row[1] in roots
         ]
         placeholders = ",".join("?" for _ in kept) or "-1"
+        root_marks = ",".join("?" for _ in roots) or "''"
         agents = f"SELECT id FROM agents WHERE project_id IN ({placeholders})"
-        for table in reversed(TABLES):
+        for table in reversed(_exportable_tables(copy)):
             columns = _columns(copy, table)
+            params: list[Any]
             if table == "projects":
-                condition = f"id NOT IN ({placeholders})"
+                condition, params = f"id NOT IN ({placeholders})", kept
             elif "project_id" in columns:
                 condition = f"project_id NOT IN ({placeholders})"
+                params = kept
+            elif "project" in columns:
+                condition = f"project NOT IN ({root_marks})"
+                params = list(roots)
+            elif "agent_id" in columns:
+                condition, params = f"agent_id NOT IN ({agents})", kept
             else:
-                condition = f"agent_id NOT IN ({agents})"
-            copy.execute(f"DELETE FROM {table} WHERE {condition}", kept)
+                raise BridgeError(
+                    f"No export rule scopes table {table!r} by project."
+                )
+            copy.execute(f"DELETE FROM {table} WHERE {condition}", params)
         copy.execute("UPDATE agents SET token_digest=NULL")
         copy.commit()
         copy.execute("VACUUM")
@@ -228,18 +300,18 @@ def export(home: Path, output: Path, project: Path | None = None) -> dict:
                 for path in _project_files(directory):
                     relative = path.relative_to(directory).as_posix()
                     member = f"{PROJECTS}/{directory.name}/{relative}"
+                    content = path.read_bytes()
                     if path.name.endswith("-identity.json"):
-                        copied = staged / directory.name / relative
-                        copied.parent.mkdir(parents=True, exist_ok=True)
-                        copied.write_bytes(
-                            _stripped_identity(path.read_bytes())
-                        )
-                        members.append((member, copied))
-                    else:
-                        members.append((member, path))
+                        content = _stripped_identity(content)
+                    copied = staged / directory.name / relative
+                    copied.parent.mkdir(parents=True, exist_ok=True)
+                    copied.write_bytes(content)
+                    members.append((member, copied))
             providers = home / roster.PROVIDERS
             if providers.is_file():
-                members.append((roster.PROVIDERS, providers))
+                copied = staged / roster.PROVIDERS
+                copied.write_bytes(providers.read_bytes())
+                members.append((roster.PROVIDERS, copied))
         manifest = {
             "format": FORMAT,
             "schema": schema,
@@ -297,6 +369,61 @@ def _safe_name(name: str) -> str:
     return name
 
 
+def _check_projects(projects: list) -> None:
+    """Refuses manifest project entries an import cannot place safely.
+
+    The manifest carries no digest of its own, so its project keys and roots
+    are as untrusted as the members. A key becomes a directory name below
+    ``projects/`` and must be the single path component `export` writes; a
+    root keys the store rows and must be an absolute path.
+
+    Args:
+        projects: The manifest's ``projects`` list.
+
+    Raises:
+        BridgeError: If an entry is not an object, its key is not one safe
+            path component, its root is not absolute, its participants are
+            not objects, or a key or root repeats.
+    """
+    keys: set[str] = set()
+    roots: set[str] = set()
+    for entry in projects:
+        if not isinstance(entry, dict):
+            raise BridgeError(
+                f"{MANIFEST} lists a project that is not an object."
+            )
+        key = entry.get("key")
+        if (
+            not isinstance(key, str)
+            or key in ("", ".", "..")
+            or "/" in key
+            or "\\" in key
+            or "\x00" in key
+            or key in keys
+        ):
+            raise BridgeError(f"Refusing archive project key {key!r}.")
+        root = entry.get("root")
+        if (
+            not isinstance(root, str)
+            or not PurePosixPath(root).is_absolute()
+            or "\x00" in root
+            or root in roots
+        ):
+            raise BridgeError(f"Refusing archive project root {root!r}.")
+        participants = entry.get("participants", [])
+        if not isinstance(participants, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("lane", ""), str)
+            for item in participants
+        ):
+            raise BridgeError(
+                f"{MANIFEST} lists malformed participants for {root}."
+            )
+        keys.add(key)
+        roots.add(root)
+
+
 def read_manifest(archive: Path) -> dict:
     """Reads and validates the manifest and member table of one archive.
 
@@ -341,6 +468,7 @@ def read_manifest(archive: Path) -> dict:
                 or not isinstance(manifest.get("projects"), list)
             ):
                 raise BridgeError(f"{MANIFEST} is not an export manifest.")
+            _check_projects(manifest["projects"])
             missing = sorted(set(files) - names)
             unlisted = sorted(names - set(files) - {MANIFEST})
             if missing or unlisted:
@@ -423,8 +551,9 @@ def import_archive(
         merge: Whether to add projects beside existing state.
 
     Returns:
-        The restored projects and every participant whose lane path does not
-        exist on this machine.
+        The restored projects, every participant whose lane path does not
+        exist on this machine, and the archived provider definitions that
+        were added, skipped because the name is taken, or refused.
 
     Raises:
         BridgeError: If the archive is unsafe, newer than this build, the
@@ -443,7 +572,6 @@ def import_archive(
             "projects beside it."
         )
     selected = _selected(manifest, project)
-    roots = {entry["root"] for entry in selected}
     (home / PROJECTS).mkdir(parents=True, exist_ok=True, mode=0o700)
     for entry in selected:
         if (home / PROJECTS / entry["key"]).exists():
@@ -455,6 +583,7 @@ def import_archive(
         staged = Path(scratch)
         _extract(archive, manifest, staged)
         _rebind(staged, selected)
+        offered = _archived_providers(staged)
         placed = []
         try:
             for entry in selected:
@@ -463,13 +592,30 @@ def import_archive(
                     raise BridgeError(
                         f"The archive lacks a manifest for {entry['root']}."
                     )
+                try:
+                    recorded = json.loads((source / "project.json").read_text())
+                except ValueError:
+                    recorded = None
+                if (
+                    not isinstance(recorded, dict)
+                    or recorded.get("root") != entry["root"]
+                ):
+                    raise BridgeError(
+                        f"The archived project {entry['key']} is not rooted "
+                        f"at {entry['root']} as the manifest claims."
+                    )
                 target = home / PROJECTS / entry["key"]
                 shutil.move(str(source), str(target))
                 placed.append(target)
-            _merge_store(home, staged, roots)
-            providers = staged / roster.PROVIDERS
-            if providers.exists() and not (home / roster.PROVIDERS).exists():
-                shutil.move(str(providers), str(home / roster.PROVIDERS))
+            _merge_store(
+                home,
+                staged,
+                {
+                    entry["root"]: home / PROJECTS / entry["key"]
+                    for entry in selected
+                },
+            )
+            providers = roster.adopt_providers(home, offered)
         except BaseException:
             for target in placed:
                 shutil.rmtree(target, ignore_errors=True)
@@ -480,7 +626,41 @@ def import_archive(
         for item in entry.get("participants", [])
         if not item.get("lane") or not Path(item["lane"]).is_dir()
     ]
-    return {"projects": selected, "missing_lanes": missing}
+    return {
+        "projects": selected,
+        "missing_lanes": missing,
+        "providers": providers,
+    }
+
+
+def _archived_providers(staged: Path) -> dict:
+    """Reads the provider entries an archive offers, without trusting them.
+
+    Args:
+        staged: Directory the archive was extracted into.
+
+    Returns:
+        Provider entries by name, for `roster.adopt_providers` to validate;
+        empty when the archive carries no registry.
+
+    Raises:
+        BridgeError: If the archived registry is not a provider registry.
+    """
+    path = staged / roster.PROVIDERS
+    if not path.exists():
+        return {}
+    try:
+        stored = json.loads(path.read_text())
+    except ValueError as exc:
+        raise BridgeError(
+            f"The archived {roster.PROVIDERS} is unreadable."
+        ) from exc
+    entries = stored.get("entries", {}) if isinstance(stored, dict) else None
+    if not isinstance(entries, dict):
+        raise BridgeError(
+            f"The archived {roster.PROVIDERS} is not a provider registry."
+        )
+    return entries
 
 
 def _extract(archive: Path, manifest: dict, staged: Path) -> None:
@@ -521,8 +701,20 @@ def _rebind(staged: Path, selected: list[dict]) -> None:
             db.commit()
 
 
-def _merge_store(home: Path, staged: Path, roots: set[str]) -> None:
-    """Copies the selected projects' store rows into the local store."""
+def _merge_store(home: Path, staged: Path, folders: dict[str, Path]) -> None:
+    """Copies the selected projects' store rows into the local store.
+
+    The search index is rebuilt once the rows are in: renumbering an
+    attachment rewrites its message body, and the index has no trigger for
+    an update, so it would otherwise keep the old marker.
+
+    Args:
+        home: Private bridge state root.
+        staged: Directory the archive was extracted into.
+        folders: State directory each imported project was placed in, keyed
+            by the project's canonical root.
+    """
+    roots = set(folders)
     database = staged / STORE_MEMBER
     if not database.exists():
         return
@@ -557,6 +749,45 @@ def _merge_store(home: Path, staged: Path, roots: set[str]) -> None:
                     )
                     if "id" in columns:
                         maps[table][row["id"]] = int(cursor.lastrowid or 0)
+            _rekey(source, target, maps["messages"], folders)
+            store.rebuild_search(target, home)
+
+
+def _rekey(
+    source: sqlite3.Connection,
+    target: sqlite3.Connection,
+    renumbered: dict[int, int],
+    folders: dict[str, Path],
+) -> None:
+    """Moves every imported message's attachment to its new identifier.
+
+    An attachment is keyed by the message identifier, which the target store
+    reassigns on import. The marker in the stored body and the attachment
+    files follow that map, so a later send that is given the old identifier
+    cannot overwrite the imported attachment.
+    """
+    owners = {
+        row["id"]: folders[row["human_key"]]
+        for row in source.execute("SELECT id, human_key FROM projects")
+        if row["human_key"] in folders
+    }
+    moves: dict[Path, list[tuple[str, str]]] = {}
+    for old, new in renumbered.items():
+        row = source.execute(
+            "SELECT project_id, body_md FROM messages WHERE id=?", (old,)
+        ).fetchone()
+        was = attachments.reference("message", old)
+        found = attachments.find(row["body_md"])
+        if old == new or not found or found[0] != was:
+            continue
+        now = attachments.reference("message", new)
+        target.execute(
+            "UPDATE messages SET body_md=? WHERE id=?",
+            (attachments.retarget(row["body_md"], now), new),
+        )
+        moves.setdefault(owners[row["project_id"]], []).append((was, now))
+    for directory, pairs in moves.items():
+        attachments.renumber(directory, pairs)
 
 
 def _remapped(

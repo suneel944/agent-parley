@@ -1,9 +1,12 @@
 """Checks that local server startup never depends on name resolution."""
 
 import contextlib
+import os
 import re
 import socket
+import sys
 import threading
+import time
 
 from agent_parley import server
 from agent_parley.server import Server
@@ -39,6 +42,76 @@ def test_a_start_and_a_stop_each_leave_one_timestamped_line(bridge):
     events = [line.split()[1] for line in stamped]
     assert events.index("signalled") < events.index("stopped")
     assert "SIGTERM" in stamped[events.index("signalled")]
+    assert "relaunching" not in events
+
+
+def test_an_idle_service_stops_when_its_sources_move(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(server, "REVISION_SECONDS", 0.0)
+    readings = ["start"]
+    monkeypatch.setattr(server.protocol, "revision", lambda: readings[-1])
+    with Server(tmp_path, {"port": 0, "token": "test"}) as instance:
+        readings.append("moved")
+        watchdog = threading.Timer(5.0, instance.shutdown)
+        watchdog.start()
+        instance.serve_forever(poll_interval=0.01)
+        watchdog.cancel()
+        assert instance.relaunching()
+    assert " drifted " in capsys.readouterr().out
+
+
+def test_a_signalled_stop_is_not_followed_by_a_relaunch(tmp_path):
+    with Server(tmp_path, {"port": 0, "token": "test"}) as instance:
+        instance.stopping.set()
+        assert instance.relaunching()
+        instance.signalled.set()
+        assert not instance.relaunching()
+
+
+def test_a_drain_waits_for_the_waits_and_workers_in_flight(tmp_path):
+    with Server(tmp_path, {"port": 0, "token": "test"}) as instance:
+        instance.slots.acquire()
+        assert not instance.drain(time.monotonic() + 0.05)
+        instance.slots.release()
+        instance.waiters.acquire()
+        assert not instance.drain(time.monotonic() + 0.05)
+        instance.waiters.release()
+        assert instance.drain(time.monotonic() + 0.05)
+
+
+def test_a_relaunch_re_executes_the_service_on_its_home(
+    tmp_path, monkeypatch, capsys
+):
+    executed = []
+    monkeypatch.setattr(
+        server.os, "execv", lambda path, argv: executed.append((path, argv))
+    )
+    server.replace(tmp_path, "0.1.0")
+    assert executed == [
+        (
+            sys.executable,
+            [
+                sys.executable,
+                "-m",
+                "agent_parley.server",
+                "--home",
+                str(tmp_path),
+            ],
+        )
+    ]
+    written = capsys.readouterr().out
+    assert " relaunching version 0.1.0 re-executes as version " in written
+    assert f"pid {os.getpid()}" in written
+
+
+def test_a_refused_relaunch_is_logged(tmp_path, monkeypatch, capsys):
+    def refused(path, argv):
+        raise OSError("text file busy")
+
+    monkeypatch.setattr(server.os, "execv", refused)
+    server.replace(tmp_path, "0.1.0")
+    assert " relaunch failed: text file busy" in capsys.readouterr().out
 
 
 def test_the_service_log_stays_under_its_rotation_bound(tmp_path):
@@ -79,6 +152,30 @@ def test_a_refusal_burst_writes_one_line_per_lane_per_window(
     assert lines[0].endswith("undecided claude-p2-4 held")
     assert lines[1].endswith("undecided other")
     assert lines[2].endswith("; 4999 more since the previous entry")
+
+
+def test_an_unrecovered_checkpoint_logs_its_cause(tmp_path, monkeypatch):
+    def full_disk(*args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(server.checkpoints, "recover", full_disk)
+    path = tmp_path / "server.log"
+    lane = ("/work/project", "claude-p2-4")
+    owed = {"directory": "/work/project", "participant": "x", "payload": {}}
+    with Server(tmp_path, {"port": 0, "token": "test"}) as instance:
+        with path.open("a", encoding="utf-8") as stream:
+            with contextlib.redirect_stdout(stream):
+                instance.recovering[lane] = None
+                instance._recovering(lane, owed)
+    lines = [
+        line
+        for line in path.read_text().splitlines()
+        if " unrecovered " in line
+    ]
+    assert len(lines) == 1
+    assert "OSError: [Errno 28] No space left on device" in lines[0]
+    assert re.search(r" at test_server_startup\.py:\d+$", lines[0])
+    assert lane not in instance.recovering
 
 
 def test_a_stopped_burst_still_writes_its_count(tmp_path, monkeypatch):

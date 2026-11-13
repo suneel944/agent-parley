@@ -1,0 +1,258 @@
+"""Declares which decision kinds wait for the operator, and for how long.
+
+`KINDS` is the one table of decision kinds. Each kind declares whether it is
+``reversible`` or ``irreversible`` and the option the service recommends.
+Every declared kind is irreversible and never times out: a merge to the
+default branch, a release or tag, discarding uncommitted work, deleting a
+branch, every native permission prompt and every tool call a native
+permission layer denied always wait for an answer. A kind this table does
+not know is treated as irreversible, so a misspelled or newer kind fails
+closed. Nothing in the service answers an open decision on the operator's
+behalf.
+
+An orphan decision is not a table kind: the service cannot carry out any of
+its options for the operator, so it waits until the operator answers or the
+dead lane's work is returned at the orphan ceiling, which retires it. A
+policy that still names its former ``orphan_claim`` kind is ignored.
+
+`TIMEOUT_SECONDS` is the decision deadline other modules measure against,
+such as the stop of a session parked on a prompt nobody can answer.
+
+A project can record, with `agent-parley timeout set`, that a kind is
+always asked or that its timeout is longer than the default. The policy is
+kept in the private manifest under ``timeouts``. It can only make a kind
+more cautious: a timeout shorter than the default is refused, and no policy
+gives an irreversible kind a timeout.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, NamedTuple
+
+from agent_parley import roster
+from agent_parley.state import BridgeError
+
+if TYPE_CHECKING:
+    from agent_parley.cli import Bridge
+
+REVERSIBLE = "reversible"
+IRREVERSIBLE = "irreversible"
+TIMEOUT_SECONDS = 30 * 60.0
+MAX_TIMEOUT_SECONDS = 7 * 24 * 3600.0
+POLICY = "timeouts"
+ASK = "ask"
+SECONDS = "seconds"
+WAIT = "wait for the operator"
+
+
+class Kind(NamedTuple):
+    """One decision kind's class and recommended option.
+
+    Attributes:
+        reversibility: `REVERSIBLE` or `IRREVERSIBLE`.
+        recommended: Option the service recommends for the decision.
+        summary: What the decision is about.
+    """
+
+    reversibility: str
+    recommended: str
+    summary: str
+
+
+KINDS: dict[str, Kind] = {
+    "merge_default": Kind(IRREVERSIBLE, WAIT, "merge to the default branch"),
+    "release_tag": Kind(IRREVERSIBLE, WAIT, "publish a release or tag"),
+    "discard_work": Kind(IRREVERSIBLE, WAIT, "discard uncommitted work"),
+    "delete_branch": Kind(IRREVERSIBLE, WAIT, "delete a branch"),
+    "native_permission": Kind(
+        IRREVERSIBLE, WAIT, "answer a native permission prompt"
+    ),
+}
+
+
+def kind_of(name: str) -> Kind:
+    """Looks a decision kind up, failing closed on an unknown name.
+
+    Args:
+        name: Decision kind name.
+
+    Returns:
+        The kind's table entry, or an irreversible entry that always waits
+        when the table does not know the name.
+    """
+    return KINDS.get(name) or Kind(IRREVERSIBLE, WAIT, name)
+
+
+def policy(manifest: dict) -> dict[str, dict]:
+    """Reads the project's decision timeout policy strictly.
+
+    Args:
+        manifest: Project manifest using the participant roster layout.
+
+    An entry for a kind `KINDS` no longer declares, such as one a project
+    stored before that kind was retired, is dropped rather than refused, so
+    an old manifest keeps polling; it never made any kind act sooner.
+
+    Returns:
+        Per-kind entries, each either ``{"ask": True}`` or ``{"seconds":
+        N}`` with N at least `TIMEOUT_SECONDS`.
+
+    Raises:
+        BridgeError: If the recorded policy gives an irreversible kind a
+            timeout or shortens a timeout. An invalid policy is refused,
+            never read as permission to act sooner.
+    """
+    recorded = manifest.get(POLICY) or {}
+    if not isinstance(recorded, dict):
+        raise BridgeError("The recorded decision timeout policy is invalid.")
+    known = {name: entry for name, entry in recorded.items() if name in KINDS}
+    for name, entry in known.items():
+        _valid(name, entry)
+    return known
+
+
+def _valid(name: str, entry: object) -> None:
+    """Refuses one policy entry that would make a kind less cautious."""
+    if name not in KINDS:
+        raise BridgeError(
+            f"{name} is not a decision kind; known kinds are "
+            + ", ".join(sorted(KINDS))
+            + "."
+        )
+    if entry == {ASK: True}:
+        return
+    seconds = entry.get(SECONDS) if isinstance(entry, dict) else None
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != {SECONDS}
+        or isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+    ):
+        raise BridgeError(f"The timeout policy for {name} is invalid.")
+    if KINDS[name].reversibility == IRREVERSIBLE:
+        raise BridgeError(
+            f"{name} is irreversible and always waits for an answer; no "
+            "policy can give it a timeout."
+        )
+    if not TIMEOUT_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
+        raise BridgeError(
+            f"A policy can only raise the timeout for {name}: give between "
+            f"{int(TIMEOUT_SECONDS)} and {int(MAX_TIMEOUT_SECONDS)} seconds."
+        )
+
+
+def timeout(manifest: dict, name: str) -> float | None:
+    """Returns how long a decision kind waits for an answer under a policy.
+
+    Args:
+        manifest: Project manifest using the participant roster layout.
+        name: Decision kind name.
+
+    Returns:
+        Seconds the decision waits for an answer, or None when it always
+        waits: the kind is irreversible or unknown, or the project policy
+        says to always ask.
+
+    Raises:
+        BridgeError: If the recorded policy is invalid.
+    """
+    if kind_of(name).reversibility != REVERSIBLE:
+        return None
+    entry = policy(manifest).get(name, {})
+    if entry.get(ASK):
+        return None
+    return float(entry.get(SECONDS, TIMEOUT_SECONDS))
+
+
+def describe(manifest: dict) -> str:
+    """Tabulates every decision kind under the project's policy.
+
+    Args:
+        manifest: Project manifest using the participant roster layout.
+
+    Returns:
+        One line per kind: its class, recommended option and timeout.
+
+    Raises:
+        BridgeError: If the recorded policy is invalid.
+    """
+    rows = []
+    for name, kind in KINDS.items():
+        waits = timeout(manifest, name)
+        after = "always asks" if waits is None else f"{int(waits)}s"
+        rows.append(
+            f"{name}: {kind.reversibility}, default {kind.recommended}, {after}"
+        )
+    return "\n".join(rows)
+
+
+def show(bridge: Bridge, repo: Path) -> str:
+    """Tabulates every decision kind under the recorded project policy.
+
+    Args:
+        bridge: Coordination runtime owning the project state.
+        repo: Any checkout of the target repository.
+
+    Returns:
+        The table `describe` renders.
+
+    Raises:
+        BridgeError: If the repository has no project or the recorded
+            policy is invalid.
+    """
+    _, directory = bridge.project(repo, create=False)
+    return describe(roster.read(directory))
+
+
+def configure(
+    bridge: Bridge,
+    repo: Path,
+    name: str,
+    ask: bool = False,
+    seconds: float | None = None,
+) -> str:
+    """Records how long one decision kind waits, or that it always asks.
+
+    Only an operator in the base checkout may run this. Without ``ask`` or
+    ``seconds`` the kind returns to its default.
+
+    Args:
+        bridge: Coordination runtime owning the project state.
+        repo: Any checkout of the target repository, outside every lane.
+        name: Decision kind name.
+        ask: Record that the kind always asks.
+        seconds: Longer timeout than `TIMEOUT_SECONDS`.
+
+    Returns:
+        The table under the recorded policy.
+
+    Raises:
+        BridgeError: If the command runs inside a lane, the repository has
+            no project, or the entry would make the kind less cautious.
+    """
+    from agent_parley.cli import lock, write_json
+    from agent_parley.unattended import operator_only
+
+    root, directory = bridge.project(repo, create=False)
+    operator_only(
+        repo, root, roster.read(directory), "A decision timeout is set"
+    )
+    entry: dict | None = None
+    if ask:
+        entry = {ASK: True}
+    elif seconds is not None:
+        entry = {SECONDS: seconds}
+    if entry is not None:
+        _valid(name, entry)
+    elif name not in KINDS:
+        _valid(name, {ASK: True})
+    with lock(directory / "setup.lock"):
+        data = roster.read(directory)
+        recorded = dict(policy(data))
+        recorded.pop(name, None)
+        if entry is not None:
+            recorded[name] = entry
+        data[POLICY] = recorded
+        write_json(directory / "project.json", data)
+    return describe(roster.read(directory))

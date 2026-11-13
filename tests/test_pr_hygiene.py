@@ -1,11 +1,15 @@
 """Exercises ownership and issue validation at the GitHub metadata boundary."""
 
+import subprocess
+
 import pytest
 
+from scripts import check_pr_hygiene
 from scripts.check_pr_hygiene import (
     issue_numbers,
     validate,
     validate_commit_references,
+    validate_release_shape,
 )
 
 
@@ -71,6 +75,20 @@ def test_bot_bodies_preserved_but_metadata_still_required():
     assert validate(pr, [{"number": 7}])
 
 
+def test_bot_pull_requests_need_owner_and_label_but_no_local_issue():
+    pr = metadata()
+    pr.update(user={"type": "Bot"}, body="Bumps setup-uv from 10.1 to 10.2.")
+    assert validate(pr, []) == []
+    pr["labels"] = []
+    assert validate(pr, []) == ["Add a change-type label."]
+    human = metadata()
+    human["body"] = "## Problem and result\n## Verification\n"
+    human["body"] += "## Compatibility and risks\n"
+    assert validate(human, []) == [
+        "Reference an existing local issue with Refs #N."
+    ]
+
+
 def test_human_pr_requires_template_sections():
     pr = metadata()
     pr["body"] = "Refs #7"
@@ -133,3 +151,129 @@ def test_nonreleasing_prs_do_not_require_commit_references(title):
     assert (
         validate_commit_references(pr, commit_messages("No references")) == []
     )
+
+
+SECTIONED = "## Problem and result\n\n### Lanes\n\n- Lanes recover.\n"
+
+
+def crossing(count, *, title="fix: deliver the milestone", body="", **extra):
+    refs = "\n".join(f"Closes #{number}" for number in range(1, count + 1))
+    return {
+        "title": title,
+        "base": {"ref": "main"},
+        "body": (body or "## Problem and result\n") + refs,
+        **extra,
+    }
+
+
+def test_crossing_merge_without_subsections_fails():
+    errors = validate_release_shape(crossing(3), "0.21.0", [], True)
+    assert errors == [
+        "Group the release notes under ### headings in "
+        "## Problem and result; a flat body publishes one-line notes."
+    ]
+
+
+@pytest.mark.parametrize(
+    ("count", "title", "expected", "kind"),
+    [
+        (18, "fix: deliver", "0.22.0", "minor"),
+        (3, "fix: deliver", "0.21.1", "patch"),
+        (2, "feat!: deliver", "1.0.0", "major"),
+    ],
+)
+def test_crossing_milestone_must_be_the_measured_version(
+    count, title, expected, kind
+):
+    pr = crossing(
+        count, title=title, body=SECTIONED, milestone={"title": expected}
+    )
+    assert validate_release_shape(pr, "0.21.0", [], True) == []
+    pr["milestone"] = {"title": "9.9.9"}
+    assert validate_release_shape(pr, "0.21.0", [], True) == [
+        f"Rename milestone 9.9.9 to {expected}: "
+        f"{count} issues measure a {kind} release."
+    ]
+
+
+def test_measured_version_skips_retired_numbers():
+    pr = crossing(2, body=SECTIONED, milestone={"title": "0.21.2"})
+    assert validate_release_shape(pr, "0.21.0", ["0.21.1"], True) == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"title": "docs: deliver"},
+        {"base": {"ref": "integration/0.21.1"}},
+        {"body": "## Problem and result\nCloses #1"},
+    ],
+)
+def test_non_crossing_prs_are_not_shaped(change):
+    pr = {**crossing(12, milestone={"title": "0.0.1"}), **change}
+    assert validate_release_shape(pr, "0.21.0", [], True) == []
+    assert validate_release_shape(crossing(12), "0.21.0", [], False) == []
+
+
+@pytest.mark.parametrize("paginate", [False, True])
+def test_api_reads_one_object_or_every_paginated_line(monkeypatch, paginate):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        out = '{"a": 1}\n{"a": 2}\n' if paginate else '{"a": 1}'
+        return subprocess.CompletedProcess(command, 0, stdout=out)
+
+    monkeypatch.setattr(check_pr_hygiene.subprocess, "run", run)
+    result = check_pr_hygiene.api("repos/o/r/x", paginate=paginate)
+    assert result == ([{"a": 1}, {"a": 2}] if paginate else {"a": 1})
+    assert ("--paginate" in calls[0]) is paginate
+
+
+CREDIT = "Co-Authored-By:" + " Codex <bot@example.com>"
+
+
+def serve(monkeypatch, pr, *, commit="ci: x\n\nRefs #7", comment="ok"):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("PR_NUMBER", "5")
+    replies = {
+        "repos/o/r/pulls/5": pr,
+        "repos/o/r/issues/7": {"number": 7, "milestone": {"number": 1}},
+        "repos/o/r/pulls/5/commits?per_page=100": commit_messages(commit),
+    }
+
+    def api(path, *, paginate=False):
+        return replies.get(path, [{"body": comment}])
+
+    monkeypatch.setattr(check_pr_hygiene, "api", api)
+
+
+def test_main_passes_clean_metadata(monkeypatch, capsys):
+    serve(monkeypatch, metadata())
+    check_pr_hygiene.main()
+    assert "PR #5" in capsys.readouterr().out
+
+
+def test_main_rejects_credits_in_commits_and_comments(monkeypatch):
+    pr = metadata()
+    pr["labels"] = []
+    serve(monkeypatch, pr, commit=f"ci: x\n\n{CREDIT}", comment=CREDIT)
+    with pytest.raises(SystemExit) as failure:
+        check_pr_hygiene.main()
+    message = str(failure.value)
+    assert "Add a change-type label." in message
+    assert "attribution from commit messages" in message
+    assert "attribution from PR comments" in message
+
+
+def test_main_rejects_credits_in_linked_issues(monkeypatch):
+    serve(monkeypatch, metadata())
+    issue = {"number": 7, "milestone": {"number": 1}, "body": CREDIT}
+    real = check_pr_hygiene.api
+    monkeypatch.setattr(
+        check_pr_hygiene,
+        "api",
+        lambda path, **kw: issue if path.endswith("/7") else real(path, **kw),
+    )
+    with pytest.raises(SystemExit, match="linked issues"):
+        check_pr_hygiene.main()

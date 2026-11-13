@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import forge, recommend, store
+from agent_parley import forge, issues, recommend, store
+from agent_parley.cli import git
 from agent_parley.state import BridgeError
 
 PLAN = """
@@ -91,6 +92,115 @@ def declared(monkeypatch, mapping):
     )
 
 
+def cochanged(repo, *names):
+    """Commits the named files together three times in the base checkout."""
+    for index in range(3):
+        for name in names:
+            path = repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as handle:
+                handle.write(f"{index}\n")
+        git(repo, "add", "--", *names)
+        git(
+            repo,
+            "-c",
+            "user.name=Bridge Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            f"together {index}",
+        )
+
+
+def order(ranked):
+    """Lists the candidate numbers of one reading."""
+    return [record["issue"] for record in ranked["candidates"]]
+
+
+def test_work_on_held_files_gathers_on_the_lane_that_holds_them(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    claude = prepared(bridge, paired, tmp_path, repo)
+    codex = Path(paired["lanes"]["codex"])
+    bridge.issue(codex, "claim", "48")
+    cochanged(repo, "docs/guide.md", "db/schema.sql")
+    paths(
+        monkeypatch,
+        {
+            "42": ["src/api.py"],
+            "44": ["docs/guide.md"],
+            "46": ["src/api.py"],
+            "48": ["db/schema.sql"],
+        },
+    )
+    declared(monkeypatch, {})
+    ranked = bridge.issue_next(claude)
+    assert order(ranked) == ["46", "43", "44"]
+    first, _, last = ranked["candidates"]
+    assert first["same_files"] == ["42"] and not first["held_back"]
+    assert first["reasons"][1] == "same files as #42 you hold"
+    assert last["held_back"] == [{"issue": "48", "owner": "codex"}]
+    assert last["reasons"][1] == "held back: same files as #48 codex holds"
+    peer = bridge.issue_next(codex)
+    assert order(peer) == ["44", "43", "46"]
+    assert "same files as #48 you hold" in peer["candidates"][0]["reasons"]
+    assert (
+        "held back: same files as #42 claude holds"
+        in peer["candidates"][-1]["reasons"]
+    )
+    bridge.issue(codex, "release", "48")
+    returned = bridge.issue_next(claude)
+    assert order(returned)[:3] == ["46", "43", "44"]
+    assert returned["candidates"][2]["held_back"] == []
+    assert not any(
+        reason.startswith("held back")
+        for record in returned["candidates"]
+        for reason in record["reasons"]
+    )
+    assert bridge.issue(repo, "list")["issues"]["44"]["owner"] is None
+
+
+def test_claim_paths_are_read_once_per_interval(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(forge, "_paths_read", {})
+    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    monkeypatch.setattr(
+        forge,
+        "_run",
+        lambda command, timeout: (
+            calls.append(command) or '[{"files": [{"path": "src/api.py"}]}]'
+        ),
+    )
+    assert forge.issue_pull_request_paths(tmp_path, "48") == ["src/api.py"]
+    assert forge.issue_pull_request_paths(tmp_path, "48") == ["src/api.py"]
+    assert len(calls) == 1
+    forge.issue_pull_request_paths(tmp_path, "49")
+    assert len(calls) == 2
+    monkeypatch.setattr(forge, "PATHS_TTL", 0.0)
+    forge.issue_pull_request_paths(tmp_path, "48")
+    assert len(calls) == 3
+
+
+def test_the_dispatch_order_holds_back_another_lanes_files():
+    shared = {
+        "44": [{"issue": "48", "owner": "codex"}],
+        "46": [{"issue": "42", "owner": "claude"}],
+    }
+    assert recommend.for_lane(["43", "44", "46"], shared, "claude") == [
+        "46",
+        "43",
+        "44",
+    ]
+    assert recommend.for_lane(["43", "44", "46"], shared, "codex") == [
+        "44",
+        "43",
+        "46",
+    ]
+    assert recommend.for_lane(["43", "44"], {}, "claude") == ["43", "44"]
+
+
 def test_the_shortlist_prefers_a_started_group_and_clear_paths(
     bridge, repo, paired, tmp_path, monkeypatch
 ):
@@ -170,6 +280,19 @@ def test_the_limit_bounds_the_shortlist(
     assert len(bridge.issue_next(claude, 0)["candidates"]) == 1
 
 
+def test_the_main_checkout_names_a_lane_worktree_to_run_it_in(
+    bridge, repo, paired, tmp_path, monkeypatch
+):
+    claude = prepared(bridge, paired, tmp_path, repo)
+    with pytest.raises(BridgeError) as raised:
+        bridge.issue_next(repo)
+    assert "assigned agent worktree" in str(raised.value)
+    assert raised.value.next_command.startswith(
+        "agent-parley issue next --repo "
+    )
+    assert str(claude) in raised.value.next_command
+
+
 def test_the_served_tool_recommends_without_writing_anything(
     bridge, repo, paired, tmp_path, monkeypatch
 ):
@@ -220,6 +343,65 @@ def test_a_forecast_collision_ranks_below_a_clean_path():
     ranked = recommend.rank(LEDGER, {}, risks, {}, "claude")
     assert [record["issue"] for record in ranked] == ["46", "44", "43"]
     assert "likely to collide with x on db/schema.sql" in ranked[-1]["reasons"]
+
+
+def test_a_released_claim_that_ended_on_the_forge_is_not_next_work():
+    ended = {
+        "revision": 10,
+        "issues": {
+            **LEDGER["issues"],
+            "46": {**LEDGER["issues"]["46"], "ended_on_forge": {"at": 1.0}},
+        },
+    }
+    ranked = recommend.rank(ended, {}, {}, {}, "claude")
+    assert [record["issue"] for record in ranked] == ["43", "44"]
+
+
+PLANNED = {
+    "revision": 1,
+    "issues": {
+        number: {
+            "owner": None,
+            "offer": None,
+            "blocked_by": blockers,
+            "execution": {"authorized": True},
+        }
+        for number, blockers in (
+            ("5", []),
+            ("10", []),
+            ("20", ["10"]),
+            ("30", ["10"]),
+            ("40", ["10"]),
+        )
+    },
+}
+
+
+def test_a_blocker_of_planned_work_ranks_above_an_isolated_issue():
+    assert issues.unclaimed(PLANNED) == ["10", "5"]
+    assert issues.waiters(PLANNED) == {}
+    ranked = recommend.rank(PLANNED, {}, {}, {}, "claude")
+    assert [record["issue"] for record in ranked] == ["10", "5"]
+    assert ranked[0]["planned"] == ["20", "30", "40"]
+    assert "unblocks #20, #30, #40 (planned)" in ranked[0]["reasons"]
+    assert ranked[1]["reasons"] == ["no recorded dependency blocks it"]
+
+
+def test_default_waiters_count_every_owned_waiter():
+    ledger = {
+        "issues": {
+            "10": {"owner": None, "blocked_by": []},
+            "20": {"owner": "codex", "blocked_by": ["10"]},
+            "30": {
+                "owner": "claude",
+                "blocked_by": ["10"],
+                "execution": {"authorized": True, "state": "complete"},
+            },
+            "40": {"owner": None, "blocked_by": ["10"]},
+        }
+    }
+    assert issues.waiters(ledger) == {"10": ["20", "30"]}
+    assert issues.waiters(ledger, owned_only=False) == {"10": ["20"]}
 
 
 def test_nothing_free_reads_as_nothing_free():

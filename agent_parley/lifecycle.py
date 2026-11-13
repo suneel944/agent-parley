@@ -12,6 +12,7 @@ import re
 import time
 from pathlib import Path
 
+from agent_parley import attachments
 from agent_parley.state import BridgeError, lock, write_json
 
 QUEUED = "queued"
@@ -24,6 +25,51 @@ RECOVERY = "recovery"
 ACTIVE = (QUEUED, RUNNING, RECOVERY)
 STATES = (*ACTIVE, BLOCKED, READY, COMPLETE)
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
+MAX_HISTORY = 50
+_MARKER_ACTIONS = ("claim", "accept", "take", "complete")
+
+
+def append_history(record: dict, entry: dict, cap: int = MAX_HISTORY) -> None:
+    """Appends one transition and bounds how much history an issue keeps.
+
+    A lane that claims and releases the same issue hundreds of times would
+    otherwise grow this list without limit, and every idempotent retry then
+    copies the whole growing list again. Retention keeps the most recent
+    `cap` entries, plus the latest claim, accept, take and complete marker
+    when an older one would otherwise fall outside that window, so a capped
+    history still answers when the current claim began, who it moved to and
+    when the issue last completed.
+
+    Args:
+        record: Issue record whose history is being extended.
+        entry: Transition entry to append.
+        cap: Number of most recent entries kept before markers are restored.
+    """
+    history = record.setdefault("history", [])
+    history.append(entry)
+    if len(history) <= cap:
+        return
+    recent = history[-cap:]
+    present = {item.get("action") for item in recent}
+    older = history[:-cap]
+    markers = [
+        marker
+        for action in _MARKER_ACTIONS
+        if action not in present
+        for marker in [
+            next(
+                (
+                    item
+                    for item in reversed(older)
+                    if item.get("action") == action
+                ),
+                None,
+            )
+        ]
+        if marker is not None
+    ]
+    markers.sort(key=lambda item: item.get("at", 0))
+    record["history"] = markers + recent
 
 
 def initial(*, authorized: bool = False) -> dict:
@@ -50,6 +96,25 @@ def initial(*, authorized: bool = False) -> dict:
         "progress": None,
         "backlog": None,
     }
+
+
+def drop_offer(directory: Path, record: dict) -> None:
+    """Removes the attachments of an offer that is leaving the record.
+
+    Every transition that clears a pending offer calls this first, so a
+    declined, cancelled, released, completed or resolved offer takes its
+    spilled summary and its attached diff with it. An offer that is only
+    dereferenced would leave its diff counted against the offering lane's
+    attachment allowance forever.
+
+    Args:
+        directory: Private state directory for the common repository.
+        record: Ledger record whose pending offer is being cleared.
+    """
+    offer = record.get("offer") or {}
+    for field in ("attachment", "diff"):
+        if offer.get(field):
+            attachments.remove(directory, str(offer[field]))
 
 
 def state(record: dict) -> dict:
@@ -121,12 +186,15 @@ def authorize(record: dict) -> dict:
     return execution
 
 
-def claimed(record: dict, claim_id: str) -> dict:
+def claimed(record: dict, claim_id: str, usage: dict | None = None) -> dict:
     """Starts a new authorized execution generation on a claim.
 
     Args:
         record: Mutable issue ledger record carrying earlier execution state.
         claim_id: Newly generated ownership identifier.
+        usage: The new owner's consumption reading at the claim, kept as
+            ``usage_start`` so resolution can report what the claim used.
+            None drops any reading an earlier generation left.
 
     Returns:
         The execution mapping stored on the record.
@@ -145,41 +213,112 @@ def claimed(record: dict, claim_id: str) -> dict:
         progress=previous.get("progress"),
     )
     record["execution"] = execution
+    if usage:
+        record["usage_start"] = dict(usage)
+    else:
+        record.pop("usage_start", None)
     return execution
 
 
-def released(record: dict, closed: bool = False) -> dict:
+def usage_between(start: dict | None, end: dict) -> dict:
+    """Reports what one claim consumed between two consumption readings.
+
+    Within one session the claim used the difference of each reading. When
+    the claim started before this ledger recorded readings, or the lane
+    rotated to a new session inside it, the token and hour figures are the
+    current session's own, and served calls, which are counted per lane
+    rather than per session, are unknown without a starting reading.
+
+    Args:
+        start: Reading taken at the claim, or None when none was recorded.
+        end: Reading taken at resolution.
+
+    Returns:
+        Tokens, calls and hours, each None when unknown and never negative,
+        and ``basis``: ``claim`` for a difference within one session,
+        ``session`` when the current session's own figures stand in.
+    """
+    begun = (
+        start
+        if start and start.get("participant") == end.get("participant")
+        else None
+    )
+    same = begun is not None and begun.get("session") == end.get("session")
+    base = begun if same and begun else {}
+    tokens = end.get("tokens")
+    calls = end.get("calls")
+    hours = float(end.get("hours") or 0.0)
+    return {
+        "tokens": (
+            None
+            if tokens is None
+            else max(0, int(tokens) - int(base.get("tokens") or 0))
+        ),
+        "calls": (
+            None
+            if begun is None or calls is None
+            else max(0, int(calls) - int(begun.get("calls") or 0))
+        ),
+        "hours": round(max(0.0, hours - float(base.get("hours") or 0.0)), 2),
+        "basis": "claim" if same else "session",
+    }
+
+
+def released(record: dict, closed: bool = False, issue: str | int = "") -> dict:
     """Returns unfinished work to its authorized queue after release.
 
     A claim whose issue closed on the forge inside its generation has no
     integration left to wait on, so even ready work may be released. It is
-    marked `ended_on_forge` rather than offered again as free work; the
-    next claim builds a fresh record without the mark, so a reopened issue
-    can still be taken.
+    marked through `end_on_forge` rather than offered again as free work;
+    the next claim builds a fresh record without the mark, so a reopened
+    issue can still be taken.
+
+    A claim blocked on a recorded external condition keeps that condition
+    when it is released. `operator_blocked` decides which claims qualify,
+    so an older record with a string condition or no condition counts as
+    external here too. The work stays ``blocked`` with no owner and no
+    claim generation, so neither a work offer nor `issue next` presents it
+    as unblocked to the next lane, which would only rediscover the same
+    unmet condition. A lane or operator that knows the condition is met
+    lifts it by claiming the issue, which starts a fresh generation.
 
     Args:
         record: Mutable issue ledger record.
         closed: Whether the claim's issue closed on the forge inside the
             current ownership generation.
+        issue: Issue number the record tracks, named in a refusal so it
+            points at the exact merge command; empty when unknown.
 
     Returns:
         The execution mapping stored on the record.
 
     Raises:
-        BridgeError: If ready work still awaits verified integration.
+        BridgeError: If ready work still awaits verified integration. The
+            refusal's next command merges the owning lane's work.
     """
     execution = state(record)
     if execution["state"] == READY and not closed:
         raise BridgeError(
             "Ready work must remain claimed until verified integration "
-            "completes."
+            "completes. Keep "
+            + (f"issue #{issue}" if issue else "the claim")
+            + " and merge it, or report it partial or blocked with "
+            "--remaining before releasing it.",
+            next_command=(
+                "agent-parley participant merge"
+                + (f" {record['owner']}" if record.get("owner") else "")
+                + (f" --issue {issue}" if issue else "")
+            ),
         )
-    if closed:
-        record["ended_on_forge"] = {
-            "at": time.time(),
-            "claim_id": record.get("claim_id"),
-        }
-    if execution["state"] != COMPLETE:
+    if not closed and operator_blocked(record):
+        execution.update(
+            claim_id=None,
+            next_action=_next_action(execution),
+            updated_at=time.time(),
+            commit="",
+            gate=None,
+        )
+    elif execution["state"] != COMPLETE:
         execution.update(
             state=QUEUED,
             claim_id=None,
@@ -191,22 +330,85 @@ def released(record: dict, closed: bool = False) -> dict:
             gate=None,
         )
     record["execution"] = execution
+    if closed:
+        end_on_forge(record)
+    return record["execution"]
+
+
+def end_on_forge(record: dict) -> dict:
+    """Marks an unowned issue as work that ended on the forge.
+
+    The mark keeps the issue out of free work and satisfies the issues that
+    wait on it. Its queued execution stops reading as claimable: it loses
+    the automatic-claim authorization and its next action becomes `none`,
+    so neither `issue next` nor a work offer, nor an operator reading the
+    record, is told to claim a closed issue. Verified complete work keeps
+    its execution unchanged. A later claim starts a fresh authorized
+    generation and drops the mark, so a reopened issue can still be taken.
+
+    Args:
+        record: Mutable issue ledger record without an owner.
+
+    Returns:
+        The execution mapping stored on the record.
+    """
+    execution = state(record)
+    record["ended_on_forge"] = {
+        "at": time.time(),
+        "claim_id": record.get("claim_id"),
+    }
+    if execution["state"] != COMPLETE:
+        execution.update(
+            authorized=False,
+            next_action="none",
+            updated_at=time.time(),
+        )
+    record["execution"] = execution
     return execution
 
 
+def satisfied(record: dict) -> bool:
+    """Reports whether a blocker no longer holds back the work waiting on it.
+
+    A blocker is satisfied by verified completion, or by release after its
+    issue or pull request ended on the forge, which marks the record
+    `ended_on_forge`. The operator merging or closing by hand ends the work
+    as surely as verified integration does, and nothing else would ever
+    clear the edge. A reclaim drops the mark, so a reopened blocker holds
+    its dependents again. A blocker whose issue the forge reports closed
+    while a lane still holds it is satisfied too: a dead holder never
+    releases it, so its dependents would otherwise wait for nothing.
+
+    Args:
+        record: Ledger record of the blocking issue, or an empty mapping.
+
+    Returns:
+        True when the blocker is complete, ended on the forge, or closed on
+        the forge.
+    """
+    from agent_parley import issues
+
+    return (
+        state(record)["state"] == COMPLETE
+        or bool(record.get("ended_on_forge"))
+        or bool(record and issues.closed(record))
+    )
+
+
 def dependencies_complete(ledger: dict, record: dict) -> bool:
-    """Reports whether every issue this record waits on is verified complete.
+    """Reports whether every issue this record waits on is satisfied.
 
     Args:
         ledger: Published issue ledger.
         record: Issue record whose dependencies are checked.
 
     Returns:
-        True when every dependency carries verified completion.
+        True when every dependency carries verified completion or ended on
+        the forge.
     """
     issues = ledger.get("issues", {})
     return all(
-        state(issues.get(number, {}))["state"] == COMPLETE
+        satisfied(issues.get(number, {}))
         for number in record.get("blocked_by", [])
     )
 
@@ -220,9 +422,13 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
 
     Returns:
         Issue numbers ordered numerically. Owner work is limited to its
-        current generation. Free work must be queued, unowned and not
-        released after its issue ended on the forge.
+        current generation and to issues that did not close on the forge
+        inside it, so a closed issue is never the lane's next action. Free
+        work must be queued, unowned and not released after its issue ended
+        on the forge.
     """
+    from agent_parley import issues
+
     found = []
     for number, record in ledger.get("issues", {}).items():
         execution = state(record)
@@ -242,10 +448,37 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
                 and not record.get("orphan")
                 and execution["claim_id"] == record.get("claim_id")
                 and execution["state"] in ACTIVE
+                and not issues.closed(record)
             )
         if eligible:
             found.append(number)
     return sorted(found, key=int)
+
+
+def operator_blocked(record: dict) -> bool:
+    """Reports whether a claim waits on a condition only an operator meets.
+
+    A blocked claim that names no resuming issue recorded an external
+    condition, which is an operator action in practice; an older record
+    with no condition at all is read the same way. Releasing it on
+    retirement would hand the next lane the same block with the context
+    stripped, so dispatch and retirement treat it like ready work: it stays
+    with the lane that recorded it until that lane resolves, hands on or
+    releases it on purpose. A claim waiting on another issue is not kept:
+    that issue's completion resumes it for whichever lane holds it then.
+
+    Args:
+        record: Published issue ledger record.
+
+    Returns:
+        Whether the claim is blocked on anything but another issue.
+    """
+    execution = state(record)
+    if execution["state"] != BLOCKED:
+        return False
+    condition = execution.get("resume_when") or {}
+    kind = condition.get("kind") if isinstance(condition, dict) else condition
+    return kind != "issue"
 
 
 def describe_action(record: dict) -> str:
@@ -497,6 +730,7 @@ def complete(
             blocker="",
             resume_when="",
         )
+        drop_offer(directory, record)
         record.update(
             owner=None,
             offer=None,
@@ -505,7 +739,8 @@ def complete(
             completed_by=owner,
             completed_at=now,
         )
-        record.setdefault("history", []).append(
+        append_history(
+            record,
             {
                 "action": "complete",
                 "actor": "operator",
@@ -516,7 +751,7 @@ def complete(
                 "offer_id": None,
                 "claim_id": claim_id,
                 "commit": commit,
-            }
+            },
         )
         _reconcile_dependents(ledger, issue, now)
         ledger["revision"] += 1
@@ -579,11 +814,13 @@ def integration_failed(
 
 
 def settle_dependencies(directory: Path) -> list[tuple[str, str]]:
-    """Drops dependency edges whose blocker is complete or no longer recorded.
+    """Drops dependency edges whose blocker is satisfied or no longer recorded.
 
     Completion frees its dependents at the instant it is recorded, which
     misses an edge added afterwards and an edge to an issue the ledger does
-    not hold. Such an edge can never clear on its own, and while it stands
+    not hold. A blocker released after it ended on the forge is satisfied
+    too, yet no completion is ever recorded for it. Such an edge can never
+    clear on its own, and while it stands
     the waiting issue can neither report ready nor be listed as unclaimed,
     whether or not anybody still owns it. The supervisor calls this on every
     poll, so the edge is reconciled whoever holds the issue.
@@ -605,8 +842,7 @@ def settle_dependencies(directory: Path) -> list[tuple[str, str]]:
                 blocker
                 for record in records.values()
                 for blocker in record.get("blocked_by", [])
-                if blocker not in records
-                or state(records[blocker])["state"] == COMPLETE
+                if blocker not in records or satisfied(records[blocker])
             },
             key=int,
         )
@@ -652,7 +888,7 @@ def _reconcile_dependents(ledger: dict, issue: str, now: float) -> None:
             not waiting["blocked_by"]
             and waiting_execution["state"] == BLOCKED
             and dependency
-            and state(dependency)["state"] == COMPLETE
+            and satisfied(dependency)
         ):
             waiting_execution.update(
                 state=RUNNING if waiting.get("owner") else QUEUED,
@@ -672,19 +908,28 @@ def resolve(
     outcome: str,
     actor: str,
     reason: str = "",
+    claim_id: str | None = None,
+    usage: dict | None = None,
 ) -> dict:
     """Ends a claim whose holder never answered its completion reminder.
 
-    This is the operator's transition, not the holder's, and it is recorded as
-    its own action so history never reads as though the lane filed the work
-    itself. It is reachable only for a claim the supervisor has escalated as
-    an unresolved completion, so a holder that answers is never resolved out
-    from under it, and only for evidence the caller has already correlated
-    with the current ownership generation.
+    This is the operator's or the service's transition, not the holder's,
+    and it is recorded as its own action so history never reads as though
+    the lane filed the work itself. The operator reaches it only for a claim
+    the supervisor has escalated as an unresolved completion, so a holder
+    that answers is never resolved out from under it. The supervisor reaches
+    it without an escalation by naming the claim its forge reading observed,
+    once a merged pull request closed the issue inside that generation, so a
+    claim taken again since that reading is never ended by it. Either way
+    the caller has already correlated the evidence with the current
+    ownership generation.
 
     A merged pull request names the commit that carries the work, so the
     ``complete`` outcome records that commit and frees the issues waiting on
-    it. A closed pull request integrated nothing, so the ``release`` outcome
+    it. The supervisor may also complete a claim whose holder reported ready
+    once the forge reports its issue closed without such a pull request,
+    and then records the commit the ready report named. A closed pull
+    request integrated nothing, so the ``release`` outcome
     returns the work to the queue instead; it supersedes a stale ready state,
     because the generation that reported ready has ended on the forge.
 
@@ -697,31 +942,44 @@ def resolve(
         outcome: ``complete`` for merged work, ``release`` to requeue it.
         actor: Operator identity recording the transition.
         reason: Operator rationale kept beside the evidence.
+        claim_id: Claim the supervisor observed ending on the forge, which
+            stands in for the escalation and must still be current.
+        usage: The holder's consumption reading taken just before this
+            call. Its difference from the reading taken at the claim is
+            kept as ``usage`` on the resolution and its history entry. A
+            reading of another participant, or none, records no usage.
 
     Returns:
         The resolved issue record.
 
     Raises:
         BridgeError: If the issue is unheld, carries no escalation for its
-            current generation, or the evidence does not support the outcome.
+            current generation, holds a claim other than `claim_id`, or the
+            evidence does not support the outcome.
     """
     if outcome not in ("complete", "release"):
         raise BridgeError("Resolution outcome must be complete or release.")
     commit = str(evidence.get("commit") or "")
-    if outcome == "complete" and (
-        evidence.get("state") != "MERGED" or not COMMIT.fullmatch(commit)
-    ):
-        raise BridgeError(
-            "Completion needs a merged pull request naming its merge commit; "
-            "release the claim instead."
-        )
+    merged = evidence.get("state") == "MERGED" and COMMIT.fullmatch(commit)
+    refusal = (
+        "Completion needs a merged pull request naming its merge commit; "
+        "release the claim instead."
+    )
+    if outcome == "complete" and not merged and claim_id is None:
+        raise BridgeError(refusal)
     with lock(directory / "issues.lock", timeout=1):
         ledger = _snapshot(directory)
         record = ledger["issues"].get(issue)
         if not record or not record.get("owner"):
             raise BridgeError(f"Issue #{issue} has no owner.")
         escalation = record.get("unresolved_completion") or {}
-        if escalation.get("claim_id") != record.get("claim_id"):
+        if claim_id is not None:
+            if claim_id != record.get("claim_id"):
+                raise BridgeError(
+                    f"Issue #{issue} was claimed again after the forge "
+                    "reading that ended it."
+                )
+        elif escalation.get("claim_id") != record.get("claim_id"):
             raise BridgeError(
                 f"Issue #{issue} has no unresolved completion; the supervisor "
                 "escalates only after the holder leaves its completion "
@@ -730,6 +988,15 @@ def resolve(
         holder = record["owner"]
         now = time.time()
         execution = state(record)
+        if outcome == "complete" and not merged:
+            commit = str(execution.get("commit") or "")
+            if (
+                evidence.get("state") not in ("MERGED", "CLOSED")
+                or execution["state"] != READY
+                or execution["claim_id"] != record.get("claim_id")
+                or not COMMIT.fullmatch(commit)
+            ):
+                raise BridgeError(refusal)
         if outcome == "complete":
             execution.update(
                 state=COMPLETE,
@@ -758,6 +1025,13 @@ def resolve(
                 commit="",
                 gate=None,
             )
+        drop_offer(directory, record)
+        started = record.pop("usage_start", None)
+        used = (
+            {"usage": usage_between(started, usage)}
+            if usage and usage.get("participant") == holder
+            else {}
+        )
         record.update(
             owner=None,
             offer=None,
@@ -772,10 +1046,12 @@ def resolve(
                 "at": now,
                 "claim_id": record.get("claim_id"),
                 "evidence": dict(evidence),
+                **used,
             },
         )
         record.pop("unresolved_completion", None)
-        record.setdefault("history", []).append(
+        append_history(
+            record,
             {
                 "action": "resolve",
                 "actor": actor,
@@ -788,7 +1064,8 @@ def resolve(
                 "outcome": outcome,
                 "holder": holder,
                 "evidence": dict(evidence),
-            }
+                **used,
+            },
         )
         if outcome == "complete":
             _reconcile_dependents(ledger, issue, now)

@@ -2,11 +2,22 @@
 
 import json
 import re
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
-from agent_parley.state import BridgeError, write_json, write_text
+from agent_parley.state import (
+    BridgeError,
+    LockBusy,
+    lock,
+    write_json,
+    write_text,
+)
 
 FOLDER = "attachments"
+INDEX = "held.json"
+STALE = "held.stale"
+INDEX_LOCK = "attachments.lock"
+INDEX_TIMEOUT = 5.0
 MAX_ATTACHMENT_BYTES = 65536
 MAX_LANE_BYTES = 1048576
 PAGE_CHARACTERS = 2048
@@ -117,6 +128,125 @@ def bounded(kind: str, identifier: object, text: str, cap: int) -> str:
     return text.encode()[:budget].decode(errors="ignore").rstrip() + tail
 
 
+def _scan(home: Path) -> dict[str, dict[str, int]]:
+    """Reads every metadata file to find the attachments still held.
+
+    Args:
+        home: Attachment folder.
+
+    Returns:
+        Size in bytes of every unreleased attachment, keyed by writer and
+        then by reference.
+    """
+    found: dict[str, dict[str, int]] = {}
+    for path in home.glob("*.json"):
+        if not REFERENCE.match(path.stem):
+            continue
+        try:
+            meta = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict) or meta.get("released"):
+            continue
+        writer = meta.get("writer")
+        if isinstance(writer, str):
+            mine = found.setdefault(writer, {})
+            mine[path.stem] = int(meta.get("bytes", 0))
+    return found
+
+
+def _load(home: Path) -> dict[str, dict[str, int]] | None:
+    """Reads the allowance index, or None when it is missing or damaged.
+
+    An index is also untrusted while the stale marker `held.stale` exists,
+    because a change that found the lock busy may be missing from it.
+
+    Args:
+        home: Attachment folder.
+
+    Returns:
+        The index, keyed by writer and then by reference.
+    """
+    if (home / STALE).exists():
+        return None
+    try:
+        index = json.loads((home / INDEX).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict) or not all(
+        isinstance(refs, dict)
+        and all(isinstance(size, int) for size in refs.values())
+        for refs in index.values()
+    ):
+        return None
+    return index
+
+
+def _change(
+    directory: Path, change: Callable[[dict[str, dict[str, int]]], object]
+) -> None:
+    """Applies one change to the allowance index under its lock.
+
+    A missing or damaged index, such as in a state directory written before
+    the index existed, is rebuilt from the metadata files first. Callers
+    write or mark their metadata before they call, so a rebuild already
+    reflects the change and applying it again is harmless. When the lock
+    stays busy the stale marker is written instead, without touching the
+    index the holder may be rewriting, so the next reader rebuilds it rather
+    than trusting a count the change never reached; a removal that runs
+    while a transaction rolls back therefore never raises. The lock holder
+    removes the marker before it rebuilds, so a marker written during the
+    rebuild survives for the next reader.
+
+    Args:
+        directory: Private state directory for the common repository.
+        change: Edits the index in place.
+    """
+    home = folder(directory)
+    if not home.is_dir():
+        return
+    try:
+        with lock(directory / INDEX_LOCK, timeout=INDEX_TIMEOUT):
+            try:
+                (home / STALE).unlink()
+            except FileNotFoundError:
+                index = _load(home)
+            else:
+                index = None
+            if index is None:
+                index = _scan(home)
+            change(index)
+            write_json(home / INDEX, {k: v for k, v in index.items() if v})
+    except LockBusy:
+        (home / STALE).touch()
+
+
+def held(directory: Path, writer: str) -> dict[str, int]:
+    """Lists the attachments one lane currently holds.
+
+    The answer comes from the allowance index `held.json`, so its cost
+    depends on the attachments still held, not on how many were ever
+    written. A missing or damaged index is rebuilt once from the metadata
+    files.
+
+    Args:
+        directory: Private state directory for the common repository.
+        writer: Participant whose attachments are listed.
+
+    Returns:
+        Size in bytes of each unreleased attachment of that lane, keyed by
+        reference.
+    """
+    home = folder(directory)
+    index = _load(home)
+    if index is None:
+        _change(directory, lambda index: None)
+        index = _load(home)
+    if index is None:
+        index = _scan(home) if home.is_dir() else {}
+    return dict(index.get(writer, {}))
+
+
 def used(directory: Path, writer: str) -> int:
     """Sums the attachment bytes one lane currently holds.
 
@@ -125,17 +255,53 @@ def used(directory: Path, writer: str) -> int:
         writer: Participant whose attachments are counted.
 
     Returns:
-        Total recorded size of that lane's attachments in bytes.
+        Total recorded size of that lane's attachments in bytes; a released
+        attachment holds none.
     """
-    total = 0
-    for path in folder(directory).glob("*.json"):
-        try:
-            meta = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if meta.get("writer") == writer:
-            total += int(meta.get("bytes", 0))
-    return total
+    return sum(held(directory, writer).values())
+
+
+def release(directory: Path, reference: str, writer: str) -> int:
+    """Frees one settled attachment of a writer from its allowance.
+
+    The body is deleted and the metadata stays marked released, so a later
+    read names why the body is gone instead of reporting it unknown. The
+    record keeps its bounded first slice.
+
+    Args:
+        directory: Private state directory for the common repository.
+        reference: Attachment reference to release.
+        writer: Participant that must have written it.
+
+    Returns:
+        Bytes freed; zero when the attachment is absent, already released
+        or written by someone else.
+    """
+    if not isinstance(reference, str) or not REFERENCE.match(reference):
+        return 0
+    home = folder(directory)
+    meta_path = _path(home, reference, "json")
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        return 0
+    if meta.get("writer") != writer or meta.get("released"):
+        return 0
+    _path(home, reference, "md").unlink(missing_ok=True)
+    write_json(meta_path, {**meta, "released": True})
+    _change(directory, lambda index: _drop(index, reference))
+    return int(meta.get("bytes", 0))
+
+
+def _drop(index: dict[str, dict[str, int]], reference: str) -> None:
+    """Removes one reference from every writer in the allowance index.
+
+    Args:
+        index: Allowance index, edited in place.
+        reference: Attachment that no longer holds any allowance.
+    """
+    for refs in index.values():
+        refs.pop(reference, None)
 
 
 def keep(
@@ -145,13 +311,17 @@ def keep(
     text: str,
     writer: str,
     readers: list[str],
+    settled: Iterable[str] = (),
 ) -> str:
     """Stores one body whole beside the record that refers to it.
 
     A handoff payload such as a diff is kept in full rather than clipped,
     because the record refers to it instead of carrying it. The caller decides
     whether a body is worth keeping; this function only bounds it against the
-    attachment cap and the writer's allowance.
+    attachment cap and the writer's allowance. A full allowance is freed by
+    releasing the writer's settled attachments, oldest first, only as far
+    as the new body needs. Only references the allowance index still holds
+    are released, so an attachment released earlier is never read again.
 
     Args:
         directory: Private state directory for the common repository.
@@ -160,13 +330,15 @@ def keep(
         text: Full body to retain.
         writer: Participant that wrote the body.
         readers: Participants allowed to read it.
+        settled: References of the writer's attachments every reader has
+            finished with, oldest first; they may be released to make room.
 
     Returns:
         The reference the record refers to the stored body by.
 
     Raises:
         BridgeError: If the body exceeds the attachment cap or the writer's
-            total attachment allowance.
+            total attachment allowance after releasing settled attachments.
     """
     size = len(text.encode())
     if size > MAX_ATTACHMENT_BYTES:
@@ -174,10 +346,19 @@ def keep(
             f"{kind} body is {size} bytes; an attachment is capped at "
             f"{MAX_ATTACHMENT_BYTES} bytes."
         )
-    if used(directory, writer) + size > MAX_LANE_BYTES:
+    mine = held(directory, writer)
+    total = sum(mine.values())
+    for ref in settled:
+        if total + size <= MAX_LANE_BYTES:
+            break
+        if ref in mine:
+            total -= release(directory, ref, writer)
+    if total + size > MAX_LANE_BYTES:
         raise BridgeError(
             f"{writer} holds its {MAX_LANE_BYTES}-byte attachment "
-            "allowance; wait for older records to be pruned."
+            "allowance in bodies its readers have not finished with; "
+            "send a shorter body, or wait until its older long messages "
+            "are read and its older reports are pruned."
         )
     ref = reference(kind, identifier)
     home = folder(directory)
@@ -193,7 +374,23 @@ def keep(
             "readers": sorted(set(readers)),
         },
     )
+    _change(directory, lambda index: _hold(index, writer, ref, size))
     return ref
+
+
+def _hold(
+    index: dict[str, dict[str, int]], writer: str, reference: str, size: int
+) -> None:
+    """Records one attachment against its writer in the allowance index.
+
+    Args:
+        index: Allowance index, edited in place.
+        writer: Participant the attachment counts against.
+        reference: Attachment now held.
+        size: Its size in bytes.
+    """
+    _drop(index, reference)
+    index.setdefault(writer, {})[reference] = size
 
 
 def spill(
@@ -204,6 +401,7 @@ def spill(
     cap: int,
     writer: str,
     readers: list[str],
+    settled: Iterable[str] = (),
 ) -> tuple[str, str]:
     """Stores a body above its cap as an attachment and bounds the record.
 
@@ -220,6 +418,8 @@ def spill(
         cap: Record cap in UTF-8 bytes.
         writer: Participant that wrote the body.
         readers: Participants the record is addressed to.
+        settled: The writer's releasable attachments, oldest first; see
+            `keep`.
 
     Returns:
         The body the record stores and the reference, which is empty when
@@ -231,7 +431,7 @@ def spill(
     """
     if len(text.encode()) <= cap:
         return text, ""
-    ref = keep(directory, kind, identifier, text, writer, readers)
+    ref = keep(directory, kind, identifier, text, writer, readers, settled)
     return bounded(kind, identifier, text, cap), ref
 
 
@@ -255,14 +455,24 @@ def body(directory: Path, reference: str, name: str) -> str:
     home = folder(directory)
     try:
         meta = json.loads(_path(home, ref, "json").read_text())
-        text = _path(home, ref, "md").read_text()
     except (OSError, ValueError):
         raise BridgeError(
             f"No attachment {ref} is readable by {name}."
         ) from None
     if name != meta.get("writer") and name not in meta.get("readers", []):
         raise BridgeError(f"No attachment {ref} is readable by {name}.")
-    return text
+    if meta.get("released"):
+        raise BridgeError(
+            f"Attachment {ref} was released after every recipient read it "
+            "to free its writer's allowance; the record keeps its first "
+            "slice."
+        )
+    try:
+        return _path(home, ref, "md").read_text()
+    except OSError:
+        raise BridgeError(
+            f"No attachment {ref} is readable by {name}."
+        ) from None
 
 
 def page(directory: Path, reference: str, name: str, offset: int = 0) -> dict:
@@ -306,6 +516,67 @@ def remove(directory: Path, reference: str) -> None:
     home = folder(directory)
     for suffix in ("md", "json"):
         _path(home, reference, suffix).unlink(missing_ok=True)
+    _change(directory, lambda index: _drop(index, reference))
+
+
+def retarget(text: str, reference: str) -> str:
+    """Points the marker a bounded record ends with at another reference.
+
+    Args:
+        text: Stored body of a record.
+        reference: Reference the marker names from now on.
+
+    Returns:
+        The body with its marker renamed, or the body unchanged when it
+        carries no marker.
+    """
+    stripped = text.rstrip()
+    found = MARKER.search(stripped)
+    if not found:
+        return text
+    size = int(found.group(2))
+    return stripped[: found.start()] + marker(validate(reference), size)
+
+
+def renumber(directory: Path, moves: list[tuple[str, str]]) -> None:
+    """Re-keys attachments whose records were given new identifiers.
+
+    Every moved file is first parked under a hidden name, so one move never
+    lands on a file another move is about to vacate. A destination that is
+    still occupied afterwards belongs to a record outside the moves and is
+    refused rather than overwritten. The allowance index is deleted
+    afterwards, so the next reader rebuilds it under the new references.
+
+    Args:
+        directory: Private state directory for the common repository.
+        moves: Pairs of the reference a record had and the one it now has.
+
+    Raises:
+        BridgeError: If a destination already holds an attachment.
+    """
+    home = folder(directory)
+    parked = []
+    for old, new in moves:
+        for suffix in ("md", "json"):
+            source = _path(home, validate(old), suffix)
+            if source.exists():
+                hidden = home / f".renumber-{old}.{suffix}"
+                source.rename(hidden)
+                parked.append((hidden, _path(home, validate(new), suffix)))
+    for hidden, target in parked:
+        if target.exists():
+            raise BridgeError(
+                f"Attachment {target.stem} already exists; the import would "
+                "overwrite it."
+            )
+        if target.suffix == ".json":
+            meta = json.loads(hidden.read_text())
+            meta["reference"] = target.stem
+            write_json(target, meta)
+            hidden.unlink()
+        else:
+            hidden.rename(target)
+    (home / INDEX).unlink(missing_ok=True)
 
 
 def _path(home: Path, reference: str, suffix: str) -> Path:

@@ -10,8 +10,13 @@ Neither platform reports mere existence as identity. A recorded process
 is recognized only when its creation time still matches the one stored
 beside its process ID, so a reused process ID never passes for the
 session that first claimed it.
+
+The module also takes the one host load and memory reading a launch is
+gated on, through `host_load`.
 """
 
+import calendar
+import contextlib
 import ctypes
 import functools
 import os
@@ -34,33 +39,141 @@ ANCESTRY_LIMIT = 8
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 
 PsReader = Callable[[str, int], str]
+CwdLister = Callable[[], str]
 
 
-def read_ps_field(field: str, pid: int) -> str:
+class IdentityUnknown(OSError):
+    """Signals that a running process's identity could not be read.
+
+    A ``ps`` or ``lsof`` call that times out, cannot start or fails says
+    nothing about whether the process it asked about has exited. The
+    error derives from ``OSError`` so a caller that treats any failure
+    as "not that process" stays safe, while a caller that must not act
+    on a live process can tell "unknown" from "gone".
+    """
+
+
+def read_ps_field(
+    field: str, pid: int, overrides: dict[str, str] | None = None
+) -> str:
     """Reads one ``ps`` output field for a process.
+
+    ``ps`` runs under the C locale and UTC so a time field such as
+    ``lstart`` prints the same text for the same process whatever the
+    caller's ``TZ`` or locale; process identity built from it must
+    compare equal across the service, hooks and every operator shell.
 
     Args:
         field: A ``ps`` field specifier ending in ``=`` so no header is
             printed, such as ``lstart=`` or ``args=``.
         pid: Process ID to inspect.
+        overrides: Environment values set for ``ps`` over the caller's
+            own; None selects the C locale and UTC.
 
     Returns:
         The field value without surrounding whitespace, or an empty
-        string when ``ps`` reports no such process or cannot be run.
+        string when ``ps`` succeeds with no output or the process no
+        longer exists.
+
+    Raises:
+        IdentityUnknown: If ``ps`` times out, cannot start or fails
+            while the process still answers the signal-zero check.
     """
+    if overrides is None:
+        overrides = {"LC_ALL": "C", "TZ": "UTC"}
     try:
         result = subprocess.run(
             ["ps", "-ww", "-o", field, "-p", str(pid)],
+            env={**os.environ, **overrides},
             capture_output=True,
             text=True,
             check=False,
             timeout=PS_TIMEOUT,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        if darwin_running(pid):
+            raise IdentityUnknown(
+                f"ps could not read {field} for process {pid}."
+            ) from error
         return ""
     if result.returncode != 0:
+        if darwin_running(pid):
+            raise IdentityUnknown(
+                f"ps failed reading {field} for process {pid}."
+            )
         return ""
     return result.stdout.strip()
+
+
+def read_local_ps_field(field: str, pid: int) -> str:
+    """Reads one ``ps`` output field in the caller's own TZ and locale.
+
+    Earlier releases recorded ``lstart`` this way, so a process that
+    one of them recorded is recognized again only in this form.
+
+    Args:
+        field: A ``ps`` field specifier ending in ``=``.
+        pid: Process ID to inspect.
+
+    Returns:
+        The field value, or an empty string when ``ps`` succeeds with no
+        output or the process no longer exists.
+
+    Raises:
+        IdentityUnknown: If ``ps`` cannot read a process that still runs.
+    """
+    return read_ps_field(field, pid, {})
+
+
+def read_lsof_cwds() -> str:
+    """Lists every visible process's working directory through ``lsof``.
+
+    ``lsof`` ships with macOS and is the only base tool there that
+    reports another process's working directory. It exits non-zero when
+    it could not inspect some process, which is routine for processes of
+    other users, so its output is used whenever it printed any.
+
+    Returns:
+        ``lsof -Fpn`` field output: a ``p`` line naming each process ID,
+        followed by an ``n`` line naming its working directory.
+
+    Raises:
+        IdentityUnknown: If ``lsof`` cannot start, times out, or fails
+            without printing anything.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-a", "-d", "cwd", "-Fpn"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=PS_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        detail = "lsof could not list working directories."
+        raise IdentityUnknown(detail) from error
+    if result.returncode != 0 and not result.stdout.strip():
+        raise IdentityUnknown("lsof failed listing working directories.")
+    return result.stdout
+
+
+def parse_lsof_cwds(output: str) -> dict[int, Path]:
+    """Pairs each process ID in ``lsof -Fpn`` output with its directory.
+
+    Args:
+        output: Field output as :func:`read_lsof_cwds` returns it.
+
+    Returns:
+        The working directory of every process the output names one for.
+    """
+    found: dict[int, Path] = {}
+    pid = None
+    for line in output.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            found[pid] = Path(line[1:])
+    return found
 
 
 def linux_start_ticks(pid: int) -> str:
@@ -75,6 +188,19 @@ def linux_start_ticks(pid: int) -> str:
     return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
 
 
+def linux_same_start(pid: int, ticks: str) -> bool:
+    """Reports whether a Linux process carries recorded creation ticks.
+
+    Args:
+        pid: Process ID to inspect.
+        ticks: Creation ticks recorded beside that process ID.
+
+    Returns:
+        Whether the process's creation ticks equal the recorded ones.
+    """
+    return linux_start_ticks(pid) == ticks
+
+
 def linux_running(pid: int) -> bool:
     """Reports whether the kernel still lists a process in ``/proc``.
 
@@ -85,6 +211,23 @@ def linux_running(pid: int) -> bool:
         Whether that process ID currently exists.
     """
     return Path(f"/proc/{pid}").exists()
+
+
+def linux_zombie(pid: int) -> bool:
+    """Reports whether a Linux process has exited but not been reaped.
+
+    A zombie keeps its process ID and its recorded creation ticks until
+    its parent reaps it, so neither alone tells an exited process from a
+    running one.
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        Whether `/proc` lists the process in the zombie state.
+    """
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    return fields[0] == "Z"
 
 
 def linux_foreground_pid(pid: int) -> int:
@@ -138,6 +281,69 @@ def linux_matches_command(pid: int, home: Path) -> bool:
         str(home).encode(),
     ]
     return command[1:5] == expected
+
+
+def linux_worktree_clients(lane: Path, command: str) -> list[int]:
+    """Lists Linux processes running a native client inside a worktree.
+
+    A client counts when its working directory is the worktree or lies
+    inside it, and the base name of its first or second argument is the
+    client command, so both a native binary and a script run by an
+    interpreter such as `node` are recognized. A process that exits or
+    denies access while it is read is skipped.
+
+    Args:
+        lane: Lane worktree the client runs in.
+        command: Native client command, such as `claude`.
+
+    Returns:
+        Process IDs of every matching process, in `/proc` order.
+    """
+    found = []
+    target = lane.resolve()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            words = (entry / "cmdline").read_bytes().split(b"\x00")[:2]
+            if command.encode() not in (
+                os.path.basename(word) for word in words
+            ):
+                continue
+            if Path(os.readlink(entry / "cwd")).is_relative_to(target):
+                found.append(int(entry.name))
+        except OSError:
+            continue
+    return found
+
+
+def linux_cwd_pids(target: Path) -> list[int] | None:
+    """Lists Linux processes whose working directory lies inside a path.
+
+    A process that exits or denies access while it is read is skipped.
+
+    Args:
+        target: Directory, such as a worktree about to be moved.
+
+    Returns:
+        Process IDs whose working directory is the path or lies inside
+        it, or None when ``/proc`` cannot be listed.
+    """
+    root = target.resolve()
+    found = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            if Path(os.readlink(entry / "cwd")).is_relative_to(root):
+                found.append(int(entry.name))
+        except OSError:
+            continue
+    return found
 
 
 def libc_pidfd(name: str, *arguments: int | None) -> int:
@@ -197,7 +403,10 @@ def linux_terminate(pid: int, ticks: str) -> None:
     A process that ignores `SIGTERM`, such as a client wedged in a native
     dialog or left behind by a system hang, is sent `SIGKILL` once the
     shutdown timeout passes, through the same pinned descriptor, so the
-    escalation can never reach a recycled process ID.
+    escalation can never reach a recycled process ID. A process that exits
+    between the pin and the signal is already stopped, so its vanished
+    ``/proc`` entry or refused signal ends the stop instead of failing it;
+    an exited process makes the pinned descriptor readable at once.
 
     Args:
         pid: Process ID recorded for the process.
@@ -216,11 +425,17 @@ def linux_terminate(pid: int, ticks: str) -> None:
     except ProcessLookupError:
         return
     try:
-        if linux_start_ticks(pid) != ticks:
+        try:
+            current = linux_start_ticks(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        if current != ticks:
             raise BridgeError("Server PID changed; refusing to signal it.")
-        linux_signal(fd, signal.SIGTERM)
+        with contextlib.suppress(ProcessLookupError):
+            linux_signal(fd, signal.SIGTERM)
         if not select.select([fd], [], [], STOP_TIMEOUT)[0]:
-            linux_signal(fd, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                linux_signal(fd, signal.SIGKILL)
             if not select.select([fd], [], [], KILL_TIMEOUT)[0]:
                 raise BridgeError(
                     f"Process {pid} did not exit after SIGTERM and SIGKILL."
@@ -257,6 +472,22 @@ def darwin_running(pid: int) -> bool:
     return True
 
 
+def darwin_zombie(reader: PsReader, pid: int) -> bool:
+    """Reports whether a macOS process has exited but not been reaped.
+
+    A zombie still answers the signal-zero existence check, so only the
+    state ``ps`` prints tells it from a running process.
+
+    Args:
+        reader: Reads one ``ps`` field for a process ID.
+        pid: Process ID to inspect.
+
+    Returns:
+        Whether ``ps`` reports the process in the zombie state.
+    """
+    return reader("stat=", pid).startswith("Z")
+
+
 def darwin_start_ticks(reader: PsReader, pid: int) -> str:
     """Reads a macOS process creation time through ``ps``.
 
@@ -270,7 +501,9 @@ def darwin_start_ticks(reader: PsReader, pid: int) -> str:
     process ID would compare equal to the session it replaced. Both
     fields are rendered from the creation timestamp stored with the
     process, so a later change to the system clock does not rewrite the
-    recorded value.
+    recorded value. The reader renders that instant in UTC under the C
+    locale, so callers with different ``TZ`` or locale settings read
+    the same value.
 
     Args:
         reader: Reads one ``ps`` field for a process ID.
@@ -280,15 +513,49 @@ def darwin_start_ticks(reader: PsReader, pid: int) -> str:
         The recorded creation time exactly as ``ps`` prints it.
 
     Raises:
-        ProcessLookupError: If no such process exists or ``ps`` reports
-            no creation time for it.
+        ProcessLookupError: If no such process exists.
+        IdentityUnknown: If the process still runs but ``ps`` could not
+            report its creation time, so it is neither proven gone nor
+            proven to be the recorded process.
     """
     if not darwin_running(pid):
         raise ProcessLookupError(f"No process with ID {pid}.")
     started = reader("lstart=", pid)
-    if not started:
-        raise ProcessLookupError(f"No creation time for process {pid}.")
-    return started
+    if started:
+        return started
+    if darwin_running(pid):
+        raise IdentityUnknown(f"No creation time for running process {pid}.")
+    raise ProcessLookupError(f"No process with ID {pid}.")
+
+
+def darwin_same_start(
+    reader: PsReader, local_reader: PsReader, pid: int, ticks: str
+) -> bool:
+    """Reports whether a macOS process carries a recorded creation time.
+
+    A record written before ``ps`` ran in UTC and the C locale holds
+    ``lstart`` in the recorder's own ``TZ`` and locale. When the UTC
+    reading differs, the caller's own reading is accepted too, so a
+    live lane recorded before an upgrade is not taken for a dead one.
+
+    Args:
+        reader: Reads one ``ps`` field in UTC and the C locale.
+        local_reader: Reads one ``ps`` field in the caller's own ``TZ``
+            and locale.
+        pid: Process ID to inspect.
+        ticks: Creation time recorded beside that process ID.
+
+    Returns:
+        Whether either reading equals the recorded creation time.
+
+    Raises:
+        ProcessLookupError: If no such process exists.
+        IdentityUnknown: If the process runs but ``ps`` could not report
+            its creation time.
+    """
+    if darwin_start_ticks(reader, pid) == ticks:
+        return True
+    return local_reader("lstart=", pid) == ticks
 
 
 def darwin_foreground_pid(reader: PsReader, pid: int) -> int:
@@ -354,7 +621,63 @@ def darwin_matches_command(reader: PsReader, pid: int, home: Path) -> bool:
     return bool(command) and command.endswith(expected)
 
 
-def darwin_terminate(reader: PsReader, pid: int, ticks: str) -> None:
+def darwin_cwd_pids(lister: CwdLister, target: Path) -> list[int] | None:
+    """Lists macOS processes whose working directory lies inside a path.
+
+    ``ps`` does not report a working directory on macOS, so the listing
+    comes from ``lsof``.
+
+    Args:
+        lister: Returns ``lsof -Fpn`` working-directory output.
+        target: Directory, such as a worktree about to be moved.
+
+    Returns:
+        Process IDs whose working directory is the path or lies inside
+        it, or None when ``lsof`` could not list them.
+    """
+    root = target.resolve()
+    try:
+        cwds = parse_lsof_cwds(lister())
+    except OSError:
+        return None
+    return [pid for pid, path in cwds.items() if path.is_relative_to(root)]
+
+
+def darwin_worktree_clients(
+    lister: CwdLister, reader: PsReader, lane: Path, command: str
+) -> list[int]:
+    """Lists macOS processes running a native client inside a worktree.
+
+    A process counts when ``lsof`` places its working directory inside
+    the worktree and the base name of the first or second word ``ps``
+    prints for its arguments is the client command, matching the Linux
+    rule for a native binary and for a script run by an interpreter. A
+    process whose arguments cannot be read is skipped.
+
+    Args:
+        lister: Returns ``lsof -Fpn`` working-directory output.
+        reader: Reads one ``ps`` field for a process ID.
+        lane: Lane worktree the client runs in.
+        command: Native client command, such as `claude`.
+
+    Returns:
+        Process IDs of every matching process, or an empty list when
+        ``lsof`` could not list working directories.
+    """
+    found = []
+    for pid in darwin_cwd_pids(lister, lane) or []:
+        try:
+            words = reader("args=", pid).split()[:2]
+        except OSError:
+            continue
+        if command in (os.path.basename(word) for word in words):
+            found.append(pid)
+    return found
+
+
+def darwin_terminate(
+    reader: PsReader, local_reader: PsReader, pid: int, ticks: str
+) -> None:
     """Rechecks the creation time, then signals and waits for exit.
 
     macOS offers no pidfd, so the process cannot be pinned for the
@@ -369,21 +692,28 @@ def darwin_terminate(reader: PsReader, pid: int, ticks: str) -> None:
 
     Args:
         reader: Reads one ``ps`` field for a process ID.
+        local_reader: Reads one ``ps`` field in the caller's own ``TZ``
+            and locale, for a creation time recorded in that form.
         pid: Process ID recorded for the process.
         ticks: Creation time recorded beside that process ID.
 
     Raises:
-        BridgeError: If the creation time changed, the process belongs
-            to another user, or it did not exit even after `SIGKILL`.
+        BridgeError: If the creation time changed or could not be read,
+            the process belongs to another user, or it did not exit even
+            after `SIGKILL`.
     """
     for number, timeout in (
         (signal.SIGTERM, STOP_TIMEOUT),
         (signal.SIGKILL, KILL_TIMEOUT),
     ):
         try:
-            if darwin_start_ticks(reader, pid) != ticks:
+            if not darwin_same_start(reader, local_reader, pid, ticks):
                 raise BridgeError("Server PID changed; refusing to signal it.")
             os.kill(pid, number)
+        except IdentityUnknown as error:
+            raise BridgeError(
+                "Server identity could not be read; refusing to signal it."
+            ) from error
         except ProcessLookupError:
             return
         except PermissionError as error:
@@ -398,6 +728,11 @@ def darwin_terminate(reader: PsReader, pid: int, ticks: str) -> None:
                 pass
             if not darwin_running(pid):
                 return
+            try:
+                if darwin_zombie(reader, pid):
+                    return
+            except IdentityUnknown:
+                pass
             time.sleep(POLL_INTERVAL)
     raise BridgeError(f"Process {pid} did not exit after SIGTERM and SIGKILL.")
 
@@ -411,25 +746,38 @@ class Platform(NamedTuple):
 
     Attributes:
         start_ticks: Returns a process's recorded creation identity.
+        same_start: Reports whether a process carries a recorded
+            creation identity, in any form a release has recorded.
         foreground_pid: Returns a hook's foreground terminal process group.
         parent_pid: Returns a process's parent, for walking a hook's
             ancestry when it has no controlling terminal.
         running: Reports whether a process ID currently exists.
+        zombie: Reports whether a process ID has exited but is not yet
+            reaped, so its creation identity still matches while nothing
+            can be signaled or waited for.
         matches_command: Reports whether a process runs this server for
             a given private state directory.
         terminate: Verifies identity, signals the process, and waits for
             it to exit.
         boot_id: Names the current boot of the host, so a process record
             written before a restart is known to be from an earlier boot.
+        worktree_clients: Lists processes running a named native client
+            with a lane worktree as their working directory.
+        cwd_pids: Lists every process whose working directory lies
+            inside a path, or None when the platform cannot tell.
     """
 
     start_ticks: Callable[[int], str]
+    same_start: Callable[[int, str], bool]
     foreground_pid: Callable[[int], int]
     parent_pid: Callable[[int], int]
     running: Callable[[int], bool]
+    zombie: Callable[[int], bool]
     matches_command: Callable[[int, Path], bool]
     terminate: Callable[[int, str], None]
     boot_id: Callable[[], str]
+    worktree_clients: Callable[[Path, str], list[int]]
+    cwd_pids: Callable[[Path], list[int] | None]
 
 
 def linux_boot_id() -> str:
@@ -445,16 +793,20 @@ def darwin_boot_id() -> str:
     """Reads the instant the macOS kernel records for the current boot.
 
     Returns:
-        The boot time exactly as `sysctl` prints it, which changes only
-        when the host starts again.
+        The boot time in epoch seconds, the ``sec`` field `sysctl` prints.
+        The local-time rendering after it is dropped because it changes
+        with the timezone while the host keeps running; output without a
+        ``sec`` field is returned whole.
     """
-    return subprocess.run(
+    output = subprocess.run(
         ["sysctl", "-n", "kern.boottime"],
         capture_output=True,
         text=True,
         timeout=PS_TIMEOUT,
         check=True,
     ).stdout.strip()
+    seconds = output.partition("sec = ")[2].partition(",")[0].strip()
+    return seconds if seconds.isdigit() else output
 
 
 def linux_platform() -> Platform:
@@ -465,33 +817,51 @@ def linux_platform() -> Platform:
     """
     return Platform(
         start_ticks=linux_start_ticks,
+        same_start=linux_same_start,
         foreground_pid=linux_foreground_pid,
         parent_pid=linux_parent_pid,
         running=linux_running,
+        zombie=linux_zombie,
         matches_command=linux_matches_command,
         terminate=linux_terminate,
         boot_id=linux_boot_id,
+        worktree_clients=linux_worktree_clients,
+        cwd_pids=linux_cwd_pids,
     )
 
 
-def darwin_platform(reader: PsReader = read_ps_field) -> Platform:
-    """Builds the macOS primitives around one ``ps`` reader.
+def darwin_platform(
+    reader: PsReader = read_ps_field,
+    local_reader: PsReader = read_local_ps_field,
+    lister: CwdLister = read_lsof_cwds,
+) -> Platform:
+    """Builds the macOS primitives around ``ps`` and ``lsof`` readers.
 
     Args:
         reader: Reads one ``ps`` field for a process ID. Tests supply a
             reader of their own so the macOS path runs on any host.
+        local_reader: Reads one ``ps`` field in the caller's own ``TZ``
+            and locale, to recognize a creation time recorded that way.
+        lister: Returns ``lsof -Fpn`` working-directory output. Tests
+            supply output of their own.
 
     Returns:
         The process primitives used on macOS.
     """
     return Platform(
         start_ticks=functools.partial(darwin_start_ticks, reader),
+        same_start=functools.partial(darwin_same_start, reader, local_reader),
         foreground_pid=functools.partial(darwin_foreground_pid, reader),
         parent_pid=functools.partial(darwin_parent_pid, reader),
         running=darwin_running,
+        zombie=functools.partial(darwin_zombie, reader),
         matches_command=functools.partial(darwin_matches_command, reader),
-        terminate=functools.partial(darwin_terminate, reader),
+        terminate=functools.partial(darwin_terminate, reader, local_reader),
         boot_id=darwin_boot_id,
+        worktree_clients=functools.partial(
+            darwin_worktree_clients, lister, reader
+        ),
+        cwd_pids=functools.partial(darwin_cwd_pids, lister),
     )
 
 
@@ -598,6 +968,172 @@ def host_report(release: str | None = None) -> dict:
     }
 
 
+MEMINFO = Path("/proc/meminfo")
+MIB = 1024 * 1024
+DARWIN_AVAILABLE = ("Pages free", "Pages inactive", "Pages speculative")
+LOAD_SKIPPED = (
+    "Host load is not read on Windows, so the launch load threshold is skipped."
+)
+
+
+class HostLoad(NamedTuple):
+    """One reading of the host's load and available memory.
+
+    Attributes:
+        ratio: One-minute load average per CPU, or None when unreadable.
+        available_mib: Memory new work can take, or None when unreadable.
+        skipped: Why no reading was taken, empty when one was.
+    """
+
+    ratio: float | None
+    available_mib: int | None
+    skipped: str = ""
+
+
+def linux_available_mib(path: Path = MEMINFO) -> int | None:
+    """Reads the memory Linux says new work can take without swapping.
+
+    Args:
+        path: Memory statistics file; tests supply a file of their own.
+
+    Returns:
+        ``MemAvailable`` in MiB, or None when the file or field is
+        unreadable.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        field, _, value = line.partition(":")
+        words = value.split()
+        if field == "MemAvailable" and words and words[0].isdigit():
+            return int(words[0]) // 1024
+    return None
+
+
+def darwin_available_mib(output: str | None = None) -> int | None:
+    """Reads the free, inactive and speculative pages ``vm_stat`` reports.
+
+    Args:
+        output: ``vm_stat`` output; read from the host when omitted.
+
+    Returns:
+        Those pages in MiB, or None when ``vm_stat`` fails or prints no
+        page size or one of the counts.
+    """
+    if output is None:
+        try:
+            output = subprocess.run(
+                ["vm_stat"],
+                capture_output=True,
+                text=True,
+                timeout=PS_TIMEOUT,
+                check=True,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+    lines = output.splitlines()
+    size = lines[0].partition("page size of ")[2].split() if lines else []
+    counts = {}
+    for line in lines[1:]:
+        field, _, value = line.partition(":")
+        counts[field.strip()] = value.strip().rstrip(".")
+    pages = [counts.get(field, "") for field in DARWIN_AVAILABLE]
+    if not size or not size[0].isdigit():
+        return None
+    if not all(page.isdigit() for page in pages):
+        return None
+    return sum(int(page) for page in pages) * int(size[0]) // MIB
+
+
+def host_load(system: str = sys.platform) -> HostLoad:
+    """Reads the host's load and available memory once, for one launch.
+
+    The load ratio is the one-minute load average divided by the CPU
+    count, so the same number means the same pressure on any machine.
+    Nothing samples it continuously; each launch and each dispatch takes
+    its own reading.
+
+    Args:
+        system: Platform name as ``sys.platform`` reports it.
+
+    Returns:
+        The ratio rounded to two places and the available memory, each
+        None when unreadable; on Windows no reading, with `LOAD_SKIPPED`.
+    """
+    if system == "win32":
+        return HostLoad(None, None, LOAD_SKIPPED)
+    try:
+        ratio: float | None = round(
+            os.getloadavg()[0] / (os.cpu_count() or 1), 2
+        )
+    except OSError:
+        ratio = None
+    available = (
+        darwin_available_mib() if system == "darwin" else linux_available_mib()
+    )
+    return HostLoad(ratio, available)
+
+
+def overloaded(reading: HostLoad, max_ratio: float, min_mib: int) -> str:
+    """Names each reading past the launch threshold.
+
+    An unreadable reading is never judged, so a host that cannot report
+    its load still launches.
+
+    Args:
+        reading: A `host_load` reading.
+        max_ratio: The ``max_load_ratio`` supervision setting.
+        min_mib: The ``min_available_mib`` supervision setting.
+
+    Returns:
+        Each reading past its threshold beside the setting that moves it,
+        joined in one clause, or empty text when none is.
+    """
+    causes = []
+    if reading.ratio is not None and reading.ratio > max_ratio:
+        causes.append(
+            f"load ratio {reading.ratio} per CPU is above max_load_ratio "
+            f"{max_ratio}"
+        )
+    available = reading.available_mib
+    if available is not None and available < min_mib:
+        causes.append(
+            f"{available} MiB available is below min_available_mib {min_mib}"
+        )
+    return " and ".join(causes)
+
+
+def load_line(reading: HostLoad, max_ratio: float, min_mib: int) -> str:
+    """Words a `host_load` reading against its threshold for ``doctor``.
+
+    Args:
+        reading: A `host_load` reading.
+        max_ratio: The ``max_load_ratio`` supervision setting.
+        min_mib: The ``min_available_mib`` supervision setting.
+
+    Returns:
+        The skipped line on Windows, else both readings beside their
+        thresholds and whether a launch would go ahead.
+    """
+    if reading.skipped:
+        return reading.skipped
+    ratio = "unreadable" if reading.ratio is None else reading.ratio
+    available = (
+        "unreadable" if reading.available_mib is None else reading.available_mib
+    )
+    verdict = (
+        "over the launch threshold, so run refuses and dispatch defers"
+        if overloaded(reading, max_ratio, min_mib)
+        else "under the launch threshold"
+    )
+    return (
+        f"load ratio {ratio} of at most {max_ratio}, {available} MiB "
+        f"available of at least {min_mib}; {verdict}"
+    )
+
+
 def check_repository_host(repo: Path, release: str | None = None) -> None:
     """Refuses a repository on a mounted Windows drive under WSL.
 
@@ -673,12 +1209,58 @@ def alive(pid: int | None, ticks: str | None) -> bool:
 
     Returns:
         Whether the process runs and was created at the recorded time. A
-        recycled process ID reports false, and so does a missing record.
+        recycled process ID reports false, a missing record reports
+        false, and so does a process left in the zombie state, which
+        keeps its process ID and creation identity after it has already
+        exited. A process whose identity cannot be read reports false
+        too; a caller that must not act on a live process uses
+        :func:`alive_or_unknown` instead.
+    """
+    return alive_or_unknown(pid, ticks) is True
+
+
+def alive_or_unknown(pid: int | None, ticks: str | None) -> bool | None:
+    """Reports whether a recorded process still runs, or that none can tell.
+
+    On macOS identity comes from ``ps``, which can time out or fail on a
+    loaded host while the process keeps running. Reading that as "exited"
+    would let supervision resume or replace a session that still runs and
+    let a hook relaunch a running service, so it is reported apart.
+
+    Args:
+        pid: Process ID recorded when the process started, if any.
+        ticks: Creation identity recorded beside that process ID.
+
+    Returns:
+        True for the same live process, False for a missing record, an
+        exited, recycled or zombie process, and None when the process
+        runs but its identity could not be read, so the caller skips the
+        decision until a later reading.
     """
     try:
-        return pid is not None and start_ticks(pid) == ticks
+        return (
+            pid is not None
+            and ticks is not None
+            and PLATFORM.same_start(pid, ticks)
+            and not PLATFORM.zombie(pid)
+        )
+    except IdentityUnknown:
+        return None
     except (OSError, IndexError, ValueError, TypeError):
         return False
+
+
+def cwd_pids(target: Path) -> list[int] | None:
+    """Lists the processes working inside a directory on this platform.
+
+    Args:
+        target: Directory, such as a worktree about to be moved.
+
+    Returns:
+        Process IDs whose working directory is the directory or lies
+        inside it, or None when the platform cannot list them.
+    """
+    return PLATFORM.cwd_pids(target)
 
 
 class ServerProcess(NamedTuple):
@@ -756,7 +1338,9 @@ def launched_process(
     if type(launcher_pid) is not int or launcher_pid <= 1:
         return None
     try:
-        if PLATFORM.start_ticks(launcher_pid) != launcher_ticks:
+        if not isinstance(launcher_ticks, str) or not PLATFORM.same_start(
+            launcher_pid, launcher_ticks
+        ):
             return None
         pid = hook_pid
         for _ in range(ANCESTRY_LIMIT):
@@ -825,6 +1409,65 @@ def recorded_process(
     return None
 
 
+def worktree_client(lane: Path, command: str) -> ServerProcess | None:
+    """Names the native client running in a lane worktree, if one does.
+
+    A session forked or resumed outside the launcher keeps the lane's
+    worktree but runs in a process the lane never recorded. Its working
+    directory still names the lane, so it is found here and the lane is
+    not read as gone while it runs. When several clients run there, the
+    most recently started one is named, because a fork is started after
+    the session it continues.
+
+    Args:
+        lane: Lane worktree the client runs in.
+        command: Native client command, such as `claude`.
+
+    Returns:
+        Verified identity of the newest live client, or None when no live
+        client runs there or the platform cannot tell.
+    """
+    found = []
+    try:
+        candidates = PLATFORM.worktree_clients(lane, command)
+    except OSError:
+        return None
+    for pid in candidates:
+        try:
+            ticks = PLATFORM.start_ticks(pid)
+        except (OSError, IndexError, ValueError):
+            continue
+        if alive(pid, ticks):
+            found.append(ServerProcess(pid, ticks))
+    if not found:
+        return None
+    return max(found, key=lambda client: start_order(client.ticks))
+
+
+def start_order(ticks: str) -> float:
+    """Orders recorded creation identities by when the process started.
+
+    Linux records creation ticks since boot, a decimal count. macOS records
+    ``lstart`` text in UTC under the C locale, such as
+    ``Mon Nov  3 10:00:00 2026``, whose text order follows weekday and
+    month names rather than time, so it is parsed into seconds instead.
+
+    Args:
+        ticks: Creation identity as `start_ticks` returns it.
+
+    Returns:
+        A value that grows with the creation time, or negative infinity
+        when the identity cannot be read as a time.
+    """
+    if ticks.isdigit():
+        return float(ticks)
+    try:
+        started = time.strptime(ticks, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return float("-inf")
+    return float(calendar.timegm(started))
+
+
 def identify(record: dict, home: Path) -> ServerProcess | None:
     """Matches creation identity, module, and home before accepting a PID.
 
@@ -840,8 +1483,12 @@ def identify(record: dict, home: Path) -> ServerProcess | None:
     try:
         pid = record["pid"]
         ticks = PLATFORM.start_ticks(pid)
-        matched = PLATFORM.matches_command(pid, home)
-        if matched and ticks == record.get("start_ticks"):
+        recorded = record.get("start_ticks")
+        if (
+            PLATFORM.matches_command(pid, home)
+            and isinstance(recorded, str)
+            and PLATFORM.same_start(pid, recorded)
+        ):
             return ServerProcess(pid, ticks)
     except (OSError, KeyError, IndexError):
         pass

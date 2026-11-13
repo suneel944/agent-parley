@@ -65,6 +65,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from agent_parley.demo import free_port
 from scripts import acceptance
 from scripts.record_demo import (
     BACKGROUND,
@@ -79,7 +80,6 @@ from scripts.record_demo import (
     MUTED,
     colour,
     escape,
-    free_port,
 )
 
 WIDTH = 160

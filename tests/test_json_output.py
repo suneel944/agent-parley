@@ -106,7 +106,7 @@ def test_status_reports_the_verdict_a_peer_recorded(
 def test_status_text_still_prints_the_same_report(bridge, repo, paired, capsys):
     bridge.status(cli.Selection(participant="claude"))
     output = capsys.readouterr().out
-    assert "Server: not ready" in output
+    assert "Service: not running" in output
     assert "claude (claude):" in output
     assert "Reported outcome: unknown" in output
 
@@ -127,6 +127,24 @@ def test_top_prints_one_frame_and_exits(
     assert rows[0]["provider"] == "claude"
     assert rows[0]["credential"] is None
     assert rows[0]["drift"] is False
+
+
+def test_top_names_the_lanes_whose_tokens_are_unmeasured(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    bridge.add_participant(repo, "gem", "gemini")
+    bridge.add_participant(repo, "orb", "amp")
+    document = envelope(
+        run(monkeypatch, capsys, "--home", str(bridge.home), "top", "--json"),
+        "top",
+    )
+    rows = document["projects"][0]["participants"]
+    assert {row["participant"]: row["unmeasured"] for row in rows} == {
+        "claude": [],
+        "codex": [],
+        "gem": [],
+        "orb": ["tokens"],
+    }
 
 
 def test_issue_list_reports_offers_with_their_identifiers(

@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import approvals, dashboard, history, metrics, roster
+from agent_parley import (
+    approvals,
+    dashboard,
+    history,
+    lifecycle,
+    merges,
+    metrics,
+    roster,
+)
 from agent_parley.checkpoints import branch_head
 from agent_parley.cli import git
 from agent_parley.state import BridgeError
@@ -92,12 +100,39 @@ def test_a_lane_naming_the_base_checkout_cannot_approve_itself(
         bridge.merge(repo, "codex")
 
 
+def test_a_lane_in_the_base_checkout_with_its_token_cannot_approve_itself(
+    bridge, repo, paired, awaiting, monkeypatch
+):
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.approve(repo, "codex")
+    monkeypatch.delenv("AGENT_PARLEY_TOKEN")
+    with pytest.raises(BridgeError, match="approve codex"):
+        bridge.merge(repo, "codex")
+
+
 def test_a_lane_naming_the_base_checkout_cannot_approve_recovery(
     bridge, repo, paired, monkeypatch
 ):
     monkeypatch.chdir(paired["lanes"]["codex"])
     with pytest.raises(BridgeError, match="base checkout"):
         bridge.authorize_recovery(repo, "42", "usage limit")
+
+
+def test_a_lane_token_in_the_base_checkout_cannot_decide(
+    bridge, repo, paired, awaiting, monkeypatch
+):
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.approve(repo, "codex")
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.authorize_recovery(repo, "42", "usage limit")
+    with pytest.raises(BridgeError, match="assigned agent worktree"):
+        bridge.issue(repo, "unblock", "42", on="17")
+    monkeypatch.delenv("AGENT_PARLEY_TOKEN")
+    with pytest.raises(BridgeError, match="approve codex"):
+        bridge.merge(repo, "codex")
 
 
 def test_a_lane_naming_the_base_checkout_cannot_unblock_as_operator(
@@ -152,6 +187,7 @@ def test_new_commits_and_changed_policy_each_need_a_new_approval(
     with pytest.raises(BridgeError, match="committed since"):
         bridge.merge(repo, "codex")
 
+    bridge.report(awaiting["lane"], "ready", "Engine extended", "", "13 ok")
     bridge.approve(repo, "codex")
     bridge.verification(repo, "true")
     with pytest.raises(BridgeError, match="verification command"):
@@ -159,6 +195,28 @@ def test_new_commits_and_changed_policy_each_need_a_new_approval(
 
     bridge.approve(repo, "codex")
     assert "Merged" in bridge.merge(repo, "codex")
+
+
+def test_an_approval_binds_the_commit_the_ready_report_described(
+    bridge, repo, paired, awaiting
+):
+    lane = awaiting["lane"]
+    (lane / "unreviewed.txt").write_text("never reported\n")
+    commit(lane, "Unreported work")
+    report = reported(awaiting["directory"], "codex")
+
+    with pytest.raises(BridgeError, match="committed since report") as stale:
+        bridge.approve(repo, "codex")
+    assert report in str(stale.value)
+    with pytest.raises(BridgeError, match="committed since report"):
+        bridge.merge(repo, "codex")
+    assert not (repo / "unreviewed.txt").exists()
+    assert "committed since report" in bridge.preview_merge(repo, "codex")
+
+    bridge.report(lane, "ready", "Engine extended", "", "13 tests passed")
+    bridge.approve(repo, "codex")
+    assert "Merged" in bridge.merge(repo, "codex")
+    assert (repo / "unreviewed.txt").exists()
 
 
 def test_a_further_report_invalidates_the_approval_it_was_given_for(
@@ -186,6 +244,36 @@ def test_a_rejection_refuses_integration_and_tells_the_lane_why(
     )
     assert chain[0]["action"] == "rejected"
     assert "Needs a test" in chain[0]["detail"]
+
+
+@pytest.mark.parametrize("value", ["approve", "APPROVED", None, 1])
+def test_an_unknown_decision_refuses_rather_than_permits(
+    bridge, repo, paired, awaiting, value
+):
+    directory = awaiting["directory"]
+    data = roster.read(directory)
+    head = branch_head(
+        Path(data["root"]), data["participants"]["codex"]["branch"]
+    )
+    report = reported(directory, "codex")
+    metrics.record_report(
+        directory,
+        "codex",
+        {
+            "kind": "approval",
+            "decision": value,
+            "operator": "someone",
+            "reason": "",
+            "binding": approvals.binding(data, "codex", head, report),
+        },
+    )
+
+    reviewed = approvals.review(directory, data, "codex", head)
+    assert reviewed["state"] == approvals.AWAITING
+    with pytest.raises(BridgeError, match="is not known"):
+        bridge.merge(repo, "codex")
+    with pytest.raises(BridgeError, match="is not known"):
+        bridge.pull_request(repo, "codex")
 
 
 def test_an_unreadable_decision_log_refuses_rather_than_permits(
@@ -248,3 +336,51 @@ def test_the_requirement_is_reported_and_validated(bridge, repo, paired):
         (Path(paired["lanes"]["codex"]).parent / "project.json").read_text()
     )
     assert stored["approval"] == ["merge"]
+
+
+def test_a_lane_cannot_clear_the_approval_or_verification_gate(
+    bridge, repo, paired, monkeypatch
+):
+    bridge.approval_policy(repo, ["merge"])
+    bridge.verification(repo, "make check")
+    lane = Path(paired["lanes"]["codex"])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.approval_policy(lane, [])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.verification(lane, "true")
+    monkeypatch.chdir(lane)
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.approval_policy(repo, [])
+    with pytest.raises(BridgeError, match="base checkout"):
+        bridge.verification(repo, "true")
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("AGENT_PARLEY_TOKEN", "lane-token")
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.approval_policy(repo, [])
+    with pytest.raises(BridgeError, match="AGENT_PARLEY_TOKEN"):
+        bridge.verification(repo, "")
+    assert "participant merge" in bridge.approval_policy(lane)
+    assert "make check" in bridge.verification(lane)
+    stored = roster.read(lane.parent)
+    assert stored["approval"] == ["merge"]
+    assert stored["verify"] == ["make", "check"]
+
+
+def test_a_completed_prerequisite_reads_as_completed_not_released():
+    state = {
+        "issues": {
+            "10": {"owner": None, "execution": {"state": lifecycle.COMPLETE}},
+            "11": {"owner": None},
+            "12": {"owner": "codex"},
+            "20": {"owner": "claude", "blocked_by": ["10", "11", "12"]},
+        }
+    }
+
+    assert merges.outside_prerequisites(state, {"claude": ["20"]}) == [
+        "#10 is a prerequisite outside this selection, completed, so it is "
+        "satisfied.",
+        "#11 is a prerequisite outside this selection, released, so no lane "
+        "still holds it.",
+        "#12 is a prerequisite outside this selection, held by codex, so it "
+        "is not satisfied here.",
+    ]

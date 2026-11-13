@@ -4,6 +4,9 @@ import itertools
 import json
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agent_parley import checkpoints, cli, dashboard, store, supervision
@@ -156,6 +159,40 @@ def test_a_git_failure_reports_nothing_without_raising(
     assert view["projects"][0]["rows"][0]["operator_edits"] == []
 
 
+def test_paths_git_would_quote_are_read_by_their_real_names(
+    bridge, repo, paired
+):
+    def run(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+
+    (repo / "my file.txt").write_text("one\n")
+    (repo / "naïve.txt").write_text("one\n")
+    (repo / "old name.txt").write_text("one\n")
+    run("add", "old name.txt")
+    run("commit", "-qm", "add")
+    start = supervision._read(paired["root"], "rev-parse", "HEAD")
+    run("mv", "old name.txt", "new näme.txt")
+    assert sorted(supervision.dirty_paths(paired["root"])) == [
+        "my file.txt",
+        "naïve.txt",
+        "new näme.txt",
+    ]
+    run("add", "-A")
+    run("commit", "-qm", "rename")
+    end = supervision._read(paired["root"], "rev-parse", "HEAD")
+    assert sorted(supervision._changed(paired["root"], start, end)) == [
+        "my file.txt",
+        "naïve.txt",
+        "new näme.txt",
+        "old name.txt",
+    ]
+    reserve(bridge, paired["root"], "claude", "naïve.txt")
+    (repo / "naïve.txt").write_text("operator change\n")
+    assert supervision.operator_edits(bridge.home, paired) == {
+        "claude": ["naïve.txt"]
+    }
+
+
 def test_the_hook_reads_the_poll_reading_instead_of_asking_git(
     bridge, repo, paired, monkeypatch
 ):
@@ -216,6 +253,74 @@ def test_an_expired_publication_is_read_from_git_again(bridge, repo, paired):
     }
 
 
+def test_an_expired_reading_is_served_while_one_refresh_replaces_it(
+    bridge, paired, monkeypatch
+):
+    root = paired["root"]
+    supervision._READINGS[root] = (0.0, {"claude": ["old"]}, {}, 60)
+    release = threading.Event()
+    calls = []
+
+    def edits(home, manifest):
+        calls.append("edits")
+        assert release.wait(10)
+        return {"claude": ["new"]}
+
+    def advances(home, manifest):
+        calls.append("advances")
+        assert release.wait(10)
+        return {}
+
+    monkeypatch.setattr(supervision, "operator_edits", edits)
+    monkeypatch.setattr(supervision, "base_advances", advances)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        served = list(
+            pool.map(
+                lambda _: supervision.readings(bridge.home, paired),
+                range(16),
+            )
+        )
+    assert served == [({"claude": ["old"]}, {})] * 16
+    flight = supervision._READINGS_FLIGHTS[root]
+    release.set()
+    assert flight.done.wait(10)
+    assert sorted(calls) == ["advances", "edits"]
+    assert supervision.readings(bridge.home, paired) == (
+        {"claude": ["new"]},
+        {},
+    )
+    assert sorted(calls) == ["advances", "edits"]
+
+
+def test_concurrent_callers_without_a_reading_share_one(
+    bridge, paired, monkeypatch
+):
+    calls = []
+    start = threading.Barrier(8)
+
+    def edits(home, manifest):
+        calls.append("edits")
+        time.sleep(0.3)
+        return {"claude": ["shared.txt"]}
+
+    def advances(home, manifest):
+        calls.append("advances")
+        return {}
+
+    def ask(_):
+        start.wait(10)
+        return supervision.readings(bridge.home, paired)
+
+    monkeypatch.setattr(supervision, "operator_edits", edits)
+    monkeypatch.setattr(supervision, "base_advances", advances)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        served = list(pool.map(ask, range(8)))
+    assert served == [({"claude": ["shared.txt"]}, {})] * 8
+    assert sorted(calls) == ["advances", "edits"]
+    assert paired["root"] not in supervision._READINGS
+    assert paired["root"] not in supervision._READINGS_FLIGHTS
+
+
 def test_the_batch_matcher_agrees_with_the_pairwise_rule():
     keys = [
         "a",
@@ -244,3 +349,37 @@ def test_the_batch_matcher_agrees_with_the_pairwise_rule():
             }
             assert store.overlapping_paths(keys, list(patterns)) == expected
     assert store.overlapping_paths(keys, []) == set()
+
+
+def test_the_folding_batch_matcher_agrees_with_the_pairwise_rule():
+    keys = [
+        "a",
+        "A/",
+        "a/B",
+        "A/b/",
+        "A/B/C.PY",
+        "a/b/c.py",
+        "A/*",
+        "a/B/*.py",
+        "*.PY",
+        "Ab",
+        "ab/C",
+        "X:y",
+        "x:Y",
+        "x:y/z",
+        "[AB]/c",
+        "?",
+        "C/d/E",
+    ]
+    for size in (1, 2):
+        for patterns in itertools.combinations(keys, size):
+            expected = {
+                path
+                for path in keys
+                for pattern in patterns
+                if store.overlapping(path, pattern, fold=True)
+            }
+            assert (
+                store.overlapping_paths(keys, list(patterns), fold=True)
+                == expected
+            ), patterns

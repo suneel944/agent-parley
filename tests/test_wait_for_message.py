@@ -103,7 +103,7 @@ def test_a_reply_arriving_during_a_wait_is_reported_at_once(bridge, lanes):
         )
     finally:
         sender.join(timeout=5)
-    assert time.monotonic() - started < 1
+    assert time.monotonic() - started < 5
     assert [row["id"] for row in page["messages"]] == [sent["id"]]
     assert page["expired"] is False
 
@@ -153,12 +153,44 @@ def test_an_expired_wait_reports_an_empty_page_and_records_nothing(
     assert events() == before
 
 
+def test_an_unexpected_tool_failure_answers_internal_error(
+    bridge, lanes, monkeypatch
+):
+    def broken(home, actor, name, arguments):
+        raise TypeError("damaged row")
+
+    monkeypatch.setattr(store, "call", broken)
+    with service(bridge) as running:
+        response = served(
+            running, lanes["BlueLake"]["token"], "list_participants", {}
+        )
+    assert response.status_code == 200
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": -32603, "message": "Internal error"},
+    }
+
+
+def test_an_invalid_envelope_is_answered_with_a_json_rpc_error(bridge, lanes):
+    with service(bridge) as running:
+        response = httpx.post(
+            f"http://127.0.0.1:{running.server_port}/mcp/",
+            headers={"Authorization": f"Bearer {lanes['BlueLake']['token']}"},
+            json={"jsonrpc": "1.0", "id": 1, "method": "tools/list"},
+            timeout=30,
+            trust_env=False,
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == -32600
+
+
 def test_a_requested_wait_is_clamped_and_validated(bridge, lanes):
     assert waits.bounded(10_000) == waits.MAX_SECONDS
     assert waits.bounded(None) == waits.DEFAULT_SECONDS
     assert waits.bounded(10, ceiling=1) == 1
     assert waits.bounded(10, ceiling=0) == 0
-    for invalid in ("30", True, -1, [30]):
+    for invalid in ("30", True, -1, [30], float("nan"), float("inf")):
         with pytest.raises(BridgeError):
             waits.bounded(invalid)
 

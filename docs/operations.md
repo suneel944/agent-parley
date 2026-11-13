@@ -2,6 +2,71 @@
 
 ## Install and upgrade
 
+One command installs everything on Linux, macOS and WSL2:
+
+```sh
+curl -LsSf https://github.com/suneel944/agent-parley/releases/latest/download/install.sh | sh
+```
+
+`install.sh` installs uv through its official installer only when uv is
+missing, with `UV_NO_MODIFY_PATH=1` so no shell startup file is edited. It then
+runs `uv tool install agent-parley`, or `uv tool install --force agent-parley`
+when the tool is already installed, so a pinned or wheel install still moves
+to the latest release, followed by `agent-parley plugins install` and
+`agent-parley doctor`, and prints the next command. It never uses sudo. When
+uv's directory is not on PATH it prints the exact `export PATH=...` line to add.
+Re-running it upgrades in place. Setting `AGENT_PARLEY_SPEC` to another package
+spec, such as a built wheel path, installs that instead with
+`uv tool install --force`, on every run; CI uses it to install the code under
+test in a clean home on Ubuntu and macOS. Native Windows is refused with the WSL2
+pointer described under [Platforms](#platforms). Each release attaches
+`install.sh` and lists its SHA-256 in `SHA256SUMS`, so it can be checked before
+it runs:
+
+```sh
+curl -LsSfO https://github.com/suneel944/agent-parley/releases/latest/download/install.sh
+curl -LsSf https://github.com/suneel944/agent-parley/releases/latest/download/SHA256SUMS | grep ' install.sh$' | shasum -a 256 -c -
+sh install.sh
+```
+
+`agent-parley plugins install` is the plugin step on its own: it adds the
+marketplace and plugin to each of `claude` and `codex` found on PATH, skipping
+what their listings already hold, and `agent-parley plugins status` reports
+that state without writing. `uv tool upgrade agent-parley` on its own
+replaces the launcher and leaves the plugin behind, because the plugin lives in
+each CLI's own cache. The running service repairs that: once at start and then
+once per poll interval, its supervision thread runs the same install for every
+CLI and config home whose installed plugin version differs from the launcher's,
+at most once per launcher version and home. A home the plugin was never
+installed into is left alone. A failed refresh is logged with the CLI's error
+and retried with a delay doubling from one minute to an hour. Native sessions
+read their plugin at start, so `problems` then lists a `plugin stale` row
+naming the live lanes started before the refresh or running an older plugin,
+with the command that relaunches the oldest. Setting `AGENT_PARLEY_PLUGIN_REPAIR=off` in the service's
+environment turns the repair off for an estate that manages its plugins another
+way.
+
+Each launch records the plugin version its session loaded in the lane's
+activity record, and `status --json` and `top --json` carry it per lane as
+`plugin_version`, with `plugin_stale` true when it differs from the launcher.
+A lane launched before the field existed reports `unknown` and is never stale.
+Neither command nor the hook reads a plugin manifest to answer this. A stale
+lane is marked in `top` with `plugin VERSION stale; agent-parley run NAME
+--resume`, and its hook tells it once to finish its current step and end its
+turn, blocking one `Stop` so the notice is read. The agent never runs the
+restart itself; the operator, or the service for an unattended lane, runs
+`agent-parley run NAME --resume`. A lane counts as unattended when its
+activity record says `attached` is false, meaning its launcher has no
+terminal, and its participant has wakes on; the manifest has no separate
+unattended marker. The service restarts an unattended lane once its plugin
+refresh for that lane's config home succeeded and the lane could be resumed at
+all: it has a resumable session no takeover fenced, a native provider that
+needs no extra environment, and no missing bridge tool opt-in. When the same
+session process is still idle with no turn in flight, the session is ended the
+way `participant stop` ends one and resumed with `run --resume`, at most once
+per launcher version. A lane with a terminal is never restarted; the notice
+and the `top` marker are its surface. The manual steps follow.
+
 Installing needs no clone. `uv tool install agent-parley` takes the published
 distribution from PyPI. `uv tool install git+https://github.com/suneel944/agent-parley`
 tracks the default branch instead, and a release wheel URL pins an exact
@@ -22,7 +87,19 @@ terminal. `make install-dev` installs an editable checkout.
 its environment under `/opt/agent-parley`. Each user's runtime state remains
 private.
 
-Upgrading needs no action: the store upgrades in place on first use, keeping
+Shell completion comes from `agent-parley completion bash`, `zsh` or `fish`.
+Load it with `eval "$(agent-parley completion bash)"` (or `zsh`) or
+`agent-parley completion fish | source`. It offers commands and flags, and
+reads participant names, issue numbers, providers and credential profiles from
+the state directory, both for positional values such as `say NAME` and
+`participant restart NAME` and for options such as `--credentials`.
+
+Upgrading needs no action: a running service notices the new package within
+two seconds, finishes the requests in flight and re-executes itself on it under
+the same process ID, so `agent-parley down` and `agent-parley up` are not
+needed after `uv tool upgrade agent-parley`; the service log records the
+hand-over as `drifted`, `stopped`, `relaunching` and a new `bound` entry. The
+store upgrades in place on first use, keeping
 every message, claim and lease. Issue ledgers upgrade lazily: 0.11 derives
 lifecycle defaults for older records without an `execution` field and persists
 them when a lifecycle transition next writes the record. Stop running sessions
@@ -44,7 +121,7 @@ Linux process driving a Linux install, and the loopback mail server is not
 reachable across the boundary. `doctor` names the kernel release, the WSL
 generation (`1`, `2` or `none`) and whether `pidfd_open` is available, so a
 platform gap is read before a lane starts. CI runs the behaviour suite inside
-WSL on a Windows runner as an advisory job; it never blocks a merge. A native
+WSL on a Windows runner as the `wsl` job, a required check on `main`. A native
 Windows port is evaluated, not planned, in
 [Native Windows port](windows-port.md).
 
@@ -93,10 +170,40 @@ keeps the issue throughout either way.
 `history issue NUMBER` reports beside the transition, so a later reader sees why
 the work moved. `issue list` and `status` show a pending offer with `operator`
 as its source, an unclaimed issue appearing for as long as an offer waits on it.
+While it waits, a plain `issue claim` of that issue is refused, naming the
+recipient, so only the recipient's `issue accept` moves it.
 
 `issue assign NUMBER --unassign` withdraws an operator offer or request that
 nobody has answered. An offer that was already accepted is refused, naming the
 lane that holds the issue, because only that lane can hand it on.
+
+### Accepting follow-up work a lane suggested
+
+A lane that finds work outside its issue mails it to `@followup` instead of
+filing it or widening its own scope. Nothing is filed until you accept it:
+
+```bash
+agent-parley followup list
+agent-parley followup accept f3
+agent-parley followup accept f4 --milestone 0.22.0 --to codex
+```
+
+`followup list` prints each pending suggestion with the lane that made it,
+why, the paths it names, when it expires and the open issues or claims whose
+titles it may duplicate. `followup accept ID` files the issue in the active
+milestone, the open one due soonest or else the oldest, and offers it to a
+running lane that holds no claim and has no offer waiting, as `issue assign`
+would. With no idle lane it stays unclaimed for the next lane that pulls work.
+A repeat prints the issue already filed. Filing needs the GitHub forge; a
+refusal leaves the suggestion pending. With Telegram configured, each
+suggestion also arrives as a decision with an `accept` button that takes a
+confirming tap. Unaccepted suggestions expire after seven days.
+
+`followup list --json` prints `kind: followup_list` with `suggestions`, each
+carrying `id`, `lane`, `title`, `why`, `paths`, `created`, `expires`, `state`
+and `duplicates` (`issue`, `title`, `owner`). `followup accept --json` prints
+`kind: followup_accept` with the same fields plus `issue`, `milestone`,
+`offered_to`, `offer_id` and `repeated`.
 
 ### Reading status
 
@@ -115,18 +222,28 @@ its live claims, and `TASK` from the lane's own last report or registered task,
 never the operator's last prompt. A claim whose issue is no longer open on the
 forge, or whose pull request ended, while still owned is left out of the table
 and named on one line with `agent-parley issue resolve N`; `--all` lists those
-rows too.
+rows too. A claim that progressed after the cached reading was taken stays in
+the table even when the reading lacks its number, because an issue opened and
+claimed inside the poll interval is not closed, only newer than the reading.
 
 Titles and open state come from one bounded read of the project's open GitHub
-issues, the same list `issue list` reads, with a 5-second timeout. The reading
-is cached as `forge-issues.json` in the project's state directory for 300
-seconds, so repeated `status` calls reuse it. When the read fails, `status`
-answers from the last cached reading, prints one `Forge:` line with its age,
-and waits 60 seconds before trying again. With no reading at all, or no GitHub
-forge, the `Forge:` line says so and claims on closed issues are not hidden.
+issues, the same list `issue list` reads, with a timeout of 3 seconds plus 2
+seconds per 100 issues read. The service's poll takes that reading, not
+`status`: it caches it as `forge-issues.json` in the project's state directory
+and reads again once the cache is 300 seconds old. Between full reads, at most
+hourly, it reads only the issues updated since the last reading. When the read fails, the poll keeps the last reading and waits 60 seconds
+before trying again. `status` only reads the cache; a reading over 600 seconds
+old prints one `Forge:` line with its age and the cause, a failed read or a
+service that is not refreshing it. With no reading at all, no GitHub forge, or
+no GitHub `origin` remote, the `Forge:` line says so (`no GitHub`, `no GitHub
+remote`) and claims on closed issues are not hidden.
 Last, `Needs action:` lists each orphaned or overdue claim with the
 command that resolves it, `agent-parley issue claim N --take-orphaned` run from
-a peer lane or `agent-parley issue assign N LANE --reason TEXT`.
+a peer lane or `agent-parley issue assign N LANE --reason TEXT`. When the
+project has no live lane besides the holder, the orphaned line names the
+operator's command instead: start a lane with `agent-parley run NAME --repo
+ROOT` and have it take the claim, or `agent-parley issue release N`. `top`
+notes and the `orphaned claims` row of `problems` follow the same rule.
 
 `status --table`, a participant name, or any lane filter prints the full lane
 table instead: the server line, the code line, the state directory, and then
@@ -190,8 +307,9 @@ hour limits and exits non-zero when one matches; the budget informs and does
 not gate. `--issue` reports the lanes that hold or are offered one issue. A selection
 that matches nothing prints one line naming the filters that were applied.
 
-`--drifted` and `--pending` exit non-zero when at least one lane matches, so a
-shell gate fails on drift or on unfinished coordination without parsing text.
+`--drifted`, `--pending` and `--over-budget` exit non-zero when at least one
+lane matches, so a shell gate fails on drift, unfinished coordination or a
+crossed budget without parsing text.
 Every other reading exits zero. `--json` prints the same document as an
 unfiltered `status --json`, holding only the matching rows.
 
@@ -203,8 +321,11 @@ the repository's `origin` remote points at GitHub. Without any of those the
 title is simply absent and nothing else changes: the claim still succeeds and
 every listing, dependency and handoff behaves the same.
 
-Under the same conditions a claim assigns the issue to your GitHub account, a
-release unassigns it, and a lane's first `report --state ready` posts that
+Under the same conditions a claim assigns the issue to your GitHub account
+unless someone else already holds it there, in which case the claim records
+their names instead. A release, `issue resolve --release` or the supervisor's
+poll unassigns only an assignee agent-parley added; a failed unassign keeps its
+mark and the poll retries it. A lane's a lane's first `report --state ready` posts that
 lane's summary and evidence as a comment on every issue it claims. These
 mirrors use your own `gh` sign-in and run after the local ledger is written, so
 a forge that is missing, offline or unwilling changes nothing about ownership.
@@ -235,7 +356,9 @@ page carries up to ten messages and a search up to five, each with a
 240-character body preview; `--after-id` continues a thread page and `--limit`
 narrows a search. Where SQLite was built without the full-text index a search
 matches the query as a literal case-insensitive substring rather than as
-indexed terms, and every result names which of the two answered it.
+indexed terms, and every result names which of the two answered it. The index
+covers the whole body of a message that spilled to an attachment, and so does
+decision search; the substring fallback reads only the slice the message keeps.
 
 `--as NAME` names the lane to read instead of taking it from the worktree, so
 `mail show`, `mail thread`, `mail search` and `mail list` answer from the main
@@ -286,6 +409,21 @@ the only compatible combination.
 <!-- compatibility:start -->
 | Launcher | Wire protocol | Store schema |
 | --- | --- | --- |
+| 0.22.0 | 1 | 12 |
+| 0.21.0 | 1 | 12 |
+| 0.20.1 | 1 | 12 |
+| 0.20.0 | 1 | 12 |
+| 0.19.1 | 1 | 12 |
+| 0.19.0 | 1 | 12 |
+| 0.18.2 | 1 | 12 |
+| 0.18.1 | 1 | 12 |
+| 0.18.0 | 1 | 12 |
+| 0.17.0 | 1 | 12 |
+| 0.16.0 | 1 | 12 |
+| 0.15.2 | 1 | 12 |
+| 0.15.1 | 1 | 12 |
+| 0.15.0 | 1 | 12 |
+| 0.14.0 | 1 | 12 |
 | 0.13.0 | 1 | 11 |
 | 0.12.0 | 1 | 10 |
 | 0.11.0 | 1 | 10 |
@@ -321,9 +459,14 @@ metadata is used only for a package installed without one.
 
 `doctor` prints the launcher version and protocol, the protocol each shipped
 plugin manifest declares, the store's schema against the schema this build
-writes, and the `service` component naming the code a running service answers
-from, then a verdict line. Each line carries the state this build puts that
-component in, printed in upper case when the build does not accept it.
+writes, the `service` component naming the code a running service answers
+from, `projects` (each registered root that no longer exists), `notify`
+(whether outbound and inbound notification are active) and `approvals` (each
+lane lacking the resume opt-in), the host platform, then a verdict line. A
+missing root, or notification configured but unable to send, makes the verdict
+not consistent; notification that is off and an `approvals` setup gap do not.
+Each line carries the state this build puts that component in, printed in
+upper case when the build does not accept it.
 
 The `service` component has three states. `not running` means nothing answered
 on the configured port, which is no drift. It is still an outage wherever a
@@ -344,7 +487,53 @@ The first hook to read the published record of that gone process asks for a
 new service, so the relaunch follows the stop. `status` prints the same drift
 as a
 `Code: stale` line, and `agent-parley up` then starts a service on the code in
-the checkout.
+the checkout. A service that answers ready on a package version other than the
+launcher's is `stale` too: it normally re-executes itself once it sees its
+sources move, and when it has not, `agent-parley down` then `agent-parley up`
+restarts it on this version.
+
+#### Plugin and server version drift
+
+Each supported CLI gets one `<cli> plugin` line per config home that holds the
+plugin: the CLI default, the directory the shell exports (`(shell)`) and each
+credential profile a lane runs on (`(<profile>)`). The line names the
+installed plugin version, and the launcher line above it names the version it
+is expected to match. A plugin on another version is `stale` and a plugin
+declaring a protocol this build refuses is `mismatch`; either fails the
+verdict and exits non-zero. The remedy names both paths: a running service
+reinstalls a stale plugin on its own and names the lanes to restart, and on a
+cold estate with no service `agent-parley plugins install` does the same. A CLI
+with the plugin in no home is reported from the bundled manifest and does not
+fail the verdict.
+
+`doctor --json` carries the same reading for scripts:
+
+| Field | Meaning |
+| --- | --- |
+| `plugins[].cli` | `claude` or `codex`. |
+| `plugins[].home` | `default`, `shell` or the credential profile name; never a path. |
+| `plugins[].version` | Installed plugin version, empty when not installed. |
+| `plugins[].expected` | Launcher version the plugin should match. |
+| `plugins[].state` | `ok`, `stale`, `mismatch` or `not installed`. |
+| `server.version` | Version the running service answers on, empty when none answers. |
+| `server.expected` | Launcher version the service should match. |
+
+`doctor` only reads: it opens no network connection beyond the local health
+request to the configured port and writes nothing.
+
+The `projects` component is `ok` while every registered project's root
+checkout exists. A project whose root is gone, such as a probe run from a
+temporary directory, puts it in `root gone`, names each such root, and makes
+the verdict not consistent until the checkout is restored or that project's
+state folder is removed. The remedy names the command for each root:
+`agent-parley gc --project ROOT` reports the removal and `--apply` performs
+it. It refuses while the root exists, while any lane's session process may
+still run, and before the service has retired the project's lanes, which it
+does one supervision interval after it finds the root gone. While the service
+records a lane whose retirement it refused, it names each such lane and its
+refusal and refuses too, unless `--yes` deletes that work with the rest. The
+project's recovery checkpoints move to `recovered/` under the state root,
+named by the project's key, unless `--yes` deletes them with the rest.
 
 The store has four states. `absent` means no store has been created yet, which
 is consistent because the service writes it at the current schema. `ok` means
@@ -358,10 +547,11 @@ The verdict names one command per distinct cause, because a store behind this
 build and a plugin speaking another protocol need different commands. A behind
 store is resolved by `agent-parley up`, which migrates it in place and leaves
 a running service and every lane running; a newer store by installing the
-build that wrote it; a plugin mismatch by reinstalling the plugin. Its exit
-status is non-zero on a mismatch, so a
-script can gate on it. It reads only: it opens no lane, writes no configuration,
-repairs nothing, and prints no credential or profile path.
+build that wrote it; a plugin mismatch by `agent-parley plugins install`,
+restarting any lane already running on the old one. Its exit status is
+non-zero on a mismatch, so a script can gate on it. It reads only: it opens no
+lane, writes no configuration, repairs nothing, and prints no credential or
+profile path.
 
 Drift is refused where the call already crosses a boundary, not discovered
 mid-turn:
@@ -372,7 +562,10 @@ mid-turn:
   wrote, so the hook boundary is checked locally and no hook reaches the network
   to learn a version.
 - A served call declaring an unaccepted protocol in its `Agent-Parley-Protocol`
-  header is denied with both numbers, and `top` counts that denial.
+  header is denied with both numbers and the command that reinstalls the
+  plugin, and `top` counts that denial; that lane is already running on the
+  old plugin, so it must be restarted after the reinstall, not merely
+  retried.
 - Opening a store written by a newer schema is refused, never migrated
   downwards, exactly as a newer project manifest already is.
 - A hook whose read fails on a store behind its build migrates the store in
@@ -398,7 +591,9 @@ The command derives its rows from the same reading `status` and `top` print,
 the supervision thresholds and the store classification, and writes nothing.
 Rows are ordered by how long each has held, longest first; a store or service
 row carries no age and leads the list, because no lane can be acted on until
-the store is usable and the service is up. One lane holding twenty messages,
+the store is usable and the service is up. Rows older than a day follow the
+rest under an `Older than a day:` heading, so current work is read first.
+One lane holding twenty messages,
 three overdue claims or four changed files is one row per cause, carrying how
 many items that row covers and the age of the oldest, so the list is as long
 as the work rather than as long as the backlog. Each row names the lane, the
@@ -407,31 +602,45 @@ condition, that count, its age and what clears it:
 | Condition | When | Clears with |
 | --- | --- | --- |
 | `store` | The store schema is behind or ahead of this build. | The `doctor` remedy for that state. |
-| `service` | The coordination server is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
+| `service` | The coordination service is not running, is not ready, or is serving a build older than the installed code. | `agent-parley up`, or `agent-parley down && agent-parley up` for a stale one. |
 | `supervision failing` | The supervision poll of a project has been failing since the time the row ages from, naming the last failure. | Read `server.log` in the state directory and fix the stage it names; the next clean poll clears the row. |
 | `stalled` | A lane reading `idle` holds mail older than `stalled_after` and served no call inside it. | Whatever the lane's state allows, from the remedy table below. |
 | `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
-| `wake attention` | The service's last wake of the lane was refused because operator input is pending, the client is waiting for a native approval or the previous accepted wake produced no checkpoint, or the wake needs operator attention. | Whatever the lane's state allows, from the remedy table below. |
-| `waiting on approval` | The lane's client has waited on a native tool approval prompt for longer than `--ack-after`. | Answer the prompt in the lane's own terminal. |
-| `held by a native dialog` | The launcher escalated a native dialog it could not answer; the row names the dialog and the options it offers. | Answer the prompt in the lane's own terminal. |
+| `wake attention` | The service's last wake of the lane was refused because operator input is pending, the client is waiting for a native approval or the previous accepted wake produced no checkpoint, or the wake needs operator attention; or the wake was not delivered, which the row states as `wake attempted at T, not delivered:` and its reason, such as a client started outside `agent-parley run` with no wake socket. | Whatever the lane's state allows, from the remedy table below. |
+| `waiting on approval` | The lane's client has waited on a native tool approval prompt for longer than `--ack-after`, and its session process is not known to be gone. | Answer the prompt in the lane's own terminal. |
+| `held by a native dialog` | The launcher escalated a native dialog it could not answer and the lane's session process is not known to be gone; the row names the dialog and the options it offers. Once that process is gone the row disappears and the lane carries only the stopped remedy. | Answer its decision from the chat, or the prompt in the lane's own terminal. |
 | `second session` | Another client process is sending hooks under the lane's identity; its events are ignored. The row names its session and process. | Stop that process, or run it outside the lane's worktree. |
 | `overdue claim` | One or more held issues are past their recorded deadline. A claim whose current generation reported ready or was verified complete is never overdue. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
 | `claims over cap` | A lane holds more claims than `max_claims_per_lane`, from a ledger written before every ownership path was capped or a cap lowered after the claims were taken. The count is the excess. | `agent-parley issue release NUMBER` for the highest-numbered claim, named in the row, or an offer to a peer. |
-| `unanswered offer` | One or more handoff offers to the same lane have no answer yet. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER NAME --unassign` for an operator offer. |
+| `unanswered offer` | One or more handoff offers to the same lane have no answer yet. Past the offer's own deadline the supervisor cancels it back to the lane that made it; this row can still show it in the gap before the next poll. | `agent-parley issue cancel NUMBER`, or `issue assign NUMBER --unassign` for an operator offer. |
+| `unanswered request` | One or more peer takeover requests wait on the same holder, past the request's own deadline. Its `takeover_grace`, not this row, decides whether it is later granted as an offer. | `agent-parley issue accept NUMBER --offer-id ID` or `issue decline`, or `issue assign NUMBER --unassign` to withdraw it. |
 | `unresolved completion` | One or more claimed issues read closed on the forge, or merged or closed on the lane branch when the forge cannot say, and their holder left `completion_reminders` reminders unanswered. | `agent-parley issue resolve NUMBER` for the oldest, named in the row, with `--release` when the pull request was closed without merging. |
 | `not converging` | A claim's repeated failing verification results outlasted the request to change approach with no verified improvement, so its convergence account escalated. One row per claim; the holder keeps it. | `agent-parley issue show NUMBER` to read the account, then hand off, reassign or redirect the lane explicitly. |
 | `awaiting acknowledgement` | Messages needing acknowledgement have waited past `--ack-after`, which defaults to `stalled_after`. | Whatever the lane's state allows, from the remedy table below. |
-| `holding a refused key` | A lane that is not active refused a peer a reserved key and still holds it. The row names the refused lanes and how long the holder has been quiet. | Whatever the lane's state allows, from the remedy table below; an expired lease of a holder observed idle past `inactive_after` is also reclaimed by the next sweep. |
+| `holding a refused key` | A lane that is not active refused a peer a reserved key and still holds it. The row names the refused lanes, how long the holder has been quiet and its release deadline (`KEY_HOLD_DEADLINE`, 900 seconds from the first quiet sighting). | Before the deadline, whatever the lane's state allows, from the remedy table below; past it, the operator decides: tell the holder to release, or let the refused lanes wait. An expired lease of a holder observed idle past `inactive_after` is also reclaimed by the next sweep. |
 | `bounced share` | A share the sender is still waiting on reached a recipient that cannot act on it. The row sits on the sender's lane. | Whatever the first blocked recipient's state allows, from the remedy table below. |
 | `shares to a retired lane` | Retirement superseded shares the lane still owed; the row sits on the retired lane, counts them and lasts while their acknowledgement deadlines run, or one day for a share without one. It is informational. | Nothing; the row clears when those deadlines pass. |
 | `recovery refused` | An `issue recover` approval could not proceed on the last poll, because the owner is idle, paused, at an approval prompt or on another session, or the approval is gone. The row sits on the owner's lane, names the issue and the reason, and lasts while the refused claim is the issue's current claim. | Clear what the reason names in the owner's lane; the service retries the recovery on every poll. |
 | `integration unverified` | The base checkout carries a merge that failed its gate, conflicted or was interrupted, or the record of one cannot be read. One row per project, on the lane that may repair it, naming the kind, the attempt and the gate result; every further merge is held. | The step the row names: rerun `agent-parley participant merge NAME` after the repair, `--renew-recovery` once attempts are used, or `agent-parley participant merge --verify-recovery` when no lane may repair it. See [Recovering an unverified integration](#recovering-an-unverified-integration). |
-| `root missing` | The project root checkout is gone. Once it has been gone an interval, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
+| `unattended integration failed` | The service's own attempt under an unattended policy recorded with `--auto` failed after the lane was found eligible, as a gate, approval or merge failure. One row per lane while that decision is its newest and its claim is current. | Clear what the reason names, then `agent-parley unattended run NAME --issue N`. |
+| `crossing ready` | The project records an integration base, no claim is held, at least one issue landed there by a merged pull request is still open on the forge, and the cached reading holds every open issue. One row per project names the landed issues still open and ages from the newest landing or the newest claim end, whichever is later; with notifications configured it opens one decision, which never applies anything. The decision opens only while that age is under one day. | `gh pr create --head BRANCH`, naming each landed issue as `Closes #N`; review and merge it yourself, since that merge cannot be undone. |
+| `checks stalled` | Supervision marked an open pull request's pending head stalled; the lane was already told once. The row names the pending checks and clears when the head finishes or changes. | `gh pr checks URL`, then re-run once with `gh run rerun RUN --failed`, cancelling first a run still in progress past its job timeout. |
+| `checks failed` | An open pull request's checks are red with at least one check the forge ran and failed, or its head is pending on the one automatic re-run supervision requested. The row names the attempt and the failed checks. | `gh pr checks URL`, then fix and push or re-run; while the automatic re-run is pending, wait for its conclusion; after it, run the re-run command the row names yourself, or fix and push. |
+| `ci rounds exhausted` | An open pull request's head is red after it used its CI rounds: the `ci_rounds` supervision setting (2) plus any round the operator granted. A round is a head commit whose checks finished; a re-run on the same head is not a new round. The lane was told once to stop pushing and report blocked, and one decision offers `grant one more round` or `take over`. The row replaces `checks failed` for that pull request and clears on a green head. | Answer the decision: a grant lets the lane push once more; a takeover stops further decisions for that pull request. The limit is advisory and never refuses a push. |
+| `checks refused` | A required check the forge never started blocks one or more open pull requests. One row per check name and forge conclusion names every pull request it blocks. | Resolve it at the forge (billing, spending limit or manual approval), then re-run once. |
+| `session outliving its claim` | The lane holds no claim, yet a native session in a worktree the lane made showed activity in the last 60 seconds. | `agent-parley status NAME`; Agent Parley never stops such a session. |
+| `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
+| `root missing` | The project root checkout is gone. Lanes retire only once it has been gone `root_gone_after` (an hour by default), and never while its parent directory cannot be listed; the row then says the root is unreachable. Past that, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
+| `root returned` | The project root came back after lanes retired for its absence. The row names those lanes until each is re-admitted. | `agent-parley participant add NAME --repo ROOT` for each lane named |
+| `plugin stale` | These live lanes run an old plugin: the service refreshed it after their sessions started, or their recorded `plugin_version` differs from the launcher. One row per project names them all. A refresh that failed is named with the CLI's error instead; the service retries it. | End the oldest named session, then `agent-parley run NAME --repo ROOT --resume`; for a failed refresh, `agent-parley plugins install` |
 | `escalated plan revision` | A lane's plan revision touched an edge already revised back and forth under the current plan version, so it was escalated instead of applied. One row per escalated proposal, on the proposing lane, among the retained proposals. | `agent-parley plan approve ID` or `agent-parley plan reject ID --reason TEXT` |
 | `plan revisions pending` | Plan revisions outside the operator's envelope wait for a decision. One row per project counts them and ages from the oldest. | `agent-parley plan proposals`, then approve or reject each |
-| `ready to retire` | Every claim the lane holds has been orphaned for longer than `orphan_retire_after` and no peer took it. | `agent-parley participant retire NAME` |
+| `orphaned claims` | The lane's session process is gone and the supervisor marked claims it holds orphaned, and the lane is not yet `ready to retire`. The row is derived from the ledger, so it shows whether or not a notification transport is configured. | `agent-parley issue claim N --take-orphaned` from a live peer lane; with no live lane besides the holder, start one with `agent-parley run NAME` and have it take the claim, or `agent-parley issue release N`. |
+| `ready to retire` | The lane's session process is gone, every claim it holds has been orphaned for longer than `orphan_retire_after` and no peer took it. Never shown while the lane's ready report waits on an open pull request. | `agent-parley participant retire NAME`, or `participant retire --ready` for every such lane |
+| `ready to integrate` | The lane's latest report is ready, a claim it holds has an open pull request in the cached forge reading, and the report has waited for integration longer than the default wait ceiling of 3600 seconds. It replaces `ready to retire` and `orphaned claims` for that lane, since retiring or releasing would drop the claim the pull request closes. It clears when the pull request merges or closes, or a newer report supersedes the ready one. Nothing merges on its own. | `agent-parley approve NAME` when the project requires approval and the report is not approved; otherwise review and merge the named pull request, or `agent-parley participant merge NAME`. |
+| `ready without a pull request` | A claim the lane holds has been in the ready state longer than the default wait ceiling of 3600 seconds, the project has a cached forge reading, that reading holds no open pull request for the claim, and no approval is pending. Ready work stays claimed through integration, so a claim whose pull requests all merged or closed while the issue stayed open would otherwise wait for good while the lane is told it waits on CI and review. The row names the longest-ready claim and counts the rest. | Open the claim's pull request, close the issue if its work already merged, or `agent-parley issue release N`. |
 | `branch drift` | The lane left its assigned branch. | `agent-parley participant restore NAME` |
-| `dirty worktree` | The lane holds uncommitted work and is not active, or it retired and its uncommitted work kept the worktree. | Commit or stash the named files in the named worktree; `agent-parley participant add NAME` returns a retired lane to service with that work still in place. |
+| `dirty worktree` | The lane holds uncommitted work, is not active and its session process is gone, or it retired and its uncommitted work kept the worktree. | Commit or stash the named files in the named worktree; `agent-parley participant add NAME` returns a retired lane to service with that work still in place. |
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
 | `run budget exhausted` | The project's enforced run budget is used up or its ledger was unreadable or missing; no wake, dispatch, retry or launch starts. | `agent-parley budget resume` after raising the limit, or `--reset` |
 | `run budget unmetered` | A lane has no readable token records while a token limit is enforced, or a live session not started by `agent-parley run` while an hours limit is, so it is refused wakes, dispatch and retries. | `agent-parley budget enforce --tokens 0 --hours 0`, or relaunch the lane with `agent-parley run` on a provider whose transcripts Parley reads |
@@ -498,18 +707,24 @@ agent-parley plan show --json
 `plan apply` records exactly the advisory dependencies `issue block` records and
 nothing else. It claims no issue, assigns no lane and gates no transition, so a
 plan that turns out to be wrong blocks nobody. Run `plan diff` first to see the
-edges an apply would add before it adds them.
+edges an apply would add before it adds them. Only the operator applies, from
+the project base checkout; a lane's `plan apply` is refused, because the plan's
+`[revisions]` table bounds what lanes may revise alone.
 
 `plan show` prints the applied plan as an indented tree, each issue under the
 issues it waits on, with its current owner and any recorded forge title beside
 it. Each apply records a version carrying the file's digest and the identity
-that applied it, and the twenty most recent versions are kept.
+that applied it, and the twenty most recent versions are kept. Re-applying
+the file the latest apply recorded, when it would add no edge, records
+nothing and keeps open revision proposals and the revision budget.
 
 Applying adds edges and never removes one. An edge entered with `issue block`
 after the apply is listed as `recorded by hand`, and an edge the file no longer
 names stays in the ledger and is reported by `plan diff` as `unlisted` until
 `issue unblock` removes it, so the document and the ledger never silently
-disagree.
+disagree. An edge an accepted revision removed is not restored by a later
+apply: `plan diff` lists it as `revoked` with the removing proposal, and
+`plan apply` refuses until the file drops it or `--force` restores it.
 
 A plan that names a malformed issue number, exceeds a bound, or describes a
 dependency cycle is refused before any edge is written. The cycle check covers
@@ -573,8 +788,10 @@ lane can repair it, because the issue is unheld or complete or the lane
 retired, fix or reset the base yourself and run `participant merge
 --verify-recovery` from the base checkout: it runs the recorded gate on the
 base as it stands and clears the record only if the gate passes and the tree
-stays clean. Nothing is reset or reverted for you. See the architecture contract for the record's
-fields, its migration and its evidence limits.
+stays clean. Nothing is reset or reverted for you. Both flags are operator
+decisions: either one run inside a lane's worktree, or with a lane's
+credential, is refused. See the architecture contract for the record's fields,
+its migration and its evidence limits.
 
 `plan show` and `status` mark a group whose every member is reported ready, and
 the `top` header counts those groups, so an integrable set is visible before
@@ -591,7 +808,7 @@ agent-parley participant merge --outcome ready
 agent-parley issue assign 42 --idle --provider codex
 ```
 
-`say`, `issue assign`, `participant stop`, `participant pause`,
+`say`, `mail send`, `issue assign`, `participant stop`, `participant pause`,
 `participant resume`, `participant pr` and `participant merge` take a lane
 selector where they otherwise take a positional name. `--all` selects every
 lane; `--provider NAME`, `--outcome STATE`, `--drifted`, `--idle` and
@@ -670,14 +887,16 @@ why a key is worth reusing for a retry and not for bookkeeping.
 
 ### Deadlines and attempt budgets
 
-A claim, a handoff offer and an acknowledgement can carry a deadline:
+A claim, a handoff offer, a takeover request and an acknowledgement can
+carry a deadline:
 
 ```sh
 agent-parley issue claim 42 --within 2h
 agent-parley issue offer 42 --to codex --summary "commit, checks" --within 30m
+agent-parley issue request 42 --summary "claude is idle" --within 30m
 agent-parley say codex "Confirm the schema change" --ack --within 15m
 agent-parley deadlines show
-agent-parley deadlines set --claim 4h --offer 30m --ack 15m --attempts 3
+agent-parley deadlines set --claim 4h --offer 30m --request 30m --ack 15m --wait 2h --attempts 3
 ```
 
 **An overdue claim moves only when its holder is silent.** Past its deadline
@@ -695,11 +914,18 @@ A lane that reports `blocked` on an issue it still holds spends one attempt.
 budget is another visible state with the same guarantee: what to do about it
 stays the owner's or the operator's decision.
 
-`deadlines set` records the defaults every claim, offer and acknowledgement
-inherits when it passes no `--within`, so lanes carry a budget without repeating
-a flag. Windows take the same units as `--since` (`45m`, `6h`, `7d`), and a
-project that records none gives a claim and an offer a deadline only when they
-ask for one.
+`deadlines set` records the defaults every claim, offer, takeover request and
+acknowledgement inherits when it passes no `--within`, so lanes carry a budget
+without repeating a flag. Windows take the same units as `--since` (`45m`,
+`6h`, `7d`), and a project that records none gives a claim, an offer or a
+request a deadline only when they ask for one.
+
+A lane that waits on something outside its control reports
+`report --state waiting --until SECONDS` with a summary naming what it waits
+on. The claim keeps its phase, `status` and `top` show the lane as waiting on
+that reason with its next-check time, and the supervisor defers waking it
+until then. `--wait` caps how far ahead `--until` may put that next check; with
+none recorded the cap is 3600 seconds.
 
 **Every acknowledgement request carries a deadline.** A send marked
 `ack_required` that names no window takes the project's `--ack` default, and a
@@ -745,6 +971,17 @@ reading as a `bounced share` row on the sender's lane while it holds. A request
 the operator sent is not returned this way: that operator is at a terminal and
 already reads it as awaiting acknowledgement.
 
+Mail to a dead lane is returned the same way, whether or not it asked for an
+acknowledgement. Once a lane's state record has read `dead` for 30 minutes
+(`DEAD_MAIL_AFTER`, long enough for a resumable session to have been resumed),
+each delivery to it that has waited 30 minutes and is still unread or
+unacknowledged is superseded with the reason `<lane> dead past 1800s`, which
+also drops it from that lane's wake backlog. Each sender that is a lane gets one
+`Mail returned: <lane> is dead` notice listing the messages, so it can resend
+them to a live peer or hold the work. Mail the operator sent is superseded
+without a notice. Nothing is read, acknowledged or deleted, and other
+recipients keep their delivery.
+
 Deadlines are evaluated when a checkpoint, a `status`, a `top` refresh or a
 served call reads the record, from the stored timestamps. The service gains no
 background scheduler, and a stopped service produces no phantom transitions. The
@@ -777,7 +1014,10 @@ prints the lane's own limits and its standing against the limits that apply.
 Consumption is measured from readings that already exist. Tokens are what the
 lane's own native client recorded for its session, exactly as the `TOKENS`
 column reports them: no vendor request, no key, no price, so a token budget is
-a count and **not** spend. Calls are the coordination calls the store served
+a count and **not** spend. Tokens are read for `claude`, `codex`, `copilot`,
+`gemini` and `opencode` lanes; an `amp` lane is not measured, and a `copilot`
+lane counts only once its session ends
+([Token reading](providers.md#token-reading)). Calls are the coordination calls the store served
 for the lane within retention. Hours are how long the session process the
 launcher recorded has been alive; a stopped lane counts no hours.
 
@@ -897,8 +1137,8 @@ and recorded as exhausted, so unknown prior use never reads as none.
 
 **Resume and reset.** Raising, removing or clearing a limit is an operator
 action. `budget enforce` and `budget resume` refuse to run when
-`AGENT_PARLEY_TOKEN` is set, as it is in a launched lane's environment, and no
-MCP tool changes the run budget. A lane's hook also denies a shell command that
+`AGENT_PARLEY_TOKEN` is set, as it is in a launched lane's environment, or
+when run from inside a lane worktree, and no MCP tool changes the run budget. A lane's hook also denies a shell command that
 runs `agent-parley budget enforce` or `budget resume`, so unsetting the
 variable in the same command does not slip past. Nothing here is enforcement:
 both refusals only prevent accidental use from a lane, are not an authority
@@ -976,6 +1216,12 @@ conflated.
 condition and the deliveries it has left; `mail cancel ID` removes one before it
 is delivered. `status` counts a lane's pending operator items.
 
+`mail pending` also lists, under `orphans`, the orphan decision for each lane
+holding orphaned claims: the remedy `problems` prints, which is a live peer's
+`issue claim --take-orphaned` or, when no live lane can take them, the
+operator's commands. It is read from the ledger, so it appears whether or not a
+notification transport is configured.
+
 ### Attaching what does not fit
 
 Every coordination payload has an explicit UTF-8 byte cap: a message body
@@ -1003,7 +1249,15 @@ attachment is readable by its own lane.
 
 One attachment is capped at 65,536 bytes and a lane holds at most 1 MiB of
 attachments in total; a body past either cap is refused with the cap named.
-A message attachment lives as long as its message; a report attachment is
+When a long message would pass the lane's
+allowance, the lane's oldest message attachments that every recipient has read
+are released first, only as far as the new body needs. A released attachment
+reads as released and its message keeps the first slice. A message with an
+unread recipient, or with no recipient such as a feed-only post, keeps its
+attachment. The allowance is counted from the index `attachments/held.json`,
+which lists each lane's unreleased attachments, so a long send costs the same
+however many attachments were ever written; a state directory without the
+index rebuilds it once from the metadata files. A report attachment is
 removed when the report log rotates past that record; an offer attachment is
 removed when the offer is declined, cancelled or replaced, and an accepted
 offer keeps it until the issue is released. `top` and `status` count as
@@ -1015,7 +1269,7 @@ branch with a `!` when a lane left its assigned branch, issues owned and
 handoffs pending, unread and unacknowledged mail, held leases with the age of
 the oldest, delivered context, denials against retained hook events, served
 MCP calls with rejections, and the tokens that lane's own native client
-recorded. The header carries server health, the project's denial rate and
+recorded. The header carries service health, the project's denial rate and
 how long the frame took to read. The view is read-only and makes no model
 call; `q` leaves it.
 
@@ -1043,8 +1297,8 @@ minimum. When the set does not fit, columns are dropped in this order, and
 the header names the ones that went:
 
 ```text
-PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS, UNUSED, LEASES, FIT, IDLE,
-REVIEW, ISSUES, DENIALS
+PROVIDER, EVENT, BRANCH, CONTEXT, CALLS, TOKENS, UNUSED, TASK, LEASES, FIT,
+IDLE, REVIEW, ISSUES, DENIALS
 ```
 
 `PARTICIPANT`, `STATE` and `MAIL` are never dropped; if they alone still do
@@ -1079,7 +1333,8 @@ matched by path or by its trailing directory name.
 
 Branch drift, a stale lease, a rejected call, an overdue issue and a lost
 session process are drawn in colour where the terminal reports colour
-support and in bold where it does not. Each also prints its own `!` or word
+support and in bold where it does not; set `NO_COLOR` to keep emphasis
+bold-only. Each also prints its own `!` or word
 in the table, so a monochrome terminal and a piped capture read the same.
 The legend that explains the columns moved behind `?` and out of every
 frame.
@@ -1217,11 +1472,20 @@ competing reservation is judged by, and against the paths the lane itself
 holds: those committed on its branch and those still uncommitted in its
 worktree. A match is printed as an indented line under the lane's row in `top`,
 under the reservation count in `status`, and carried in the
-`base_advance_paths` field of `top --json` and `status --json`. The lane's
-lifecycle hook delivers one bounded advisory notice naming those paths and
-stating that nothing was rebased; the notice repeats only when the set of paths
-changes, which the hook records in the lane's activity state. Nothing rebases,
-pauses or reverts, and a Git failure or timeout reports nothing rather than an
+`base_advance_paths` field of `top --json` and `status --json`. The owning lane
+is told once per set of moved paths, through the path that already carries its
+coordination: the lifecycle hook at its next event, or the polled delivery file
+for a CLI without hooks. Neither path wakes the lane for it, so an idle lane
+reads it with its next wake and a working one at its next natural stop. The
+bounded notice names those paths, states that nothing was rebased, and gives
+the command that rebases the lane, `git -C <lane> rebase <base>`, where the
+base is the branch checked out in the base checkout or its commit when that is
+detached. It counts against the same injection budget as every other notice
+and repeats only when the set of paths changes. The delivery time is recorded
+in the lane's activity state, and the marker in `top` and `status` ends with
+`lane told <UTC time>` or `lane not told yet`; `top --json` and `status --json`
+carry it as `base_advance_told_at`. Nothing rebases, pauses or reverts, and a
+Git failure or timeout reports nothing rather than an
 error.
 
 Every recorded decision carries the failure that produced it, when one did, so
@@ -1277,9 +1541,13 @@ version changed — and a blank cell means "not read", never "spent nothing".
 Claude is read from that client's transcript for the lane's working directory.
 Codex is read from the rollout whose own record names that lane, searched only
 in the last two days of rollouts, so a Codex session older than that reports
-nothing. Reading is incremental: each refresh folds only the records appended
-since the previous one, up to 1 MiB per lane, so watching a long session never
-re-reads its history.
+nothing. Copilot is read from the latest `session.shutdown` event of the
+newest session whose start names that lane, Gemini from the chat logs of the
+project `.gemini/projects.json` maps the lane to, and OpenCode from the
+session counters in `opencode.db` for the lane directory. An `amp` lane prints
+`n/a`: its client keeps no local usage record. Reading is incremental: each
+refresh folds only the records appended since the previous one, up to 1 MiB
+per lane, so watching a long session never re-reads its history.
 
 `UNUSED` is the lane state accounting `status` prints on its `Lanes:` line,
 per lane: idle lane-minutes per observed lane-hour, then unaccountable
@@ -1325,6 +1593,46 @@ peer claim with no progress past the stall interval to ask for with
 lane to call the `retire` MCP tool rather than answer with a status line. A
 lane that can still resume a claim is told to resume it, and the claims that
 wait are listed after it.
+
+**Lanes woken together are pointed at different work.** One sweep offers
+work to lanes in name order, and each lane's next candidate, or the first
+issue its pull offer lists, skips the issues already named to an earlier lane
+while another candidate remains. The offer records that issue as `lead` in
+the lane's `<lane>-work.json`, and `agent-parley issue next` ranks an issue
+another lane's `lead` names below every issue no lane was pointed at. The
+offer and `issue next` both tell the lane to claim before exploring or
+editing, because the claim is what settles a race. Offers stay advisory:
+nothing is claimed for a lane.
+
+**New forge issues are offered before anyone claims them.** An issue enters
+the ledger only when it is claimed, planned or assigned, so pull offers, next
+leads and `issue next` also read the open issues in the poll's
+`forge-issues.json` cache. An open issue the ledger has no record of counts
+as unclaimed and unblocked, with its forge title, unless a forge account other
+than yours is assigned to it or it carries one of the `forge_skip_labels`
+supervision setting's labels (`blocked`, `wontfix`, `question` and `duplicate`
+by default). A cache older than twice
+the refresh interval, or a missing one, adds nothing, and the ledger itself is
+never written for this.
+
+**Work already merged into the integration base is not offered.** A
+`Closes #N` merged into the recorded integration base leaves the issue open
+on the forge until the base crosses to the default branch. Each forge refresh
+also reads the messages and committer dates of
+`git log origin/HEAD..<integration base>` in the base checkout, preferring the remote-tracking branch, and records the issues those
+messages close as `integration_closed` in `forge-issues.json`. Pull offers,
+next leads and `issue next` then leave out each such issue nobody owns or has
+a pending offer for. Without an integration base, without `origin/HEAD`, or
+when Git refuses or takes longer than three seconds, nothing is left out.
+
+A squash crossing writes one new commit to the default branch, so the old
+integration commits never become ancestors of `origin/HEAD` and keep naming
+their issues while the base stays recorded. An issue the forge last updated
+after the committer date of every commit that closes it, as a reopened issue
+is, is therefore not left out. After a crossing, point the base at the next
+milestone's branch with `agent-parley branch integration BRANCH`, or clear it
+with `agent-parley branch integration ""`, so finished milestones stop
+filtering offers.
 
 **An idle holder offers the split itself.** A claim held by a lane that has
 gone quiet on it is a defect that reads as healthy: the claim is held, the
@@ -1379,8 +1687,10 @@ non-ignored untracked content, and marks the claim recoverable. A refusal from
 the provider, elapsed time, or the approval alone cannot transfer ownership.
 Recovery also refuses while the owner is paused, waiting for a native approval,
 or waiting for more operator input. The command itself refuses inside an
-assigned worktree, even with `--repo` pointing at the base checkout, so a lane
-cannot approve recovery of its own or a peer's claim.
+assigned worktree, even with `--repo` pointing at the base checkout, and in
+any process holding a lane's `AGENT_PARLEY_TOKEN`, even after it changes
+directory to the base checkout, so a lane cannot approve recovery of its own
+or a peer's claim.
 The receiving lane still runs `issue claim 42 --take-orphaned`. That claim
 revalidates the stopped process and ownership generation, moves only the old
 claim's reservations, fast-forwards to the captured committed HEAD, and restores
@@ -1407,6 +1717,11 @@ service takes the capture after it has answered the hook, so a slow bundle
 never delays a native call. The old session generation is refused by later
 lifecycle hooks after takeover; this is runtime fencing, not a filesystem
 security boundary against another process writing directly into the old lane.
+Its tool calls are denied, but its `Stop` is let through with the transfer
+shown, so a returning session ends its turn instead of looping on refusals.
+The service never wakes a fenced session with `run --resume`, and a manual
+`agent-parley run NAME --resume` of it is refused; start a new session
+instead.
 
 `--since` narrows every event count to a window that ends at the current
 reading, so `agent-parley top --since 6h` answers what happened in the last six
@@ -1452,6 +1767,11 @@ from a claim to the pull request that ended it.
 `--provider`, `--issue` and `--since` combine on any listing, and `--json`
 prints one document with a `records` array, consistent with the snapshot
 contract below. `--output PATH` writes that document to a file instead.
+Mail and reservations are read at most 500 rows each, newest first, after the
+lane, claim and `--since` filters apply, so one lane's records are never
+crowded out by other lanes. When that cap leaves older matching rows out, the
+listing ends with `Older records omitted; narrow with --since.` and the JSON
+document carries `"truncated": true`.
 
 **A correlation key follows the work.** Every claim carries its own identifier,
 minted again on each claim and each accepted handoff, so releasing and
@@ -1464,10 +1784,25 @@ report log, and the pull request that ended the claim.
 record is rewritten, so a history query is safe beside running lanes. Retention
 follows each substrate: the issue ledger keeps its records until the project is
 removed, the report log keeps the newest 2000 records and is rewritten in
-place once it passes 256 KB, and mail and reservations keep theirs for as long
-as the store does. A record written before this correlation existed carries
+place once it passes 256 KB, and mail and reservations follow the store
+retention below. A record written before this correlation existed carries
 no claim and is reported as `unknown`; nothing is back-filled, because an
 invented correlation is worse than an honest gap.
+
+**Store retention.** The service prunes settled store rows older than 90 days
+when it starts and then once an hour, in batches of 5,000 rows per write
+transaction. A recipient's copy of a message goes once it is acknowledged, or
+read when no acknowledgement was asked for; the message goes once no copy is
+left. Released reservations, answered reservation requests and delivered or
+cancelled scheduled items go too. Unread and unacknowledged mail, decisions,
+live reservations, queued requests and pending scheduled items stay at any
+age. A message that ends with an attachment marker stays with its copies,
+because its search entry holds the full body and deleting the row would
+damage the search index; its attachment stays bounded by the writer's
+allowance. The newest row of each table always stays, so an identifier is
+never handed out twice. A history window cannot reach past rows that
+retention removed. Freed pages stay in `bridge.sqlite3` for reuse rather
+than shrinking the file.
 
 ### Following one lane
 
@@ -1566,10 +1901,16 @@ output, on a single line, and exits 1 as it does without `--json`:
 {"schema": "agent-parley/read/v1", "kind": "error", "generated_at": "2026-09-27T10:00:00Z", "error": {"type": "bridge", "message": "No participant named nobody"}}
 ```
 
-`type` is `bridge` for a coordination refusal, `os` for a file or network
-failure, `value` for an invalid value and `timeout` for an external command
-that ran out of time. `message` is the same text the `agent-parley:` line
-prints on standard error, which still appears; no traceback is printed. The
+`type` is `bridge` for a coordination refusal, `timeout` for an external
+command that ran out of time, `os` for a file or network failure, `missing`
+for an internal lookup that found nothing, `store` for a failure reading or
+writing coordination state, and `value` for anything else, such as an
+invalid value. `message` is the same text the `agent-parley:` line
+prints on standard error, which still appears; no traceback is printed. A
+`missing` document also carries `where`, the `file:line` of the innermost
+frame that raised it, which the message repeats. A state file such as
+`config.json` or a project manifest that lacks a required key is a `bridge`
+refusal naming the file and the key instead. The
 document goes to standard output so `agent-parley ... --json | jq` reads a
 failure the same way it reads a result. A command that already wrote part of
 its output before failing is not rolled back: the error document follows on
@@ -1587,7 +1928,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `plan`, `plan_diff`, `plan_proposals`, `plan_revision`, `approval`, `verify`, `init`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials`, `credentials_show` or `error`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `report_usage`, `plan`, `plan_diff`, `plan_proposals`, `plan_revision`, `approval`, `verify`, `init`, `pool`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials`, `credentials_show`, `issue_resolve`, `issue_recover` or `error`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -1604,7 +1945,13 @@ reports the `issue` asked for, the ledger `revision`, its `record` as the
 the advisory `reservations` its owner holds, and the same `history` document
 `history issue N --json` prints. `participant show --json` reports every field
 a `status` participant carries, plus the `worktree` the lane lives in, the
-advisory `budget_limits` the manifest records and `wake_enabled`.
+advisory `budget_limits` the manifest records, `wake_enabled`, and
+`launch_timing`: the `worktree`, `init` and `start` seconds of the lane's last
+launch, their `total`, and the epoch time `at` the native CLI started, or an
+empty object before the first launch completes. `pool show --json` reports the
+configured `size` and one `spares` row per spare naming its `worktree`,
+`branch`, `base` and `state` (`ready`, `preparing` or `stale`); `status --json`
+carries the same reading as each project's `spares`.
 `mail list --json` reports `limit`, `messages` newest first and `has_more`.
 `approval show --json` reports `root`, the `approval` steps and `required`;
 `branch show --json` reports `root` and `prefix`; `forge show --json` reports
@@ -1612,16 +1959,29 @@ advisory `budget_limits` the manifest records and `wake_enabled`.
 `manifest`. `provider show --json` reports the definition beside its
 `provider` name, and `credentials show --json` reports `credential`,
 `config_home`, `env` as `NAME=<redacted>` entries and `require_env`: no
-recorded value is printed. `problems ack --json` reports the message `id` and
-the `participants` the acknowledgement was recorded for.
+recorded value is printed. A profile that sets none of the three also reports
+`account` as `selects no account`. `problems ack --json` reports the message `id` and
+the `participants` the acknowledgement was recorded for. `provider add --json`
+and `credentials add --json` report the whole `providers` or `credentials`
+registry the definition joined. `issue resolve --json` reports `issue`,
+`outcome` (`complete` or `release`), the former `holder`, the resulting
+`owner` and execution `state`, and the forge `evidence` it acted on.
+`issue recover --json` reports the approval `id`, `issue`, `claim_id`, `owner`,
+the live session it is bound to as `session_id`, `session_pid` and
+`session_ticks`, `reason`, `authorized_by` and `authorized_at`. Without `--json`
+these commands, and `setup`, print a short confirmation, with the next
+command where one applies; `--json` is the stable machine form.
 
 `issue next --json` reports the reading lane as `participant`, its `provider`,
 `forge_paths` stating whether the forge answered with any paths at all, and
 `candidates`. Each candidate carries `issue`, the recorded `title`, its plan
 `group` and whether that group is `group_underway`, the owned issues it
 `unblocks`, the `provider` it declares, the peer `overlaps` and forecast
-`collisions` its likely paths run into, and the ordered `reasons` for its
-place.
+`collisions` its likely paths run into, `named_to`, the other lane whose
+published work names it as next work or empty, `same_files`, the claims
+this lane holds whose paths its forecast paths run into, `held_back`, the
+other lanes' live claims doing so as `issue` and `owner` records, and the
+ordered `reasons` for its place.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory`, `inbound` as
@@ -1630,7 +1990,9 @@ and one entry per project holding
 `root`, its private state `directory`, `root_missing` when the root is no
 longer a directory, `dormant` when the root is gone or every lane has been
 stopped for a long time, `reclaim` as the last sweep's `state_bytes`,
-`reclaimable` and `forceable` worktrees and when it was `swept`, the issue
+`reclaimable` and `forceable` worktrees, when it was `swept` and the steps it
+refused as `errors` (null for a sweep published before refusals were kept),
+the issue
 ledger as `revision` and `issues`, `ready_groups` naming the plan groups whose
 every member is held by a lane reported ready, `participants`,
 `supervision_error` as the last supervision failure's `at`, `since` and
@@ -1730,22 +2092,67 @@ every project series `project`. The lane families are
 `agent_parley_lane_issues_held`, `agent_parley_lane_offers_pending`,
 `agent_parley_lane_mail_unread`, `agent_parley_lane_mail_pending_ack`,
 `agent_parley_lane_leases_held`, `agent_parley_lane_leases_stale`,
-`agent_parley_lane_idle_seconds`, `agent_parley_lane_context_bytes_total`,
-`agent_parley_lane_hook_events_total`,
-`agent_parley_lane_hook_denials_total`,
-`agent_parley_lane_served_calls_total`,
-`agent_parley_lane_served_rejections_total` and
-`agent_parley_lane_tokens_total`. The project families are
+`agent_parley_lane_idle_seconds`, `agent_parley_lane_context_bytes_window`,
+`agent_parley_lane_hook_events_window`,
+`agent_parley_lane_hook_denials_window`,
+`agent_parley_lane_served_calls_retained`,
+`agent_parley_lane_served_rejections_retained`,
+`agent_parley_lane_tokens_total`,
+`agent_parley_lane_side_questions_retained`,
+`agent_parley_lane_side_question_tokens_retained`,
+`agent_parley_lane_pull_requests_opened_window`,
+`agent_parley_lane_pull_requests_merged_window`,
+`agent_parley_lane_pull_requests_closed_window`,
+`agent_parley_lane_first_pass_ratio`, `agent_parley_lane_ci_rounds_unknown`,
+`agent_parley_lane_ci_rounds_median` and
+`agent_parley_lane_claim_to_merge_seconds_median`. The project families are
 `agent_parley_project_participants`, `agent_parley_project_idle_seconds`,
-`agent_parley_project_context_bytes_total`,
-`agent_parley_project_hook_events_total` and
-`agent_parley_project_hook_denials_total`, each summed over the rows that
-project reports, so a total never counts a lane the export does not show.
-`agent_parley_lane_hook_denials_by_cause_total` splits a lane's denials by
+`agent_parley_project_context_bytes_window`,
+`agent_parley_project_hook_events_window`,
+`agent_parley_project_hook_denials_window` and
+`agent_parley_project_pull_requests_excluded`; the summed families add up the
+rows that project reports, so a total never counts a lane the export does not
+show. The pull request families are explained in
+[Monitoring](monitoring.md).
+`agent_parley_lane_hook_denials_by_cause_window` splits a lane's denials by
 `reason` and `tool`, so a refusal over a reserved path or an expiring offer
 reads apart from a policy refusal.
+
+Every `_window` and `_retained` family is a gauge, not a counter. A `_window`
+family counts what falls inside the `--since` window, or inside the retained
+hook log when no window is given; the pull request families use the last 7
+days instead. The `_retained` families count the tool events the store still
+keeps. Each can fall between two scrapes as old events leave the window, the
+log rotates or the store retires events, so read them as levels rather than
+through `rate()` or `increase()`. The two side question families count every
+entry in the lane's `agent-parley ask` ledger and ignore `--since`.
+`agent_parley_lane_tokens_total` stays a
+counter: it is the native session's own running count.
 `tokens` is what the native client counted, not billed spend, exactly as the
 `TOKENS` column is.
+
+The twelve 0.18.x names these gauges replaced are still exported as
+deprecated aliases, so a dashboard or alert rule written against 0.18.x keeps
+reading data. Each alias follows its replacement, keeps its 0.18.x `counter`
+type and labels, carries the same samples as its replacement, and says
+`Deprecated: use <replacement>` in its `# HELP` line; in `--json` it also
+carries `"deprecated": true` and a `replacement` key. Move queries to the new
+names: removing the aliases needs a release marked breaking.
+
+| Deprecated alias | Replacement |
+| --- | --- |
+| `agent_parley_lane_context_bytes_total` | `agent_parley_lane_context_bytes_window` |
+| `agent_parley_lane_hook_events_total` | `agent_parley_lane_hook_events_window` |
+| `agent_parley_lane_hook_denials_total` | `agent_parley_lane_hook_denials_window` |
+| `agent_parley_lane_served_calls_total` | `agent_parley_lane_served_calls_retained` |
+| `agent_parley_lane_served_rejections_total` | `agent_parley_lane_served_rejections_retained` |
+| `agent_parley_lane_pull_requests_opened_total` | `agent_parley_lane_pull_requests_opened_window` |
+| `agent_parley_lane_pull_requests_merged_total` | `agent_parley_lane_pull_requests_merged_window` |
+| `agent_parley_lane_pull_requests_closed_total` | `agent_parley_lane_pull_requests_closed_window` |
+| `agent_parley_lane_hook_denials_by_cause_total` | `agent_parley_lane_hook_denials_by_cause_window` |
+| `agent_parley_project_context_bytes_total` | `agent_parley_project_context_bytes_window` |
+| `agent_parley_project_hook_events_total` | `agent_parley_project_hook_events_window` |
+| `agent_parley_project_hook_denials_total` | `agent_parley_project_hook_denials_window` |
 
 A measurement that could not be read reports no sample rather than a zero:
 an unreadable mailbox or session record leaves `mail_unread`, `mail_pending_ack`
@@ -1767,6 +2174,41 @@ on an interval until the command is interrupted, and needs `--output`. There is
 no HTTP endpoint and no new port: the file is the interface, and the
 coordination server's loopback listener is unchanged. The command reads the
 same records `top` reads, takes no lock and writes no coordination state.
+
+### Throughput since an instant
+
+```bash
+agent-parley metrics throughput --since 2026-10-15T09:01:00Z
+agent-parley metrics throughput --since 7d --json
+```
+
+`metrics throughput` reports what each project and each lane delivered since
+an instant, so a release can record a baseline and later measure against it.
+`--since` takes an ISO 8601 instant or a window such as `6h` or `7d`. The
+reading comes from the store and native client records only; it calls no
+model and writes nothing.
+
+Per lane it reports:
+
+- merged issues: ledger claims resolved complete by a merged pull request;
+- active, idle, operator-wait and blocked lane-hours, replayed from recorded
+  lane transitions. Active is `starting` or `working`. Operator wait is
+  `blocked` on a `dialog`, `prompt` or `approval` cause. Blocked is any other
+  blocked cause;
+- input and output tokens from the client's own session records, placed in
+  the window by each record's timestamp. OpenCode records one combined total,
+  so its split prints `n/a`;
+- operator touches: recorded approvals, answered decisions, mail the operator
+  sent, and operator `pause --resume` or `restart`;
+- unattributed starts: a lane started again after `stopped` or `dead`. An
+  operator `run` and a service relaunch record the same transition, so these
+  are counted apart and never guessed;
+- merge-queue waits: ready reports, how many still wait for integration, and
+  the hours they waited.
+
+The project total counts a merged issue and an operator message once. A lane
+whose retained transitions start inside the window is named, because its
+hours understate the window; each project keeps its latest 2000 lane events.
 
 ## Participants, providers and accounts
 
@@ -1822,11 +2264,57 @@ The private project manifest accepts `"supervision"` with `interval` (default
 30 seconds), `inactive_after` (300 seconds), `stalled_after` (600 seconds),
 `start_deadline` (30 seconds),
 `completion_reminders` (3 reminders, 1 to 100), `orphan_retire_after`
-(3600 seconds), `claim_idle_after` (3600 seconds), `takeover_grace`
+(3600 seconds), `root_gone_after` (3600 seconds),
+`claim_idle_after` (3600 seconds), `takeover_grace`
 (300 seconds), `max_claims_per_lane` (2 claims, 1 to 100),
 `convergence_repeats` (3 failures, 1 to 100), `convergence_after`
 (14400 seconds), `prompts`, `wake`,
-`reclaim` and `titles` (all true). Numeric second values range from 1 to 86400 seconds.
+`reclaim`, `titles`, `rerun_cancelled` and `rotate` (all true), `ci_rounds`
+(2 rounds, 1 to 100), `fold_after` (86400 seconds), the retention past
+which a dead lane with no claim and no process is folded out of the default
+`status` and `problems` views, `cache_window` (3300 seconds) and
+`cache_restart_tokens` (50000 tokens, 0 to 1000000000). Numeric second values
+range from 1 to 86400 seconds. `rotate` false keeps a lane resuming its
+recorded native session after a ready or blocked report, or after its prompt
+cache expired, instead of starting a fresh one; see
+[Running lanes](lanes.md#running-unattended). A service wake or resume of a
+lane idle longer than `cache_window` starts a fresh session when the lane's
+session recorded at least `cache_restart_tokens` tokens; 0 restarts every such
+lane. `max_load_ratio` (1.5, above 0
+and at most 1000) and `min_available_mib` (1024 MiB, 0 to 1048576) set the
+host load gate below. `context_full_percent` (80, above 0 and at most 100)
+is the context-window use at or above which a lane counts as full. The use
+is read only where the provider's own session record states the window
+size, which today is Codex; every other lane's use is unknown and never
+counts as full.
+
+### Host load gate
+
+Before every launch, `agent-parley run` takes one reading of the host: the
+one-minute load average divided by the CPU count, and the memory available to
+new work, `MemAvailable` from `/proc/meminfo` on Linux or the free, inactive
+and speculative pages `vm_stat` reports on macOS. A ratio above
+`max_load_ratio` or memory below `min_available_mib` refuses the launch in
+one sentence naming each number, its threshold and the setting that moves
+it, followed by `next: agent-parley doctor`. There is no override flag: set
+the thresholds under `supervision` in the project manifest, or globally in
+`supervision.json`. `min_available_mib` 0 turns the memory check off.
+
+A resume the service would start for unattended dispatch takes the same
+reading. Past the threshold it is not refused: the wake records
+`busy:host load: ...` with the numbers, spends no attempt and the dispatch
+reads `deferred`, so a later poll launches the lane once the host has
+headroom. The reading is taken once per launch or dispatch; nothing samples
+the host continuously.
+
+A reading the host cannot give, such as a missing `/proc/meminfo` or a
+failing `vm_stat`, is not judged, so the launch goes ahead on the readings
+that remain. On native Windows the check is skipped and the launch prints
+one line saying so. `agent-parley doctor` prints the current reading against
+the global thresholds on its `host load` line, and whether `run` would
+refuse; a project's own settings still decide its launches. The sandbox of
+`agent-parley demo` records thresholds that never refuse, because its stub
+lanes only sleep.
 
 Issue convergence is accounted separately from wakes and liveness.
 `convergence.py` keeps one account per owned issue and claim generation in
@@ -1841,10 +2329,13 @@ The account stores only that hash, never report text or logs.
 
 Only verified improvement resets the account: a passing gate line in a
 report of any state, or a passing review of a report no older than the latest
-recorded failure; a failure is a non-zero failure or error count, pytest's
-`FAILED`, a traceback, an `AssertionError`, `not ok` or a non-zero exit
-status, never prose such as `fixed error handling`. Improvement records a
-milestone with its commit. Commits, reservations, reports without
+recorded failure; a failure is a non-zero failure or error count, a gate word
+followed by a failure word such as `make check failed`, pytest's `FAILED`, a
+traceback, an `AssertionError`, `not ok`, a non-zero exit status or a pass
+word negated within three words such as `tests did not pass`, never prose such
+as `fixed error handling`. A failure anywhere in the evidence outweighs a pass
+beside it, so `make check failed, 41 passed` is a failure. Improvement records
+a milestone with its commit. Commits, reservations, reports without
 verification evidence and failing reports never reset it, so a lane that keeps
 editing, reserving and reporting while the same gate fails is still counted.
 The same failure restated at the same commit counts once. A different failure
@@ -1900,7 +2391,8 @@ issue to the requesting lane; the holder answers with `issue accept` or
 `issue decline` and the request identifier, and a holder that neither answers
 nor records progress on the claim within `takeover_grace` has the request
 granted by the supervisor as an offer to the requesting lane, whose acceptance
-moves ownership.
+moves ownership. A request from a lane that has since retired or left the
+project is withdrawn by the supervisor instead of granted.
 The same keys in
 `$AGENT_PARLEY_HOME/supervision.json` set global defaults; global false values for
 `wake`, `prompts` and `reclaim` cannot be enabled by a project. A participant
@@ -1940,7 +2432,35 @@ no lane's reflog moved to, or several did, is attributed to nobody. Only
 when the forge cannot say anything about the issue does the newest pull request
 on the lane branch speak for it, and a lane branch merge never marks a claimed
 issue the forge still reads as open. Issue readings are reused for five
-minutes. Forge lookups are bounded and best effort; an offline forge cannot
+minutes.
+
+A milestone integrated on a branch other than the default branch leaves every
+issue open until that branch crosses, because GitHub closes an issue from
+`Closes #N` only on a merge into the default branch. Record the branch once,
+from the base checkout: `agent-parley branch integration integration/1.0.0`
+(an empty string removes it; lanes are refused). The service then reads, at
+most once per five minutes, and no sooner than one minute after a failed
+read, the newest 100 pull requests merged into that branch, and a claimed
+issue the forge still reads as open whose body a merged pull request closes
+by keyword, inside the claim's generation and from any branch, is observed
+as merged. A keyword inside an HTML comment, a fenced code block or an
+inline code span is ignored, as GitHub ignores it. Like any merged pull request that no other
+lane landed, it ends the claim as complete with actor `supervisor`, the pull
+request, merge commit and base kept in the evidence, so the claim leaves the
+lane, stops counting toward the cap, and is never woken, reminded or offered
+again. `status` prints `Landed in BRANCH: #N (PR #M), ...` for those issues
+until the forge closes them. When no claim is held, at least one landed
+issue is still open and the cached reading holds every open issue,
+`problems` lists one `crossing ready` row, and with
+notifications configured one decision asks the operator to open the crossing
+pull request (`gh pr create --head BRANCH`, naming each issue as `Closes #N`).
+Nothing opens or merges it for you: a merge to the default branch cannot be
+undone. A claim whose holder already reported ready also ends as complete
+with actor `supervisor` once the forge reports its issue closed, even when
+the issue closed before the claim or was closed by hand without a closing
+pull request; the reason names the case and the evidence keeps the state and
+close instant. `issue claim` refuses an issue the forge reports closed, and
+allows the claim when the forge cannot be read. Forge lookups are bounded and best effort; an offline forge cannot
 establish completion. Reminders appear in issue/status output and
 at checkpoints. An explicit subsequent message reaching every waiting peer
 marks a response observed; that is delivery evidence, not proof of a complete
@@ -1949,6 +2469,22 @@ A `pull request ended` reminder is marked answered as soon as its holder no
 longer owns the issue, whether it released, handed off, was reclaimed or was
 resolved, so the former holder is not woken, sent or listed a reminder for
 work it no longer holds.
+
+A merged pull request that changes a definition another lane's diff calls is
+mailed to that lane, even when the two touch different files. The same
+completion reading names the pull request and its merge commit; once the
+base checkout holds that commit (it waits up to a day for a fetch), the
+service reads the merge against its first parent once. Python files are
+parsed with `ast`, and a module or class `def` or `class` the merge removed,
+renamed or gave another signature is changed. JavaScript, TypeScript, Go and
+Rust files use one top-level identifier pattern per extension on the removed
+lines; other files are not read. At most 20 files and 20 names are read per
+pull request. Each lane that is not retired and did not land the change has
+its diff against its fork point, committed or not, searched for those names
+on added lines, and each hit sends one message naming the pull request, the
+symbol and the file and line in the lane's diff, once per pull request,
+symbol and lane. The notice says the change may affect the lane: a name
+match can be a false positive, and nothing is refused, rebased or changed.
 
 A lane that opens a pull request and ends its turn to wait is woken when that
 pull request changes. At most once a minute the service reads up to 30 open
@@ -1961,12 +2497,74 @@ one supervisor message, and so a wake, when the checks finish green or red on
 a head commit not yet reported, when a review is submitted, or when the merge
 state moves between mergeable and conflicting. The message names the pull
 request, the full head SHA and the new state; a red run lists every failing
-check by name. The verdict waits until every check finished, so a run is
-reported once rather than job by job. A pull request first seen with finished
+check by name. A message reporting a new review also quotes each new review's
+body and up to 20 inline comments (`MAX_REVIEW_COMMENTS`) as path, line and
+text, newest review first, read with `gh api repos/OWNER/NAME/pulls/N/reviews`
+and `.../comments`. A message reporting failed checks quotes the tail of the
+failed-step log, `gh run view RUN --job JOB --log-failed`, of each check that
+ran and failed; a cancelled, timed-out or never-started check has none. The
+quoted text is marked untrusted, prefixed `> ` line by line, stripped of
+terminal escapes and control characters, and held to one 3000-byte budget
+(`PULL_REQUEST_FEEDBACK_BYTES`) that never takes the message past its
+4096-byte limit; room for every cut note is reserved first, and a cut section
+is followed by the `gh` command that returns it whole. A log keeps its tail, a
+review its head. Only what the message reports as new is read, so a review or
+log already delivered is never sent again. The verdict waits until every check
+finished, so a run is reported once rather than job by job. A pull request first seen with finished
 checks or reviews is reported once too. Nothing is merged, rerun or answered
 for the lane. Only the GitHub forge is read; `beads` and `null` read nothing,
 and a forge that is missing, offline or unreadable keeps the last reading and
 wakes nobody without stopping the poll.
+
+A pending run carries its age. Each reading keeps every unfinished check with
+its state (`queued`, `in_progress`, `pending` or `expected`) and start time,
+and records when the current head was first seen pending; a new head or a
+finished run restarts that clock. A head still pending past the ceiling,
+twice the longest literal `timeout-minutes` in `.github/workflows` or 60
+minutes when none is declared (`CHECKS_STALLED_FACTOR`,
+`CHECKS_STALLED_SECONDS`), gets one supervisor message naming each check,
+its state and its age. The message recommends one re-run, `gh run rerun
+--failed` for a run that ended without a conclusion or cancel and re-run for
+one still in progress past its job timeout, and leaves it to the lane; after
+one re-run it is an operator decision. `status` prints the pending age beside
+`CI pending` and marks the head `stalled`, and `problems` lists a `checks
+stalled` row until the head finishes or changes. Nothing pending is re-run,
+merged or bypassed automatically. A forge whose checks report no start time is
+never marked stalled.
+
+A finished run is different when every failing check ended `cancelled` or
+`timed_out` and every other check passed: there is nothing to fix or push, so
+the service runs `gh run rerun RUN --job JOB --repo OWNER/NAME` once per such
+job through the operator's own `gh` authentication, whether or not the owning
+lane is alive. The request is recorded on that head commit and never repeated
+for it; a check that ended `failure` is never re-run. The lane is told a
+re-run was requested so it does not push an empty commit. `problems` keeps a
+`checks failed` row reading `re-run requested` until the new conclusion
+arrives; a second cancellation on the same head, or a forge that refused the
+re-run, names the exact command instead of `fix and push`. Set the
+supervision key `rerun_cancelled` to false to turn the automatic re-run off.
+
+A red verdict also keeps, per head commit, the attempt count and when it was
+first seen red, incrementing once per rerun that ends red again on the same
+commit. `problems` lists one `checks failed` row per pull request naming the
+failing checks and the attempt. A required check the forge reports as never
+started (`action_required` or `startup_failure`) is different: only the
+operator can act on it, so every open pull request sharing the same check
+name and forge conclusion is grouped into one `checks refused` row naming
+every affected pull request, and one decision, opened through
+`decisions.open_or_refresh` and keyed by that check name and conclusion, so
+the operator answers the shared cause once rather than once per lane.
+
+Each pull request also counts its CI rounds: a head commit whose checks
+finished, counted once per commit, so neither the automatic re-run nor a
+manual re-run on the same head adds a round. A red head at or past the
+`ci_rounds` supervision setting (default 2) tells its lane once to stop
+pushing and report blocked, lists a `ci rounds exhausted` row in place of
+`checks failed`, and opens one decision offering `grant one more round` or
+`take over`. A grant raises that pull request's allowance by one round and
+tells the lane; a takeover stops further decisions for it. A green head, or
+a head back under the allowance, closes the decision. The limit is advisory
+like reservations: nothing refuses a push.
 
 Repeating a reminder at a lane that has stopped answering changes nothing, so
 the supervisor counts the reminders left unanswered on a claim observed
@@ -2009,7 +2607,8 @@ accounts that cannot be reconstructed safely require manual attention.
 Wake attempts start one inactivity interval apart and the spacing doubles with
 each attempt, up to one hour. Three attempts on an unchanged backlog exhaust
 it; the lane is then asked hourly rather than never. Work dispatches add their offer generation and
-issue-scoped progress digest to that backlog. Delivery without a claim, handoff
+issue-scoped progress digest to that backlog. An escalated offer generation is not delivered again
+until the lane records progress or a new generation replaces it. Delivery without a claim, handoff
 or other recorded issue progress leaves the obligation pending. Exhaustion
 records the offer, issues, attempt count, last result and operator action in the
 work publication. A `busy:turn`, `busy:input`, or `busy:repeat` answer is not
@@ -2021,7 +2620,12 @@ cursor position reports and focus events do not count as partially entered
 operator input, so they do not refuse the wake. Complete replies are removed
 from the input-state check without hiding operator bytes that arrived in the
 same read; incomplete replies are carried until the next read and refuse a wake
-until they complete.
+until they complete or until half a second passes without another byte. A lone
+Esc therefore resolves as a keypress, as terminal programs resolve it, and adds
+no text. Backspace and delete erase one counted character, so a line typed and
+then erased reads as empty. A `busy:input` refusal in `problems` tells the
+operator to submit or clear the unsent text in the lane's own terminal rather
+than to answer a prompt.
 Wake attempts, backoff, the last result and escalation are fields of the
 lane's state in the store, and every wake decision reads them there. Results
 appear in `status`, the retained event log and private `<name>-wake.json`,
@@ -2160,8 +2764,14 @@ it spawns the configured hook command with `--adapter opencode`, and
 shared parser and flattens the result to `decision`, `reason` and `context`.
 A denied `tool.execute.before` is raised as an error inside the plugin, which
 is how an OpenCode plugin refuses a tool call; a blocked `session.idle` posts
-the reason back into the session as the next prompt; `context` is appended to
-the user's message parts. The plugin never sets a `permission.ask` status, so
+the reason back into the session as the next prompt. The service marks
+`context` delivered on every event, so the plugin holds it per session and
+appends it to the next `tool.execute.after` output or the parts of the next user
+message, whichever comes first; context returned to `session.created`,
+`tool.execute.before`, `permission.ask` or `session.idle` waits there because
+those events cannot carry text into the session. Held context lives in the
+plugin process, so an OpenCode exit before the next tool result or message
+loses it. The plugin never sets a `permission.ask` status, so
 OpenCode's own approval prompt is left to the user. OpenCode raises no end of
 session event, so `SessionEnd` is reported under `unavailable_hooks`. Resume
 passes the recorded session as `--session ID`. Plugins in the user's global
@@ -2181,10 +2791,27 @@ never seen, and a profile is the supported way to say the same thing.
 ### Notifications
 
 The service and the launcher can forward the coordination changes an absent
-operator waits on to a Telegram bot, an email address, or both. Delivery is
-outbound only: no command arrives over the channel, and a native permission
-prompt is still answered only in the lane's terminal. Configuration is entirely
-environment variables; no token or password is written into coordination state.
+operator waits on to a Telegram bot, an email address, or both. Email is
+outbound only. The Telegram bot also carries status queries and decision
+answers back once inbound is on, as described below; with inbound off, no
+command arrives over the channel and a native permission prompt is answered
+only in the lane's terminal. Settings come from the
+environment or from `notify.json` in the state directory, which
+`agent-parley notify setup` writes owner-only. No token or password is written
+into coordination state or copied into a lane's environment.
+
+```sh
+agent-parley notify setup --chat 123456789
+agent-parley notify setup --chat 123456789 --inbound
+```
+
+`notify setup` reads the Telegram bot token, and with `--inbound` the status
+passcode, from a hidden prompt, or from standard input when it is not a
+terminal. It never takes a secret as an argument and never prints one. A
+variable set in the environment overrides the stored value for that process.
+The running service reads inbound settings at start, so restart it after
+storing them. `status`, `doctor` and `up` print one line saying whether
+outbound and inbound are on and, when off, why.
 
 | Variable | Meaning |
 | --- | --- |
@@ -2193,7 +2820,7 @@ environment variables; no token or password is written into coordination state.
 | `AGENT_PARLEY_TELEGRAM_CHAT` | Chat identifier the bot posts to. |
 | `AGENT_PARLEY_SMTP_HOST` | SMTP server host. |
 | `AGENT_PARLEY_SMTP_PORT` | SMTP port; 587 by default, 465 with implicit TLS. |
-| `AGENT_PARLEY_SMTP_TLS` | `starttls` (default), `implicit` or `none`. |
+| `AGENT_PARLEY_SMTP_TLS` | `starttls` (default), `implicit` or `none`. Both TLS modes verify the server certificate and host name against the system trust store. `none` with `AGENT_PARLEY_SMTP_USER` set is refused unless the host is `127.0.0.1`, `localhost` or `::1`, because the login would travel in the clear. |
 | `AGENT_PARLEY_SMTP_USER` | SMTP user; omit it for a server that needs no login. |
 | `AGENT_PARLEY_SMTP_PASSWORD` | SMTP password. |
 | `AGENT_PARLEY_SMTP_FROM` | Sender address. |
@@ -2215,19 +2842,49 @@ These events notify, and nothing else:
 | --- | --- |
 | `handoff_offered` | A handoff is offered to a lane. |
 | `permission_prompt` | A lane is blocked on a native permission prompt. |
+| `permission_denied` | A native permission layer, such as Claude Code's auto mode classifier, refused a lane's tool call without a prompt. |
 | `native_dialog` | A lane is held by a native dialog the launcher escalated. |
+| `lane_blocked` | A lane has stayed blocked (approval, prompt, dialog) for 30 minutes; sent once per block. |
 | `lane_idle` | A lane is idle with no claim past the project's `stalled_after`. |
 | `idle_blocker` | Other issues wait on a claim held by an idle lane. |
 | `non_convergence` | An issue is escalated as not converging. |
+| `key_hold` | A lane kept a key refused to a peer past its release deadline. |
 | `run_budget_exhausted` | The enforced [run budget](#enforcing-a-run-budget) runs out. |
+| `orphan_decision` | A dead lane spent its wake budget while holding orphaned claims; names the live peer that fits, or none, and moves nothing. It never times out; it stays open until answered or until the work is returned at `orphan_retire_after`. |
 | `run_finished` | A lane run finished. |
 | `hook_refusal` | A lifecycle hook refused a branch switch or detected branch drift. |
 | `inbound_locked` | Inbound status queries were locked after repeated wrong passcodes. |
 
 Each event is sent once per situation: a digest of the fields that identify it
 is kept per lane in private state, so an unchanged situation sends nothing
-further. Sending never blocks a hook or a tool call; a failed send is recorded
-in the lane's event log and dropped, and nothing is queued for a retry.
+further. Sending never blocks a hook or a tool call.
+
+Every situation that waits on the operator is also recorded as a decision in
+`decisions.json` in the project's private state directory. A decision has a
+stable twelve-character identifier, the options that answer it with one marked
+recommended, whether acting on it can be undone, and an expiry a day out that
+each repeat observation extends; one situation holds exactly one open decision.
+The operator problems `problems` reports, such as a dirty worktree, an
+unresolved completion or a second session, open decisions as well, and a
+decision closes when its problem clears. Delivery is durable: a decision
+records each transport that accepted it and is marked sent only after every
+transport did, and a refused or abandoned send is retried on the next
+supervision poll with a backoff that doubles from 30 seconds to an hour, so a
+hook that exits before its send finishes still reaches the operator. A retry
+goes only to the transports that have not accepted the decision yet, so a
+healthy Telegram bot does not repeat a decision while SMTP keeps failing.
+Retries stop after eight failed attempts, and one `notification_failed` event
+on the lane, or a supervision note for a decision with no lane, records that
+the decision was given up. Decisions due together go out as one digest; on
+Telegram
+it carries one row of buttons per decision, and every transport shows the text
+reply each takes. Decisions are recorded only while notifications are on, and
+a record holds no credential. A `decisions.json` that no longer decodes is
+never overwritten: the next writer moves it to
+`decisions.json.corrupt-<unix time>`, records a supervision note naming the
+copy and continues from no decisions, and `doctor` reports the `decisions`
+component `damaged`, naming every copy, until the operator recovers the
+decisions it holds and deletes it.
 
 The same Telegram bot can answer status queries. Set
 `AGENT_PARLEY_INBOUND=telegram` and `AGENT_PARLEY_INBOUND_PASSCODE` to a
@@ -2235,15 +2892,93 @@ passcode of at least twelve characters; the bot token and chat identifier are
 the outbound ones. The service long-polls the Bot API, so no port is opened and
 no webhook is registered. A message must start with the passcode, come from the
 configured chat, and carry `status` with the filters `agent-parley status`
-takes; the reply is that reading. Nothing else crosses the channel: no claim,
-handoff, wake, approval or free text into a session. A message from another
-chat, or with a wrong passcode, gets no reply. Five wrong passcodes inside ten
-minutes lock the inbound path for an hour and send one `inbound_locked`
-notification; the counter and the lock live only in memory. Only a salted hash
+takes; the reply is that reading.
+
+A failed poll is retried every five seconds. The service log names the
+failure once, as `polling Telegram failed (...)` with the error class and its
+cause, such as `HTTP 409 Conflict` when a second poller uses the same token or
+`HTTP 401 Unauthorized` for a revoked one, and logs again only when the cause
+changes. The bot token is replaced by `<bot token>` in that text. The first
+poll that succeeds afterwards logs `polling recovered`, and until then
+`notify` does not report the reader as polling.
+
+A private chat with the operator is the supported shape. In a group chat every
+member could answer, so the reader refuses to start until
+`AGENT_PARLEY_TELEGRAM_USERS` (or `notify setup --users`) lists the numeric
+Telegram user ids allowed to answer; a message or tap from anyone else is
+dropped without counting toward the lock. Telegram's default privacy mode keeps
+plain group messages from the bot, so typed queries in a group arrive only
+after privacy mode is disabled with BotFather.
+
+The bot also takes answers to decisions. A tap on a decision's button is
+admitted without a passcode, because only the chat's allowed users can tap a
+button the bot posted there, and only for the open occurrence of a decision
+this state root issued that the button was posted for; a tap from any other
+chat is dropped. A decision that reopens after it was answered, closed or
+expired keeps its identifier but gets a new occurrence nonce, carried by its
+buttons and its digest's `decision:` line, so a button, confirm button or reply
+from the earlier occurrence is refused as replaced and its row is removed from
+the message; a typed `decide ID` answers the current occurrence. A typed answer is
+`decide ID OPTION [NOTE]` after the passcode, or a reply to a message that
+holds exactly one decision, starting with the option. The answer is recorded
+under the decision lock, so of two answers racing the second is refused with
+the option and the name of whoever answered first; an expired, closed or
+unknown decision is refused the same way. An irreversible option records
+nothing until a second `confirm` tap. The answered message is edited to say
+which option was chosen, by whom and when, and keeps the other decisions'
+buttons. The lane receives the answer as supervisor mail keyed by the
+decision, so a repeat never duplicates it and the unread mail wakes the lane
+on the next supervision poll; the lane then runs the matching command itself.
+A note is quoted in that mail and labelled as not an instruction. Nothing
+else crosses the channel: no claim, handoff, approval or free text is carried
+out for a lane, and nothing is typed into a session except the option key of
+a native dialog, described below. A message from another chat, or with a
+wrong passcode, gets no reply. Five wrong passcodes from one sender inside ten
+minutes lock that sender out for an hour and send one `inbound_locked`
+notification. The failure times and the lock are kept per sender in
+`inbound-gate.json` in the state root, owner-only and without any passcode or
+guess, so a service restart keeps them, and `status` shows the inbound path
+as locked with its expiry while a lock holds. Only a salted hash
 of the passcode is held, compared in constant time, and never written to state
 or logs. The reader refuses to start when the passcode is unset or too short,
 and `status` prints that fault on its `Inbound:` line and under `inbound` in
 `status --json`.
+
+A native dialog the launcher escalates, such as a tool permission prompt, a
+hook trust review or the client's question picker, is recorded as a decision
+offering the options the screen draws, less a question picker's free-text
+option, since chat text is never typed into a lane. A permission or trust
+prompt recommends its refusing option, and an option that widens a
+permission, such as switching to auto mode or not asking again, takes the
+same `confirm` tap as an irreversible one. The answer is not mailed: the
+launcher re-reads the screen on its next pass and, only while it still draws
+that same dialog, claims the answer under the decision lock and presses the
+chosen option's digit, once. A screen that changed first retires the
+decision as `stale`, so a later tap is refused and an answer already given is
+never pressed on another dialog; the new screen is asked about afresh. A
+prompt the launcher cannot read is sent as terminal-only and answered at the
+lane's terminal. Nothing is ever answered on expiry.
+
+A tool call a native permission layer refuses without drawing a prompt is
+recorded as a `permission_denied` decision. Today that is Claude Code's auto
+mode classifier: every Claude Code lane runs its hook on the
+`PermissionDenied` event, which the `claude` CLI raises with the tool,
+its input and the classifier's reason, such as `Interfere With Workloads` or
+`CI Bypass`. No other adapter reports such a refusal to a hook yet. The
+decision names the lane, the issue the lane has claimed, if any, the exact
+refused command and the stated reason. It offers `run it yourself`, with the
+command to run in the lane's worktree, `add a rule`, with a suggested
+permission rule such as `Bash(git push:*)`, and, when the lane holds a claim,
+`reassign` and `release`. The same refusal again, from the same lane on the
+same claim with the same command, refreshes that decision instead of opening
+a second one. While it is open the supervisor defers the lane's wakes under
+`permission denied` rather than asking it for a turn that would meet the
+same refusal; the answer reaches the lane as supervisor mail, like any other
+answer, and the lane or the operator carries it out. The decision is
+irreversible, so every option takes the `confirm` tap and no timeout ever
+applies a default to it. Nothing retries, rewords or works around the
+refused call, and the service never writes the suggested rule or any bypass
+flag: adding the rule is the operator's edit to their own settings.
 
 ### Reclaiming landed lanes
 
@@ -2253,7 +2988,12 @@ service sweeps them at most once every 900 seconds, after the rest of a poll,
 and `agent-parley gc` runs the same sweep on demand: without `--apply` it
 reports what it would do, with `--apply` it removes what it may. The outcome
 of the service's own sweep is published in `reclaim.json` in the project state
-directory, so the next sweep is bounded even when one fails.
+directory, so the next sweep is bounded even when one fails. Each step of the
+sweep (worktree moves, lane reclaim, lane-made worktrees, file pruning and
+bundle pruning) runs on its own, so a refusal in one never skips the rest.
+Each refusal is published under `errors` with its `step` and `error`, written
+to the service log as a `reclaim` entry, and recorded as the project's
+supervision error; the `status` reclaim line counts them and names the first.
 
 A lane is reclaimed only when every one of these holds: its worktree is a
 registered worktree directly inside this project's state directory; no session
@@ -2295,11 +3035,75 @@ that ends the idle session.
 Worktrees a lane made for itself, such as one per pull request, are swept in
 the same pass and published under `worktrees` in `reclaim.json`. Every
 worktree `git worktree list` reports is attributed to a lane by path, when it
-sits inside a lane's worktree, or by branch, when its branch is the lane's
-name or branch followed by `-` or `/`, such as `claude-pr-12`. One inside the
-project state directory belongs to the project. A worktree nothing accounts
-for is reported with reason `no lane made it` and never touched, even with
-`--force`.
+sits inside a lane's worktree or its `<lane>-wt` directory beside it, or by
+branch, when its branch is the lane's
+name or branch followed by `-` or `/`, such as `claude-pr-12`. One directly
+inside the project state directory belongs to the project, and so does one
+directly inside a project folder under the `agent-bridge` folder beside a
+state root named `agent-parley`, such as `~/.local/state/agent-bridge`, where
+lanes lived before the rename, and so does one in the project's `strays`
+directory. Git records no creator, so a worktree no lane accounts for is
+assessed by the same rule wherever it sits; one outside those directories
+that any process works inside is kept with reason `a session is running in
+it`. One outside the repository, the state root and the temporary
+directories (`/tmp`, `/var/tmp`, `/dev/shm` and the platform's temporary
+directory), such as a worktree a systemd unit runs from, belongs to the
+operator: it is never removed and is reported with reason `no lane made it
+and it sits outside the repository, the state directory and temporary
+directories`.
+
+The lane protocol names one place for those worktrees: `<lane>-wt/NAME`
+beside the lane in the project state directory, removed by the lane with
+`git worktree remove` once its pull request merges. Before either sweep,
+every worktree attributed to a lane that sits outside that lane and outside
+its `<lane>-wt` directory, such as one in the home directory, beside the
+repository or in `/tmp`, is moved to `<lane>-wt/<name>` with
+`git worktree move`, taking `<name>-2` and upward when the name is taken.
+Every other worktree the project repository registers outside the base
+checkout, the lanes, the spares and every `<lane>-wt` directory, that sits
+where throwaway checkouts are made, inside the repository, including
+`<repo>/.claude/worktrees/`, under the state root or in a temporary
+directory, is moved the same way to `strays/<name>` in the project state
+directory, with reason `no lane made it and it sits outside the project's
+strays directory`. One anywhere else, such as `~/.local/state/tm-arena`
+used by a systemd unit, is only reported under `relocations`, with the
+operator-owned reason above, and stays where it is. A move never deletes and never forces: uncommitted edits,
+unpushed commits and ignored files travel with the directory. A worktree
+whose directory holds another registered worktree, such as one with its own
+`.claude/worktrees/`, is reported as `another registered worktree sits
+inside it` and stays until the nested one has moved out, so the move never
+strands the nested worktree's registration. A locked worktree, one whose
+lane runs a session or any process works inside, one
+whose directory, Git index or HEAD changed within the last hour, reported as
+`it changed within the relocation grace period` because a session working
+from the base checkout edits it without entering it, and one Git refuses to
+move stay in place and
+are reported; one Git refused is then assessed in place by the same rule.
+Git cannot rename a worktree across filesystems, such as out of a `tmpfs`
+`/tmp`, so one on another filesystem than its destination is reported as
+`it sits on another filesystem than its destination` and rebuilt instead:
+a recovery checkpoint of it is written first, and only then is it
+force-removed and added again at the destination with its branch head and
+staged, unstaged and untracked changes. A checkpoint that fails removes
+nothing; one holding ignored files other than regenerable tool output stays
+in place with reason `it holds files Git does not track elsewhere`; a rebuild
+that fails after the removal names the checkpoint and its restore command.
+The base checkout, the lanes themselves and spares are never moved. The
+moves are published under `relocations` in `reclaim.json`; `agent-parley gc`
+lists them as `to move to` without `--apply`, performs them with it, and
+`--json` carries them as `relocations`. `reclaim.json` describes only the
+latest sweep, so the service also writes one `reclaim` line to `server.log`
+for every worktree a sweep moved, every lane or worktree it removed, and
+every refused move the previous sweep did not already report for the same
+worktree and reason. The log's rotation into `server.log.1` keeps that record
+after later sweeps find nothing left to do.
+
+A worktree moved underneath Agent Parley, by the sweep or by the operator,
+is found again by branch through `git worktree list` before anything acts
+on its recorded path. A lane whose own worktree an operator moved is never
+retired for it: the sweep keeps it with reason `its worktree moved to another
+path Git registers` and names the `git worktree move` that returns it, and
+launch and `participant restore` refuse with the same command.
 
 An attributed worktree is removed with `git worktree remove` when it is not
 locked, has no session running in its lane, has nothing uncommitted, and
@@ -2310,7 +3114,34 @@ dropped. Its branch is kept. Uncommitted changes, unpushed commits and a
 recent change keep it and are reported by name. `agent-parley gc --apply
 --force` removes those too, but only after writing a recovery checkpoint
 bundle of the whole worktree, index and untracked files included, to the
-project's `recovery` folder; a checkpoint that fails removes nothing.
+project's `recovery` folder; a checkpoint that fails removes nothing. A
+worktree holding files Git ignores is kept with reason `it holds files Git
+does not track elsewhere`, even with `--force`, because no checkpoint can
+recover what was never tracked.
+
+A worktree a lane made for itself whose unpushed commits already landed in the
+base checkout through another branch, such as a squash merge or a cherry-pick,
+is removed without `--force`. A lane's own worktree is not: it is still kept
+while its branch holds unpushed commits. The sweep decides this with `git merge-tree --write-tree HEAD
+<head>`: when merging the worktree's head into the base head leaves the base
+tree unchanged, every change it holds is already there. The worktree must
+still be clean, and quiet past `inactive_after` or belong to a retired lane.
+It is reported with reason `its unpushed commits already landed in the base
+checkout through another branch`, and it is removed with an ordinary
+`git worktree remove` only after a recovery checkpoint bundle of it is
+written, so its commits stay recoverable. A checkpoint that fails removes
+nothing, and its branch is kept.
+
+Every removal that wrote a checkpoint prints the command that puts the
+worktree back. `agent-parley gc --preserved` lists each preserved worktree
+with its checkpoint id, source path, branch and age, and `agent-parley gc
+--restore ID --to PATH` recreates it at `PATH`, which must not exist: on its
+branch when the branch still points at the saved head, on a new branch of
+that name when it is gone, and detached otherwise, with its staged, unstaged
+and untracked changes. Preserved checkpoints are kept for
+`PRESERVED_RETENTION`, 30 days, after their capture; the sweep then deletes
+them.
+
 `agent-parley gc`, `gc --dry-run` and its alias `agent-parley reclaim`
 without `--apply` add each worktree's size on disk.
 
@@ -2320,14 +3151,40 @@ worktrees a reclaim, and a forced reclaim, would still remove.
 as `reclaim` in its JSON document, reading the sweep's record instead of
 walking the disk.
 
+The same sweep prunes lane state that no longer serves anyone, and publishes
+the file names it removed under `pruned` in `reclaim.json`. A retired lane
+with no running session loses its `<name>-work.json`, `<name>-wake-work.json`,
+`<name>-mcp.json` and `<name>-wake.log`. Its identity, activity, event and
+report history, its `<name>-wake.json`, its `<name>-capacity.json`, which
+lanes on the same account still read, and its lock files are kept. Any
+`<name>-wake.log` unchanged for two days is removed too, because each wake
+appends to it.
+
+A lane whose session is not running still has its `<name>-work.json`
+rewritten when its offers or checks change, but not when only its capacity
+reading changes. A dead lane shares its capacity reading with every lane on
+the same account, so a live peer's observations would otherwise rewrite the
+dead lane's work file on every poll.
+
 When the project root itself disappears, the first poll records
-`root-missing.json` in the project state directory. One interval later every
-lane still registered is captured for recovery, retired and has its
-reservations revoked. The marker names, per lane, the claims released and the
-checkpoint each one left, and the state directory for the operator to remove.
-A lane whose session is still live is kept, and `agent-parley problems` names
-it under `root missing` until its session ends. The project then leaves
-`status`, `top` and `metrics`; a root that returns clears the marker on the next poll. When the service starts, it
+`root-missing.json` in the project state directory. Once the root has been
+gone `root_gone_after` (an hour by default), every lane still registered is
+captured for recovery, retired and has its reservations revoked; a rename and
+rename back, a re-clone or a remount inside that window touches nothing. A
+root whose parent directory cannot be listed, such as one on an unmounted
+volume, is marked `unreachable` and never retires a lane. The marker names,
+per lane, the claims released and the checkpoint each one left, and the state
+directory for the operator to remove. A lane whose session is still live is
+kept, and `agent-parley problems` names it under `root missing` until its
+session ends. A lane whose retirement is refused, because it holds ready work
+awaiting integration or work an operator blocked, keeps its claims and is
+named under `refused` with the refusal and its checkpoints; the project is
+not recorded retired while any lane is refused, and each later poll tries the
+lane again. The project then leaves `status`, `top` and `metrics`. A root
+that returns clears the marker on the next poll; when lanes had retired, the
+marker moves to `root-returned.json` with `returned_at`, and
+`agent-parley problems` lists them under `root returned` with each re-admit
+command until every one is re-admitted. When the service starts, it
 removes every wake socket in its home that no launcher is listening on.
 
 ## Other agent CLIs
@@ -2340,7 +3197,7 @@ names the one to use:
 | --- | --- | --- | --- |
 | `claude` | `--mcp-config FILE` | `--append-system-prompt TEXT` | `--settings '{"hooks":…}'` |
 | `codex` | `-c mcp_servers.agent_parley.url=…` | appended to the prompt argument | `-c hooks.EVENT=…` |
-| `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-p` argument | `hooks` in `settings.json` there |
+| `copilot` | `mcp-config.json` in the lane's `COPILOT_HOME` | prepended to the `-i` argument | `hooks` in `settings.json` there |
 | `gemini` | `mcpServers` in the lane-private system settings overlay | prepended to `--prompt-interactive` | `hooks` in that overlay, `--adapter gemini` |
 | `opencode` | `mcp` in the lane-private `opencode.json` | prepended to `--prompt` | `plugin/agent-parley.js` in the lane-private directory, `--adapter opencode` |
 | `amp` | `amp.mcpServers` in the lane-private `settings.json` | prepended to the prompt argument after `--settings-file` | `amp.hooks` in that file, `--adapter amp` |
@@ -2360,13 +3217,24 @@ missing at least one of those, so the launcher runs a delivery thread beside
 that session instead: it reads the same mailbox the served checkpoint reads,
 on the interval `AGENT_PARLEY_DELIVERY_SECONDS` sets (20s by default, clamped
 to 0.05s-600s), and publishes what is undelivered into
-`STATE/PROJECT/NAME-delivery.md`, which is lane-private and outside the
-target repository. The lane's coordination prompt names that file and tells
+`STATE/projects/PROJECT_KEY/NAME-delivery.md`, which is lane-private and
+outside the target repository. The lane's coordination prompt names that file and tells
 it to read it at every turn; a file that cannot be written falls back to a
 notice on the launcher's terminal. Each delivery is written to the same
 participant event log a served checkpoint records into, under the reason
 class `polled_delivery`, so `agent-parley top` counts its bytes in `CONTEXT`
 like any other lane's.
+
+Each delivery appends a batch headed `## Batch N, written <UTC time>`, and
+delivery never marks mail read, because the lane may not have read the file
+yet. A batch stays while any message it carried is unread and leaves once the
+lane calls `mark_message_read` for all of them. A batch without mail, such as
+a work offer or an operator edit on a reserved path that is shown once, stays
+until the lane makes a coordination call that writes, such as
+`mark_message_read`, after the batch was written; the newest one also stays
+while nothing newer is written. At most eight batches are kept. A quiet
+interval drops read batches and removes the file once none remain, so a lane
+tells a new batch from one it already read by its number.
 
 Polled delivery is delivery, never enforcement. It cannot deny a tool call,
 cannot hold a turn open, and reaches the lane only as text that lane has to
@@ -2497,13 +3365,45 @@ When `run` finds the lane's session lock held by a live launcher, it names the
 launcher and client processes, when the session started and its last activity,
 and prints `agent-parley participant stop <lane>`. That session may have been
 resumed by the service with no terminal attached, so retrying cannot succeed
-until it ends.
+until it ends. After `participant stop`, the service does not wake or resume
+that lane, so the operator's own `run` takes the lock. The next launch of the
+lane, by any path, lifts that hold.
 
 `participant restore` returns one lane to its bridge branch. It refuses while
 that participant has a running session, refuses on an uncommitted change, and
 refuses when the current branch holds commits the bridge branch does not,
 printing the command that keeps them. It never resets, cleans, stashes, or
 force-switches, so no committed or uncommitted work is discarded.
+
+### Damaged state files
+
+```sh
+agent-parley store repair
+```
+
+A coordination store that exists but SQLite cannot read, such as one reporting
+`file is not a database` or `database disk image is malformed`, is reported as
+`damaged`, never as a store not yet created. `status` prints
+`Store: damaged (<sqlite message>); run agent-parley store repair`, `doctor`
+reports the store component as inconsistent, and a hook refused by the outage
+names the same command. Probing the store opens it read-only, so a damaged
+file and its `-wal` and `-shm` side files are left exactly as found.
+
+`store repair` runs only when the operator invokes it, never from a hook. Under
+the store lock it runs SQLite's `PRAGMA quick_check`; a store that passes is
+left untouched and the command says nothing was moved. A store that fails is
+moved, with its side files, to `<name>.corrupt-<unix time>` in the state
+directory, never over an earlier copy and never deleted, and an empty store is
+created in its place. The command prints every path it kept, for manual
+salvage.
+
+A lane's `<lane>-activity.json` that does not decode to a JSON object is moved
+to `<lane>-activity.json.corrupt-<unix time>` by the next hook event, which
+continues as from a missing record and writes a valid one, so the tool call
+goes ahead. The lane's event log carries one `state_unreadable` record naming
+the kept copy. A damaged `<lane>-identity.json` cannot be rebuilt in a hook, so
+tool calls stay refused with a message naming the file and
+`agent-parley run <lane> --resume`, which registers the lane again.
 
 ### Exporting and importing the state directory
 
@@ -2580,10 +3480,12 @@ left the worktree, or the decision itself failed, the prompt goes through and th
 reason reaches the agent as context on it. The same causes still deny a tool
 call.
 
-A hook payload that cannot be decided, one past 1,000,000 characters such as a
+A hook payload that cannot be decided, one past 1,000,000 bytes such as a
 `Write` of a large file or one that is not a JSON hook object, is allowed and
 recorded as `oversize_payload` or `unreadable_payload` in the lane's event log,
-because a denial would refuse the same call on every retry.
+because a denial would refuse the same call on every retry. An oversize tool
+call still meets the reservation and command guards, and an oversize shell
+command is denied: write it to a script file and run that.
 
 A lane whose shell cwd left its worktree is told on its next prompt to run
 `cd LANE` before any tool work, and every tool call from outside is denied with
@@ -2618,8 +3520,11 @@ for every provider, with no flag that turns it off:
 
 - **Denied before it lands.** The same hook that refuses a branch switch inside
   an assigned lane denies `git commit`, `git commit --amend`, `git merge`,
-  `git tag -m`, `git revert -m` and `gh pr create` whose message, title or body
-  claims assistant authorship: a co-author trailer naming an assistant,
+  `git tag -m`, `git revert -m`, `git notes add`, `gh pr` `create`, `edit`,
+  `comment`, `merge` and `review`, `gh issue` `create`, `edit` and `comment`,
+  and `gh release` `create` and `edit` whose message, title, body, notes,
+  message file or here-document claims assistant authorship: a co-author
+  trailer naming an assistant,
   "generated", "written", "created", "authored", "assisted" or "powered" by a
   named assistant, a vendor or model name in an authorship position, or a
   generator signature. Each denial names the enumerated rule it broke, lands in
@@ -2639,8 +3544,9 @@ for every provider, with no flag that turns it off:
 
 Detection is textual and deliberately narrow: it matches authorship claims and
 authorship positions, so "fix the codex adapter" is ordinary work while "written
-by" an assistant is refused. A message supplied through a file rather than the
-command line is not visible to the hook; the integration scan still reads the
+by" an assistant is refused. Markdown around the name, as in a linked footer,
+does not hide it. A message the hook cannot read, such as a file written
+earlier in the same command, still reaches the integration scan through the
 commit it produced. Rewriting history you already have is out of scope: a
 pre-existing commit carrying a trailer is reported at merge, never amended for
 you.
@@ -2656,6 +3562,8 @@ progress in the base checkout for you to finish with `git merge --continue` or
 undo with `git merge --abort`; it never resolves a conflict, and never resets,
 cleans, stashes, or force-switches. A successful merge leaves the lane and its
 branch exactly as they were, so retiring the participant stays a separate step.
+When the lane holds several claims, `--issue N` names the one whose work is
+merged; without it the lane's only ready claim is used.
 
 `participant merge --preview` answers what that merge would do without doing it:
 
@@ -2699,7 +3607,23 @@ The command is stored as argument tokens and run without a shell, so
 redirection, expansion and chaining cannot ride into a gate, and no flag skips
 it. Removing it is an explicit `verify set ''`. `--preview` never runs it,
 because executing a configured command is a different decision from reading
-Git state.
+Git state. `verify set` runs only from an operator shell in the base checkout:
+it refuses inside an assigned worktree and in any process holding a lane's
+`AGENT_PARLEY_TOKEN`, so a lane cannot replace or clear the gate its own merge
+has to pass. `verify show` stays readable from a lane.
+
+`setup PATH --verify COMMAND --init COMMAND` records the gate and the lane
+initialization command in the same call, through the same paths and guards as
+`verify set` and `init set`. Without `--json`, `setup` prints labeled lines:
+`Root`, `Base`, `Forge`, `Verify`, `Init` and `Next`. An empty gate reads
+`Verify: none; participant merge runs no gate`, and when a file committed at
+HEAD declares a check command, a `Suggested:` line names the exact call, such as
+`agent-parley verify set "make check"`. Detection reads, in order, a
+`Makefile` `check` or `test` target (`make check`, `make test`), a
+`package.json` test script (`npm test`), a `pyproject.toml` `[tool.pytest`
+table (`pytest -q`), a `Cargo.toml` (`cargo test`) and a `go.mod`
+(`go test ./...`). It only suggests; nothing is recorded until the operator
+runs that command.
 
 ## Requiring a recorded approval
 
@@ -2717,11 +3641,15 @@ agent-parley reject claude-1 'Needs a test for the retry path'
 `approval set` records the requirement in the project manifest beside the
 roster, outside the target source tree, and takes any of `merge`, `pr`, both,
 or nothing at all. A repository with nothing required integrates exactly as
-before.
+before. Like `verify set`, it refuses inside an assigned worktree and in any
+process holding a lane's `AGENT_PARLEY_TOKEN`, so a lane cannot lift the
+requirement on its own work; `approval show` stays readable from a lane.
 
 With a step required, `participant merge` and `participant pr` refuse until a
 decision for that lane's current ready report is recorded, and the refusal
-names the report and the `agent-parley approve NAME` that grants it. The
+names the report and the `agent-parley approve NAME` that grants it. `approve`
+and `reject` refuse inside an assigned worktree and in any process holding a
+lane's `AGENT_PARLEY_TOKEN`, so a lane cannot decide its own work. The
 decision is bound to the identifier of that report, the exact commit the lane
 branch points at, the branch and base it targets, the repository root, and a
 digest of the verification command, the pull-request policy and the approval
@@ -2740,7 +3668,9 @@ work, and can go on committing. Only these two commands are refused, and only
 until a further decision is recorded.
 
 Both commands run from the base checkout and refuse to run inside an assigned
-worktree, so no lane records the approval of its own work through them. That is
+worktree or with a lane's `AGENT_PARLEY_TOKEN` set, even after changing
+directory to the base checkout, so no lane records the approval of its own work
+through them. That is
 this tool's command-line boundary, not an operating-system one: a program
 running under your account can write coordination state directly. Separate the
 operator from the lanes as different operating-system users, or in different
@@ -2765,9 +3695,11 @@ the lifecycle hooks refuse tool use with that same reason, and `top` reports
 `paused` in `STATE`. Resuming clears the flag and nothing else. Pausing a lane
 that is already paused reports that and changes nothing.
 
-`participant stop NAME` ends the session from outside its terminal. It delivers
-one final operator notice, signals the recorded session process exactly as a
-normal exit signals it, and waits a bounded time for it to leave. A process that
+`participant stop NAME` ends the session from outside its terminal. It signals
+the recorded session process exactly as a normal exit signals it and waits a
+bounded time for it to leave. It mails the lane no notice: the session is gone
+before it could read one, so the mail would only reach the next session as an
+instruction to end. A process that
 ignores that signal, such as a client wedged in a native dialog or left behind by
 a system hang, is sent `SIGKILL` through the same pinned identity. The session
 record is cleared only once the process is verified gone; a process that
@@ -2813,7 +3745,9 @@ agent-parley init set ''
 ```
 
 `init set` records that command in the same project manifest, outside the target
-source tree, and `init show` reports it. A repository with nothing configured
+source tree, and `init show` reports it. Like `verify set`, `init set` refuses
+inside an assigned worktree and in any process holding a lane's
+`AGENT_PARLEY_TOKEN`, so a lane cannot change what its peers run. A repository with nothing configured
 hands the native CLI a bare worktree exactly as before. With a command
 configured, the launcher runs it in the new worktree after `git worktree add`
 and before the native CLI starts, so dependencies, an untracked environment
@@ -2929,7 +3863,8 @@ as the operator, run lanes under a separate OS account.
 its claim generation is current, it is reported ready at the commit the lane
 still sits on, the base checkout is on the target branch, its dependencies are
 verified complete, a verification command is configured, and no peer
-reservation covers a changed path. The merge itself is the `participant merge`
+reservation covers a changed path. `--issue N` picks the claim when the lane
+holds several; without it the lane's only ready claim is used. The merge itself is the `participant merge`
 step, with the same locks, approvals and gates, so a concurrent attempt is
 refused as busy. Each attempt records a decision in the lane's report log with
 the claim generation, source and target commits, gate and outcome; a refusal
@@ -2943,15 +3878,43 @@ is merged. Running it again after a recorded integration merges nothing; an
 earlier integration never stands in for a different issue, claim or commit.
 It never pushes and makes no forge calls: forge checks and reviews are enforced
 when you push the target branch, not at the local merge, and each decision
-records `forge: "deferred to push"`. The supervision service does not
-dispatch it automatically.
+records `forge: "deferred to push"`.
 
-`participant retire` removes one lane: it refuses while a session is running or
-the worktree is dirty, removes the worktree, invalidates that participant's
-coordination credential, and drops its manifest entry. Removing the worktree
-deletes its ignored files, such as a local `.env` or build output, so retire
-lists them and asks first; `--yes` answers in advance, and a declined or
-unanswered question retires nothing and exits non-zero. `gc --apply` reclaims
+The supervision service attempts it on its own only when the policy also
+records `auto`:
+
+```bash
+agent-parley unattended set 42 43 --target main --auto
+```
+
+which stores `"auto": true` beside `target` and `issues`; absent means false,
+so existing projects are unchanged. Each poll then attempts every listed issue
+whose claim is ready, on a thread of its own, with the same command's checks
+and gates. A lane whose session is running is left until it ends. A claim is
+attempted once per issue, claim generation, ready commit and target commit, so
+an unchanged refusal is recorded once rather than on every poll; fix what it
+names and run `unattended run NAME`, or let a new commit or a moved base bring
+the next attempt. The lane is mailed every new decision, the decision's
+evidence carries `actor: "service"`, and a failed attempt shows as an
+`unattended integration failed` row in `problems` until a later decision, a
+release or a completion clears it. The service still never pushes and never
+merges into anything but the recorded target.
+
+`participant retire` removes one lane: it refuses while a session is running,
+the worktree is dirty or the lane holds ready work awaiting integration, then
+returns the lane's issue claims to the pool, releases its advisory
+reservations and grants any key a peer was queued for, marks mail it has not
+read or acknowledged as superseded, removes the worktree, invalidates that
+participant's coordination credential, and drops its manifest entry. Removing
+the worktree deletes its ignored files, such as a local `.env` or build
+output, so retire lists them and asks first; `--yes` answers in advance, and a
+declined or unanswered question retires nothing and exits non-zero.
+`participant retire --ready` takes the place of a lane name and retires every
+lane `problems` lists as `ready to retire`, one at a time through the same
+path, so each lane still asks about its ignored files unless `--yes` is given.
+It prints one result line per lane, carries on past a lane that refuses or
+is declined, and exits non-zero if any did.
+`gc --apply` reclaims
 only lanes whose work has already landed, so it removes their ignored files
 without asking. The branch is deleted
 only when it adds no commits to the project base; otherwise the branch is kept
@@ -2966,12 +3929,18 @@ queued for, removes its worktree when Git reports it clean, and invalidates its
 credential. Unlike `participant retire` it keeps the manifest entry, marked with
 the time it retired: `status` and `top` show the lane as `retired AGE ago`, the
 JSON views carry `retired_at`, and the service neither wakes it nor names it in
-a work offer. A lane whose worktree is dirty keeps it, and the changed paths are
-reported in the tool result. A lane that holds ready work is refused before
-anything is released, naming those issues: ready work stays claimed until
-`agent-parley participant merge NAME` lands it, or the lane offers it to a
-peer. Return
-that lane to service with the same
+a work offer. A lane whose worktree is dirty, or holds files Git ignores such
+as a local `.env`, keeps it, and those paths are reported in the tool result;
+no confirmation is asked, so ignored files are never deleted this way. A lane that holds ready work, or a claim blocked
+on anything but another issue, is refused before anything is released, naming
+those issues: ready work stays claimed until `agent-parley participant merge
+NAME` lands it or the lane offers it to a peer, and an operator-blocked claim
+stays with the lane that recorded it until that lane offers it or releases it
+with `issue release` on purpose. The service's work offer says the same
+instead of telling such a lane to retire. The session that retired keeps its
+native tools: the hook allows every call, decides nothing, and tells the
+session start and each prompt once that the lane retired, naming the
+re-admit command. Return that lane to service with the same
 `participant add NAME` command that created it, which restores its worktree on
 its own branch; the next launch registers a fresh credential.
 
@@ -2985,7 +3954,8 @@ states how many units of work the claim still has left.
 state. Default state is `~/.local/state/agent-parley`, mode 0700. Logs are in
 `server.log`, with the previous window in `server.log.1`; repeated per-lane
 `undecided`, `unanswered` and `unrecovered` entries are coalesced to one per
-minute, and the next entry carries the count it skipped. Set
+minute, and the next entry carries the count it skipped. An `unrecovered`
+entry names the exception type, its text and the line that raised it. Set
 `AGENT_PARLEY_HOME` or pass `--home` for another private root.
 Set `AGENT_PARLEY_PORT` before first initialization to override port 8876.
 
@@ -3001,6 +3971,43 @@ once a minute, and after repeated failed starts the wait doubles per failure
 up to 16 minutes. A relaunch stamp dated in the future, as a backward clock
 step leaves, does not hold the next request off. A machine that has never started a service is left alone: the first start
 belongs to the launch or to the operator.
+
+### Decisions wait for the operator
+
+The service never answers an open decision on the operator's behalf. Every
+decision kind is declared once, in `agent_parley/timeouts.py`, with its class
+and its recommended option:
+
+| Kind | Class | Default | Timeout |
+| --- | --- | --- | --- |
+| `merge_default` | irreversible | wait for the operator | never |
+| `release_tag` | irreversible | wait for the operator | never |
+| `discard_work` | irreversible | wait for the operator | never |
+| `delete_branch` | irreversible | wait for the operator | never |
+| `native_permission` | irreversible | wait for the operator | never |
+
+An irreversible kind, and any kind the table does not know, always waits for
+an answer. `permission_prompt`, `permission_denied` and `native_dialog`
+records are `native_permission` decisions and wait like the rest. Every other
+open decision record, the ones notifications deliver, also stays open until
+the operator answers it. An `orphan_decision` record is one of them: the
+service cannot carry out any of its options for the operator, so it stays
+open until the operator answers or the dead lane's work is returned at
+`orphan_retire_after`, which marks it stale. The former `orphan_claim` kind
+is gone; `timeout set orphan_claim` is refused and a policy entry that still
+names it is ignored.
+
+`agent-parley timeout show` lists the table. `agent-parley timeout set KIND
+--ask` or `--after DURATION`, run from the base checkout, refuses every
+current kind: an irreversible kind always waits, and any other name is not a
+decision kind. A policy is stored in `project.json` under `"timeouts"`, as
+`{"KIND": {"ask": true}}` or `{"KIND": {"seconds": 7200}}`, and can only make
+a kind more cautious: a timeout under 30 minutes or over seven days is
+refused, and a manifest holding an invalid entry for a known kind is refused
+when read. An entry stored by an earlier release for `orphan_claim`,
+`closed_claim`, `idle_key` or `failed_ci` is ignored, and dropped the next
+time `timeout set` writes the policy. `set` refuses lane shells the way
+`unattended set` does.
 
 ### Keeping the service across reboots
 
@@ -3040,13 +4047,58 @@ agent-parley` reports when the installation is not in `~/.local/bin`, and set
 `Environment=AGENT_PARLEY_HOME=...` in the `[Service]` section for a private
 root other than the default.
 
+On macOS a launchd agent does the same. Write
+`~/Library/LaunchAgents/dev.agent-parley.service.plist`, replacing
+`/Users/example` with your home directory. launchd does not expand `~` or
+`$HOME`, and `~/.local/bin` is not on its path, so every path is absolute:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agent-parley.service</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/example/.local/bin/agent-parley</string>
+    <string>up</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+```
+
+Check it, load it into your login session, and unload it with:
+
+```bash
+plutil -lint ~/Library/LaunchAgents/dev.agent-parley.service.plist
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/dev.agent-parley.service.plist
+launchctl bootout "gui/$UID" ~/Library/LaunchAgents/dev.agent-parley.service.plist
+```
+
+`up` returns once the service answers, so launchd sees the job exit and does
+not stop the service on `bootout`. Stop it with `agent-parley down`, as with the
+systemd unit. The agent loads at login, so the service returns after a reboot
+once you sign in. Use the path `which agent-parley` reports when the
+installation is not in `~/.local/bin`.
+
+On WSL2 the systemd recipe above works once systemd is enabled in the
+distribution, with `systemd=true` under `[boot]` in `/etc/wsl.conf` and a
+restart of the distribution with `wsl --shutdown`. Without it the user unit
+never runs. The distribution also stops when its last terminal closes, which
+stops the service with it. In that case nothing restarts the service at boot;
+it starts again with the next `agent-parley run`, or with `agent-parley up`.
+
 Worktrees start at a captured commit and persist. Ignored environment files,
 dependencies and untracked configuration are not copied. Set up each worktree
 as needed. Review each lane's branch, integrate it with `participant merge` or
 with Git directly, then run the target repository's combined verification gate.
-The service never starts a merge: `participant merge` and `unattended run` are
-both operator commands, run from the base checkout. A reported `ready` outcome
-does not establish that a branch is fit to merge.
+`participant merge` and `unattended run` are both operator commands, run from
+the base checkout. The service starts a merge only for issues an unattended
+policy recorded with `--auto` lists, on that command's terms. A reported
+`ready` outcome does not establish that a branch is fit to merge.
 
 ## Plugins
 
@@ -3096,6 +4148,10 @@ CI builds artifacts; it does not submit review forms.
 `docs/catalog-submission.md` records what each catalog asks for, the checks that
 can be run in this repository before submitting, and the steps that are bound to
 the owner's accounts and cannot be delegated.
+
+`docs/mcp-directories.md` does the same for the MCP directories: the
+`server.json` and `glama.json` manifests, the check that validates them, and
+the owner-only submission steps and open decisions.
 
 ## Releases
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, plan
+from agent_parley import cli, merges, plan
 from agent_parley.cli import git
 from agent_parley.state import BridgeError
 
@@ -192,3 +192,94 @@ def test_a_ready_group_is_visible_before_anyone_merges(bridge, repo, waiting):
     project = bridge.status_snapshot()["projects"][0]
     assert project["ready_groups"] == ["rewrite"]
     assert plan.groups(directory) == {"rewrite": ["42", "43"]}
+
+
+def test_a_waiting_lane_alone_merges_nothing_and_names_the_wait(
+    bridge, repo, waiting
+):
+    directory = bridge.project(repo)[1]
+
+    with pytest.raises(BridgeError, match="still waits on #42") as refused:
+        bridge.merge(repo, "codex")
+    assert "held by claude" in str(refused.value)
+    assert "issue unblock 43 --on 42" in str(refused.value)
+    assert git(repo, "log", "--pretty=%s").splitlines() == ["Initial fixture"]
+    assert merges.integration_record(directory) is None
+
+    assert "still waits on #42" in bridge.preview_merge(repo, "codex")
+    preview = bridge.integrate(repo, preview=True, lanes=["codex"])
+    assert "still waits on #42" in preview
+
+    with pytest.raises(BridgeError, match="refused") as stopped:
+        bridge.integrate(repo, lanes=["codex"])
+    assert "still waits on #42" in str(stopped.value)
+    assert git(repo, "log", "--pretty=%s").splitlines() == ["Initial fixture"]
+    assert merges.integration_record(directory) is None
+
+
+def test_a_group_with_an_unapproved_member_merges_nothing(
+    bridge, repo, waiting
+):
+    bridge.work_plan(repo, "apply", written(repo.parent))
+    bridge.approval_policy(repo, ["merge"])
+    bridge.approve(repo, "claude")
+
+    with pytest.raises(BridgeError, match="refused as a whole") as refusal:
+        bridge.integrate(repo, group="rewrite")
+    report = str(refusal.value)
+    assert "codex: " in report
+    assert "agent-parley approve codex" in report
+    assert "claude: " not in report
+    assert git(repo, "log", "--pretty=%s").splitlines() == ["Initial fixture"]
+
+    preview = bridge.integrate(repo, group="rewrite", preview=True)
+    assert "agent-parley approve codex" in preview
+    assert "agent-parley approve codex" in bridge.preview_merge(repo, "codex")
+
+
+def test_a_group_member_that_committed_after_ready_merges_nothing(
+    bridge, repo, waiting
+):
+    bridge.work_plan(repo, "apply", written(repo.parent))
+    lane = Path(waiting["lanes"]["codex"])
+    (lane / "later.txt").write_text("unreported\n")
+    commit(lane, "Unreported work")
+
+    with pytest.raises(BridgeError, match="refused as a whole") as refusal:
+        bridge.integrate(repo, group="rewrite")
+    assert "codex committed since issue #43" in str(refusal.value)
+    assert git(repo, "log", "--pretty=%s").splitlines() == ["Initial fixture"]
+
+
+def test_an_unapproved_lane_stops_an_ungrouped_run_as_refused(
+    bridge, repo, waiting
+):
+    bridge.approval_policy(repo, ["merge"])
+    bridge.approve(repo, "claude")
+
+    with pytest.raises(BridgeError) as stop:
+        bridge.integrate(repo)
+    report = str(stop.value)
+    assert "- codex: refused." in report
+    assert "agent-parley approve codex" in report
+    assert "Integrated 1 of 2 lanes: claude." in report
+
+
+def test_running_claims_do_not_order_or_cycle_a_run(bridge, repo, paired):
+    identify(repo)
+    claude = worked(bridge, paired, "claude", "1", "first.txt")
+    codex = worked(bridge, paired, "codex", "2", "second.txt")
+    bridge.issue(claude, "claim", "4")
+    bridge.issue(codex, "claim", "3")
+    bridge.issue(claude, "block", "4", on="2")
+    bridge.issue(codex, "block", "3", on="1")
+
+    plan_view = bridge.integration_plan(repo)
+    assert plan_view["sequence"] == ["claude", "codex"]
+    assert plan_view["outside"] == []
+
+    report = bridge.integrate(repo)
+
+    assert "Integrated 2 of 2 lanes: claude, codex." in report
+    assert (repo / "first.txt").exists()
+    assert (repo / "second.txt").exists()

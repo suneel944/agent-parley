@@ -21,6 +21,7 @@ passes on the release commit; see `scripts/release_publish.py`.
 """
 
 import errno
+import json
 import shlex
 import subprocess
 import sys
@@ -162,6 +163,11 @@ class Scenario:
         self.repo = repo
         self.clock = clock
         self.directory = Path(paired["lanes"]["claude"]).parent
+        self.root = paired["root"]
+        self.displays = {
+            name: participant["display"]
+            for name, participant in paired["participants"].items()
+        }
         self.start = clock()
         self.service = True
         self.unaccounted = 0
@@ -268,6 +274,10 @@ def scenario(bridge, repo, paired, monkeypatch):
         git(path, "config", "user.email", "test@example.com")
     bridge.verification(repo, f"{shlex.quote(sys.executable)} -c pass")
     bridge.approval_policy(repo, ["merge"])
+    manifest_path = bridge.project(repo)[1] / "project.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
+    write_json(manifest_path, manifest)
     store.initialize(bridge.home)
     for participant in paired["participants"].values():
         store.register(bridge.home, paired["root"], participant["display"])
@@ -285,6 +295,11 @@ def test_a_lane_killed_mid_claim_is_taken_over_and_completed(scenario):
     holder.kill()
     scenario.tick(STALL + 1)
     assert scenario.record()["orphan"]["owner"] == "claude"
+    assert "claude" in scenario.resumes
+    waiting = store.waiting(
+        scenario.bridge.home, scenario.root, scenario.displays["codex"]
+    )
+    assert waiting["kind"] == "unread"
     scenario.bridge.issue(peer.lane, "claim", NUMBER, take_orphaned=True)
     peer.turn()
     scenario.tick()

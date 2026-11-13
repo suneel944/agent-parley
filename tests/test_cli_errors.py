@@ -1,6 +1,7 @@
 """Checks the JSON error document the CLI prints for runtime failures."""
 
 import json
+import sqlite3
 import subprocess
 import sys
 
@@ -16,6 +17,11 @@ FAILURES = (
         subprocess.TimeoutExpired(["gh", "api"], 5),
         "timeout",
         "Command '['gh', 'api']' timed out after 5 seconds",
+    ),
+    (
+        sqlite3.OperationalError("database is locked"),
+        "store",
+        "database is locked",
     ),
 )
 
@@ -63,6 +69,47 @@ def test_human_mode_keeps_the_plain_error(
     assert captured.err == f"agent-parley: {message}\n"
 
 
+def test_missing_key_names_the_frame_that_raised_it(
+    monkeypatch, capsys, tmp_path
+):
+    assert fail_up(monkeypatch, tmp_path, KeyError("claude-9"), "--json") == 1
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert len(lines) == 1
+    error = json.loads(lines[0])["error"]
+    assert error["type"] == "missing"
+    assert error["where"].startswith("test_cli_errors.py:")
+    assert error["message"] == (
+        f"No record 'claude-9' (at {error['where']}); if another command "
+        "changed the project meanwhile, rerun it, otherwise report this line."
+    )
+    assert captured.err == f"agent-parley: {error['message']}\n"
+
+
+def test_corrupt_config_names_the_file_and_key(monkeypatch, capsys, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    (home / "config.json").write_text("{}\n")
+    monkeypatch.setattr(
+        sys, "argv", ["agent-parley", "--home", str(home), "up", "--json"]
+    )
+    assert cli.main() == 1
+    captured = capsys.readouterr()
+    error = json.loads(captured.out)["error"]
+    assert error["type"] == "bridge"
+    assert error["message"].startswith(f"{home / 'config.json'} lacks 'port';")
+    assert captured.err == f"agent-parley: {error['message']}\n"
+
+
+def test_corrupt_manifest_names_the_file_and_key(tmp_path):
+    (tmp_path / "project.json").write_text('{"participants": {}}\n')
+    with pytest.raises(BridgeError) as raised:
+        cli.roster.read(tmp_path)
+    assert str(raised.value).startswith(
+        f"{tmp_path / 'project.json'} lacks 'root';"
+    )
+
+
 def test_partial_output_is_followed_by_its_own_error_line(
     monkeypatch, capsys, tmp_path
 ):
@@ -77,6 +124,17 @@ def test_partial_output_is_followed_by_its_own_error_line(
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == '{"schema": "partial"'
     assert json.loads(lines[-1])["error"]["message"] == "stopped midway"
+
+
+def test_pause_refuses_a_lane_retired_before_the_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli.Bridge, "_lane", lambda self, repo, name: (tmp_path, None, None)
+    )
+    monkeypatch.setattr(
+        cli.roster, "read", lambda directory: {"participants": {}}
+    )
+    with pytest.raises(BridgeError, match="claude-9 was retired"):
+        cli.Bridge(tmp_path).pause(tmp_path, "claude-9")
 
 
 def test_argument_errors_keep_the_argparse_contract(monkeypatch, capsys):

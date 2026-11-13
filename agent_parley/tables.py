@@ -13,6 +13,7 @@ whole table, so a pipe or a file keeps every column.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 GAP = "  "
@@ -42,14 +43,38 @@ LANE_COLUMNS = ("LANE", "STATE", "CLAIMS", "TASK")
 
 
 def age(seconds: float) -> str:
-    """Formats an age compactly, without ever implying sub-second precision."""
+    """Formats an age compactly, without ever implying sub-second precision.
+
+    Ages of two days and more read in days, so a lane retired a month ago
+    reads `30d` rather than `720h`.
+    """
     if seconds < 0:
         return "-"
     if seconds < 90:
         return f"{int(seconds)}s"
     if seconds < 5400:
         return f"{int(seconds / 60)}m"
-    return f"{int(seconds / 3600)}h"
+    if seconds < 172800:
+        return f"{int(seconds / 3600)}h"
+    return f"{int(seconds / 86400)}d"
+
+
+def natural_key(name: str) -> tuple[tuple[int, str], ...]:
+    """Orders names so a run of digits compares by value.
+
+    `codex7` sorts before `codex13`, as an operator scanning for a numbered
+    lane expects, where plain string order would put it after.
+
+    Args:
+        name: A lane or participant name.
+
+    Returns:
+        A sort key: each digit run as its number, each other run as text.
+    """
+    return tuple(
+        (int(part), "") if part.isdigit() else (-1, part)
+        for part in re.split(r"(\d+)", name)
+    )
 
 
 def size(count: int) -> str:
@@ -350,8 +375,9 @@ def pull_cell(claim: dict) -> str:
 
     Returns:
         ``ended`` with any observed branch state for a claim whose work ended
-        on the forge, the cached open pull request's number, check verdict
-        and any conflict, or ``-`` when none is cached.
+        on the forge, the cached open pull request's number, check verdict,
+        how long a pending head has waited, any stall and any conflict, or
+        ``-`` when none is cached.
     """
     if claim.get("ended"):
         state = str(claim.get("branch_state") or "").lower()
@@ -360,6 +386,10 @@ def pull_cell(claim: dict) -> str:
     if not pull:
         return "-"
     cell = f"#{pull['number']} CI {pull['checks'] or 'unknown'}"
+    if pull["checks"] == "pending" and pull.get("pending_seconds") is not None:
+        cell += f" {age(pull['pending_seconds'])}"
+    if pull.get("stalled"):
+        cell += ", stalled"
     if pull.get("mergeable") == "CONFLICTING":
         cell += ", conflicting"
     return cell

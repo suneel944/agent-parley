@@ -47,7 +47,72 @@ runs only when a lane is created, never on a resume, and `participant add` runs
 it as well. `AGENT_PARLEY_BASE` names the base checkout while it runs, so the
 command can copy a file Git does not track. A non-zero exit refuses the launch
 and reports the exit status with the tail of the output; the worktree is left in
-place so you can see what happened.
+place so you can see what happened. Like `verify set`, `init set` runs only from
+an operator shell in the base checkout: it refuses inside an assigned worktree
+and in any process holding a lane's `AGENT_PARLEY_TOKEN`, so a lane cannot plant
+a command every later lane runs. `init show` stays readable from a lane.
+
+Each launch records how long `run` took to reach the native CLI, split into
+worktree creation, `init` and CLI start (registration, the service and the
+native configuration). `participant show` prints it as `Last launch:`, and
+`participant show --json` reports it as `launch_timing`. A resumed lane records
+zero for the worktree and `init`, because it pays for neither.
+
+When `init` is most of that wait, keep prepared spare worktrees:
+
+```sh
+agent-parley pool set 2    # keep two spares ready
+agent-parley pool show     # configured size and each spare's state
+agent-parley pool fill     # prepare missing spares now, in the foreground
+agent-parley pool set 0    # keep none; the next gc removes the rest
+```
+
+A spare is a worktree on its own branch, cut from the project base, with `init`
+already run in it. It lives in the project's private state directory as
+`spare.N`, outside the target repository, and carries no participant, no
+credential profile and no registration. `run` takes a ready spare when one
+exists, renames its branch to the lane branch it would have created under the
+project branch prefix, keeps the spare's worktree path as the lane's path, and
+starts the CLI there; a detached fill then prepares a replacement, logging to
+`pool.log` in the project state directory. A spare cut from an older base,
+prepared by a different `init` command, or moved off its own branch is stale: it
+is never handed out, and the next fill or `gc --apply` removes its worktree and
+branch. `status` counts spares as ready, preparing or stale, and `gc` lists each
+one. Like `init set`, `pool set` runs only from an operator shell.
+
+A path any participant records as its lane, live, retired or reclaimed, stays
+claimed until that participant leaves the roster: a fill never creates a spare
+there, and a spare recorded at such a path is dropped from the record without
+touching its worktree and is never handed out. Re-admitting a retired lane
+recreates its own worktree on its own branch; when its path already holds a
+recorded spare, another participant's lane, or a worktree on another branch,
+re-admission refuses instead of sharing that worktree.
+
+### Starting on an issue
+
+```sh
+agent-parley run claude --issue 42
+```
+
+`--issue N` claims issue N for the lane before its native CLI starts, through
+the same claim `issue claim` makes, so an issue another lane owns refuses the
+launch and the project's claim cap still applies. The launcher then reads the
+issue through the configured forge (`gh` on GitHub, `bd` under Beads) and opens
+the session with a digest instead of `--task`: the issue number, the project's
+`verify` command, the expected outcome (a pull request when
+`pull_request.self_service` is on, otherwise a ready report), and the issue's
+title, body, three newest comments and the titles of up to five issues its body
+mentions by number.
+
+The quoted issue text is held to 6000 bytes. The title and linked titles are
+kept whole, each comment is cut to 600 bytes and the body gets the rest. Anything
+cut or left out is named with the command that prints the full issue, such as
+`gh issue view 42 --repo OWNER/NAME --comments`. The text sits between fixed
+markers and is labelled untrusted input that describes the work; it is not an
+instruction to the lane or the launcher. A forge that is absent, offline or
+refusing never blocks the launch: the claim stays, and the lane starts with the
+issue number and a note that hydration failed, so it reads the issue itself.
+Native authentication and permissions are unchanged.
 
 ## Steering a lane
 
@@ -91,10 +156,10 @@ agent-parley participant restart claude-2   # start it again in its worktree
 
 A paused lane keeps its session, its claims and its reservations. Only acting is
 refused: every coordination call and every tool use comes back denied naming the
-operator, and `top` shows `paused`. `stop` tells the lane once, then signals the
-recorded session process exactly as a normal exit does, sends `SIGKILL` to one
-that ignores it, and never signals a process whose recorded identity no longer
-matches. `restart` refuses while a current session is alive, and ends a wedged
+operator, and `top` shows `paused`. `stop` mails the lane nothing, because only the
+next session would read it, as an order to end; it signals the recorded session
+process exactly as a normal exit does, sends `SIGKILL` to one that ignores it,
+and never signals a process whose recorded identity no longer matches. `restart` refuses while a current session is alive, and ends a wedged
 one first: a live process whose evidence is stale past `inactive_after`, such
 as a client left in a native dialog. It refuses a lane that is off its assigned
 branch. Uncommitted work stays in place; when there is any, the lane's claims
@@ -105,16 +170,43 @@ and supervision neither wakes nor resumes it, so `restart` is how it comes
 back.
 None of the four releases a claim: ownership still moves only through an
 explicit release or an accepted handoff, and all four land in the event log.
+A lane left dead past `orphan_retire_after` is the one exception: the service
+returns its claims and reservations to its peers, as
+[Coordination](coordination.md#a-dead-lanes-claims-are-offered-then-returned)
+describes, but keeps the lane and its worktree, so `restart` or
+`agent-parley run NAME --resume` still brings it back. A lane is never read as
+dead while a native client of its provider still runs in its worktree: a
+session forked or resumed there under a new session ID is bound to the lane
+instead, as [Monitoring](monitoring.md#a-second-session-in-a-lane) describes.
 
 A lane whose work has landed does not need removing by hand. The service sweeps
 merged lanes that hold no work, and the worktrees lanes made, at most every 900
 seconds. `agent-parley gc` reports the same sweep on demand, `gc --apply`
 removes what it may, and `--force` also removes a lane-made worktree holding
-uncommitted or unpushed work after writing a recovery checkpoint of it. The
+uncommitted or unpushed work after writing a recovery checkpoint of it. A quiet
+lane-made worktree whose unpushed commits already landed through another branch
+is bundled into a checkpoint and removed without `--force`; a lane's own
+worktree with unpushed commits is still kept. A worktree holding ignored files
+is kept even with `--force`, because no checkpoint carries them. The
 conditions are in [Operations](operations.md#reclaiming-landed-lanes). An
 attached `run` titles its terminal tab with the lane name, its state and its
 claim progress, and `agent-parley title` prints the same line for a native
 status line.
+
+### Waiting on something
+
+A lane told to wait on a peer, a CI run or an operator decision reports it
+instead of going quiet or reporting blocked:
+
+```sh
+agent-parley report --state waiting --until 3600 --summary "waiting on the CI run"
+```
+
+The lane keeps its session. `status` and `top` show it as waiting on that
+reason with its next-check time, and the supervisor does not wake it until
+then, capped by the project's `deadlines.wait` ceiling. A blocked report is for
+a lane that cannot continue: it ends the lane's work on the claim and the next
+resume starts a fresh session.
 
 ## Integrating one lane
 
@@ -139,8 +231,11 @@ agent-parley participant merge claude-2 --preview
 ```
 
 The preview only reads. It changes nothing, and it never takes the lane's
-session lock, so it is safe while that agent is still working. It attempts no
-merge, so it cannot predict conflicts.
+session lock, so it is safe while that agent is still working. On Git 2.38 or
+later it predicts conflicts with `git merge-tree`, which touches no checkout: a
+lane that would conflict is refused with the conflicting paths, and `participant
+merge` refuses it the same way before anything is merged. Older Git cannot
+predict conflicts.
 
 Or send it for review instead:
 
@@ -187,7 +282,10 @@ single-lane path, so nothing is integrated on easier terms than it would be
 alone.
 
 A group is admitted whole or not at all: one refused member leaves the group
-unmerged. Execution is ordered rather than atomic, so a merge or a gate failure
+unmerged. The whole run is predicted first, each lane onto the lanes before it,
+and a run in which any lane would conflict, alone or only in combination, merges
+nothing and names the lanes and paths. Execution is ordered rather than atomic,
+so a merge or a gate failure
 part way through stops the run, leaves the earlier merge commits in place and
 reports what was integrated, what refused and what was not attempted. Nothing is
 reset or reverted.
@@ -202,11 +300,14 @@ or independent verification.
 
 ## Running unattended
 
-A project can authorize, ahead of time, the integration of named issues so a
-ready lane need not wait for you to be at the terminal. From the base checkout:
+A project can authorize, ahead of time, the integration of named issues.
+Without `--auto` the policy only sets the terms an operator-typed
+`unattended run` applies; with `--auto` the service runs it, so a ready lane
+need not wait for you to be at the terminal. From the base checkout:
 
 ```sh
 agent-parley unattended set 42 43 --target main   # record the policy
+agent-parley unattended set 42 43 --target main --auto  # let the service run it
 agent-parley unattended show                      # report it
 agent-parley unattended run claude-1              # integrate one lane under it
 agent-parley unattended set                       # remove it
@@ -215,12 +316,67 @@ agent-parley unattended set                       # remove it
 `unattended run NAME` merges only when the lane's claimed issue is listed, its
 claim and ready commit are current, the base sits on the target branch, its
 dependencies are verified complete, a verification command is configured and
-no peer reservation covers a changed path. The merge is the
-`participant merge` step with the same locks, approvals and gate, and every
-attempt records a decision in the lane's report log. It never pushes, never
-repairs an unverified integration, and the service never runs it on its own:
-it is an operator command. The full policy is in
+no peer reservation covers a changed path. The gate runs first, outside the
+project merge lock, on the ready commit merged into the target in a scratch
+worktree holding tracked files only, so several ready lanes gate at once. The
+merge lock is then taken only to check the target has not moved and merge;
+a moved target is gated again, so an unverified result never lands. The merge
+is the `participant merge` step with the same locks and approvals, and every
+attempt records a decision in the lane's report log. It never pushes and
+never repairs an unverified integration. A lane holding several claims
+integrates its only ready one; when several are ready, name one with
+`--issue N`, which `participant merge NAME` accepts too.
+
+With `--auto` recorded, each supervision poll makes that same attempt for
+every listed issue whose claim is ready, on its own thread so a slow gate
+never holds the poll. A lane whose session is still running waits until the
+session ends, because every merge refuses a running session. The service
+attempts one claim once per issue, claim generation, ready commit and target
+commit, so an unchanged refusal is recorded once, not on every poll; after
+fixing what it names, run `unattended run NAME` or let a new commit move it.
+Each new decision is mailed to the lane, and a failed attempt raises an
+`unattended integration failed` row in `problems`. Without `--auto` the
+service never attempts it. The full policy is in
 [Operations](operations.md#requiring-a-recorded-approval).
+
+A lane is not left pushing fix after fix against red CI. The `ci_rounds`
+supervision setting (default 2) caps the CI rounds one pull request may use,
+where a round is a head commit whose checks finished and a re-run on the same
+head adds none. At the limit with red checks the lane is told to stop pushing
+and report blocked, `problems` lists `ci rounds exhausted`, and one decision
+asks you to grant one more round or take over. The cap is advisory: nothing
+refuses a push. Details are in [Operations](operations.md).
+
+A lane does not carry one native session from claim to claim. A ready or
+blocked report on a claim records a rotation point on the lane, and the next
+resume, `agent-parley run NAME --resume` or the service's own, starts a fresh
+native session instead of continuing the old one. Its first prompt names the
+lane, the claims it still holds with their next action and the last report,
+followed by the task the resume carries, so each claim starts from a bounded
+context. A lane the service resumed without a terminal ends its idle session
+at the next wake after the rotation point, which reads `busy:rotating` in the
+wake result, and the service resumes it fresh on its ordinary wake backoff. A
+lane in your own terminal is never ended this way; it rotates on its next
+resume, and a launch without `--resume` is always a fresh session. Every
+provider starts a fresh session by leaving out its resume argument, so none is
+skipped. The activity record keeps the replaced session as `rotated_from`, and
+a session change by any other route, such as `/clear`, clears the point. Set
+the supervision key `rotate` to false to resume the recorded session instead.
+
+A lane idle past its provider's prompt cache rotates the same way. Native
+prompt caches last about an hour and the wake backoff doubles up to an hour, so
+a woken lane would otherwise re-read its whole transcript uncached. When the
+service wakes or resumes a lane whose last hook event is older than the
+`cache_window` supervision setting (default 3300 seconds, 55 minutes), it reads
+the tokens the lane's current session recorded. Below `cache_restart_tokens`
+(default 50000) the session resumes as before. At or above it, or when the
+count cannot be read, the service records a rotation point with outcome
+`cache` and the lane restarts as a fresh native session. Its first prompt names
+the lane, its branch, the claims it holds with their next action, its
+reservations, its unread mail count and the last report, so no work is lost:
+the worktree, claims, reservations and mail stay where they were. A lane in
+your own terminal, or resumed with `--resume` from one, is never rotated for its
+cache. The per-provider policy is in [Providers](providers.md#prompt-cache-policy).
 
 ## Revising the plan
 
@@ -247,7 +403,7 @@ envelope and escalation rules are in
 ## One command for many lanes
 
 With eight lanes, ending the day should not be eight commands. `say`,
-`participant stop`, `participant pause`, `participant resume`,
+`mail send`, `participant stop`, `participant pause`, `participant resume`,
 `participant merge`, `participant pr` and `issue assign` take a lane selector in
 place of the positional name:
 
@@ -262,7 +418,11 @@ agent-parley participant pr --drifted
 `--all` selects every lane and the other filters narrow it, so they combine.
 Each filter reads the same lane facts `status` reports: the provider driving a
 lane, the lane's own latest reported outcome, whether its checkout sits on the
-branch it was assigned, and whether the lane reads as `idle` rather than active.
+branch it was assigned, whether supervision reads the lane as stalled, and
+whether it is over a limit. `--idle` keeps only the lanes supervision reads as
+stalled: live, owing an answer and serving no calls for longer than
+`stalled_after`. `--over-budget` keeps only the lanes over any of their advisory
+token, call or hour limits.
 A positional name and a selector together are refused.
 
 Every bulk run prints the lanes it matched and what will happen to each, then
@@ -297,6 +457,109 @@ but fail together is caught. A failure after the merge keeps the merge commit,
 records the base as carrying an unverified integration, and holds every further
 merge until `participant merge --verify-recovery` passes or the repairing lane
 retries, with `--renew-recovery` once its attempts are used.
+
+## Running a claim through a blueprint
+
+`init` and `verify` are the same for every task. A blueprint gives one claim an
+ordered list of required steps, so formatting, focused tests or a push happen
+in order instead of whenever the model remembers them. The harness runs the
+deterministic steps itself, with no model call, and hands the lane only the
+steps that need judgment. Blueprints live in coordination state, not in the
+repository. The quickest start is a shipped template:
+
+```sh
+agent-parley blueprint templates                     # pr-loop, test-first, review-only
+agent-parley blueprint set feature --template pr-loop --verify "make check"
+agent-parley run codex --issue 42 --blueprint feature
+```
+
+`pr-loop` has the lane implement the issue, runs the verify command (back to
+the lane on failure), pushes, opens the pull request and waits for CI, handing
+red checks back to the lane. `test-first` asks for a failing test, runs the
+verify command expecting it to fail, then asks for the fix and verifies it.
+`review-only` asks the lane to review the linked pull request and report.
+`--verify` fills each template's verify step; without it the project's
+`verify set` command does, and a template that runs one is refused when
+neither exists. The result is validated like a file, and `blueprint show`
+names the template it came from. To write one by hand:
+
+```json
+{
+  "nodes": [
+    {"name": "format", "kind": "run", "command": "ruff format ."},
+    {"name": "implement", "kind": "agent", "prompt": "Implement the issue."},
+    {"name": "tests", "kind": "run", "command": ["pytest", "-q"],
+     "on_failure": "fix", "retries": 2, "next": "push"},
+    {"name": "fix", "kind": "agent", "prompt": "Fix the failing tests.",
+     "next": "tests"},
+    {"name": "push", "kind": "push"}
+  ]
+}
+```
+
+```sh
+agent-parley blueprint set feature feature.json      # record it
+agent-parley blueprint show feature                  # nodes and edges
+agent-parley blueprint run codex feature --issue 42  # start the claim on it
+agent-parley blueprint advance --issue 42            # after the lane reports
+agent-parley blueprint progress                      # where every run is
+agent-parley run codex --issue 42 --blueprint feature  # claim, launch, start
+agent-parley blueprint default bug bugfix            # label bug runs bugfix
+```
+
+`run NAME --issue N --blueprint B` claims the issue, starts the run on the
+claim, then launches the lane. Without `--blueprint`, an issue whose label
+`blueprint default` maps starts that blueprint; labels mapping to two
+blueprints are refused until `--blueprint` names one. A label default is
+removed with `blueprint default LABEL`, and a blueprint a label still names
+cannot be removed.
+
+Node kinds:
+
+- `run` runs `command`, a string split like `verify set` or a list of
+  arguments, in the lane's worktree as an argument list, never through a
+  shell, within `timeout` seconds (default and ceiling 1800). It keeps the
+  last 40 lines of output. `AGENT_PARLEY_BASE` names the base checkout. The
+  command runs in a session of its own; past its timeout the whole process
+  group gets SIGTERM, then SIGKILL 5 seconds later, before the node fails or
+  retries, so no grandchild of a wrapper such as `make` keeps running.
+- `push` runs `git push --set-upstream origin HEAD` the same way.
+- `agent` writes `prompt` into the lane's inbox, with the last failing step's
+  output attached, and waits. The next `blueprint advance` after the lane
+  files a report passes the node on `ready` and fails it on `blocked`.
+- `pull-request` opens or updates the lane's pull request through the
+  repository's `pull_request.self_service` policy, with every condition of
+  that path: a ready report, the `verify` gate run before the push, the
+  assigned branch and no overlapping peer reservation. It fails while the
+  policy is off.
+- `wait-ci` reads the pull request reading the supervision poll keeps for the
+  lane's branch at its current head commit. It waits while checks are pending,
+  passes on green, and fails on red with the failing checks and the tails of
+  up to three failed-step logs attached for the next `agent` node. A red
+  verdict is judged once per head commit and re-run. When the pull request
+  used its CI rounds (`ci_rounds`), the run ends blocked for the operator.
+- `report` ends the run with `outcome` `done` (the default) or `blocked` and
+  an optional `message`.
+
+A node moves to `next` when it passes, or to the following node when `next`
+is absent; the last node ends the run as done. It moves to `on_failure` when
+it fails, or retries itself when that is absent. Failures count per node, and
+a node that fails more than its `retries` (default 0) ends the run blocked.
+`blueprint progress`, `status`, `top` and `watch` show the current node and
+the nodes passed; a claim without a run shows nothing new.
+
+`supervise` advances runs itself: each poll moves a run whose agent node has a
+new report, or that waits on CI, on a background thread, so a slow node never
+holds the poll. `blueprint advance` stays available to move a run at once.
+
+Only an operator shell in the base checkout sets, starts or advances a
+blueprint; a lane, or any process holding `AGENT_PARLEY_TOKEN`, is refused, so
+a lane cannot plant commands later lanes run. `run` and `push` nodes inherit
+the operator's environment, which is the lane's minus its coordination token,
+and no node can merge: `participant merge` and its `verify` gate stay the only
+way into the base. A run copies its blueprint when it starts, so a later
+`blueprint set` changes only the next run. A claim never started on a
+blueprint behaves exactly as before.
 
 ## Recovering an unverified integration
 
@@ -345,9 +608,49 @@ one, and `history participant NAME --kind approval` lists the decisions with
 the rest of the chain.
 
 `approve` and `reject` run from the base checkout and refuse to run inside an
-assigned worktree, so no lane records the approval of its own work through
-these commands. That is this tool's command-line boundary and not an
+assigned worktree, or with a lane's `AGENT_PARLEY_TOKEN` in the environment
+even after changing directory to the base checkout, so no lane records the
+approval of its own work through these commands. That is this tool's command-line boundary and not an
 operating-system one: a program running as you can write coordination state
 directly. The decision also records that a human decided, not that the code is
 correct; the verification command, the attribution scan and GitHub's own
 checks all still run.
+
+A separate opt-in decides whether the coordination service may resume a lane
+without a terminal:
+
+```sh
+agent-parley approval resume                          # show what is recorded
+agent-parley approval resume --bridge-tools on        # allow the bridge's tools
+agent-parley approval resume --auto-mode on --participant claude-2
+```
+
+`--bridge-tools on|off` records `approve_bridge_tools`, which allows this
+bridge's own tools, and `--auto-mode on|off` records `auto_mode`, which starts
+a `claude` lane in that client's auto permission mode. Without
+`--participant NAME` the setting is the project default. A lane-scoped opt-in
+the lane's CLI cannot carry is refused by name: `auto_mode` on any lane but
+`claude`, and `approve_bridge_tools` on an `amp` lane. [Providers](providers.md)
+lists how each adapter carries the opt-in. A lane whose adapter carries it,
+with neither recorded, is not resumed by the service, because the resume would
+stop at a permission
+prompt nobody sees; `participant add`, `problems` and `doctor` name it as a
+setup gap with this command.
+
+A lane resumed without a terminal can still reach a permission prompt its
+rules do not cover. The dialog watcher opens an operator decision naming the
+prompt and the command it asks to run, which the operator can answer from a
+notification transport. The service never answers it. If the prompt is still
+unanswered after the 30-minute decision deadline, the service ends that
+session with the same verified stop `participant stop` uses. It then records
+the lane as stopped and stores the prompting command as its wake result. The
+lane's waiting mail goes back to its senders, and its claims, offers and
+reservations are returned the way a dead lane's are. The lane is not marked
+operator-stopped, so new work can resume it.
+
+The service still never answers that permission on the lane's behalf once
+it wakes the lane again. The next wake prompt instead names the command
+the prompt asked about and says the permission it needed was never
+granted, so the lane should use another route for that work or ask the
+operator. The note is sent once; a later wake, once this one is admitted,
+does not repeat it.
