@@ -674,8 +674,10 @@ The four merge health families are also exported as
 `agent_parley_project_*`, labelled by project, summed over the reported lanes:
 the fraction is merged over opened summed across them, and the shared-file
 degree is the share of every file those lanes touch that more than one lane of
-the project touches. When supervision re-reads a pull request that left the
-open list, it stores the forge's answer on the archived reading as `ended`. A
+the project touches. With no `--provider` filter, the project sums also count
+the outcomes of lanes no longer in the project, so a removed lane's pull
+requests stay in the project's fraction. When supervision re-reads a pull
+request that left the open list, it stores the forge's answer on the archived reading as `ended`. A
 failed read keeps the pull request in the open list, and an archived reading
 with no answer, such as one archived before `ended` was stored, counts as
 unknown rather than abandoned. The file footprint is the diff `top` already reads, so it describes

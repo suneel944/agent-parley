@@ -755,6 +755,7 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
     for number, item in readings.items():
         if (
             number in every
+            or item.get("ended") == "MERGED"
             or not item.get("gone_at")
             or float(item["gone_at"]) < since
         ):

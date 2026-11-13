@@ -880,15 +880,21 @@ def collect(
         ]
         _orphan_remedies(rows, data["root"])
         metrics.share_files(rows)
+        retired = [
+            counts
+            for name, counts in outcomes["lanes"].items()
+            if name not in data["participants"]
+        ]
         if providers:
             rows = [row for row in rows if row["provider_name"] in providers]
+            retired = []
         projects.append(
             {
                 "root": data["root"],
                 "present": present,
                 "rows": rows,
                 "pull_requests_excluded": outcomes["excluded"],
-                "merge_health": metrics.merge_health(rows),
+                "merge_health": metrics.merge_health([*rows, *retired]),
                 "provider_health": {
                     name: metrics.merge_health(
                         [row for row in rows if row["provider_name"] == name]

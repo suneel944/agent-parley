@@ -151,7 +151,7 @@ def test_only_a_forge_close_is_abandoned_and_an_unread_end_is_unknown():
     lane = metrics.pull_request_outcomes(record, {"issues": {}}, SINCE)
     counts = lane["lanes"]["a"]
     assert counts["pull_requests_opened"] == 4
-    assert counts["pull_requests_closed"] == 3
+    assert counts["pull_requests_closed"] == 2
     assert counts["pull_requests_abandoned"] == 1
     assert counts["pull_requests_end_unknown"] == 1
     assert counts["pull_requests_opened_merged"] == 1
@@ -367,10 +367,20 @@ def test_metrics_status_and_top_report_recorded_outcomes(
         f'{paired["root"]}"}} 0' in text
     )
     merged = run(
-        monkeypatch, capsys, *home, "top", "--once", "--columns", "MERGED"
+        monkeypatch,
+        capsys,
+        *home,
+        "top",
+        "--once",
+        "--columns",
+        "PARTICIPANT,MERGED",
     )
-    assert "MERGED" in merged
-    assert "0%" in merged
+    cells = {
+        line.split()[0]: line.split()[1:]
+        for line in merged.splitlines()
+        if line.split()[:1] in (["claude"], ["codex"])
+    }
+    assert cells == {"claude": ["0%"], "codex": ["-"]}
     document = json.loads(run(monkeypatch, capsys, *home, "top", "--json"))
     row = next(
         participant
@@ -383,3 +393,45 @@ def test_metrics_status_and_top_report_recorded_outcomes(
     summary = "1 opened, 0 merged, 0 closed unmerged"
     assert summary in run(monkeypatch, capsys, *home, "top", "--once")
     assert summary in run(monkeypatch, capsys, *home, "status")
+
+
+def test_a_retired_lane_still_counts_in_the_project_merge_fraction(
+    bridge, paired, monkeypatch, capsys
+):
+    directory = Path(paired["lanes"]["claude"]).parent
+    home = ["--home", str(bridge.home)]
+    project = f'project="{paired["root"]}"'
+    now = time.time()
+    (directory / supervision.PULL_REQUEST_RECORD).write_text(
+        json.dumps(
+            {
+                "read_at": now,
+                "pull_requests": {
+                    "4": {"number": 4, "lane": "claude", "opened_at": now}
+                },
+                "history": [
+                    {
+                        "number": 6,
+                        "lane": "retired",
+                        "opened_at": now,
+                        "gone_at": now,
+                        "ended": "MERGED",
+                    }
+                ],
+            }
+        )
+    )
+    text = run(monkeypatch, capsys, *home, "metrics")
+    assert f"agent_parley_project_merge_fraction_ratio{{{project}}} 0.5" in (
+        text
+    )
+    assert (
+        f"agent_parley_provider_merge_fraction_ratio{{{project},"
+        f'provider="claude"}} 0' in text
+    )
+    filtered = run(
+        monkeypatch, capsys, *home, "metrics", "--provider", "claude"
+    )
+    assert f"agent_parley_project_merge_fraction_ratio{{{project}}} 0" in (
+        filtered
+    )
