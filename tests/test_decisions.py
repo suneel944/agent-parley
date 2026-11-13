@@ -175,7 +175,7 @@ def test_a_failing_transport_never_makes_a_healthy_one_resend(
     assert calls == {"good": 1, "flaky": 5}
 
 
-def test_a_transport_failing_for_good_stops_at_the_attempt_cap(
+def test_a_transport_failing_for_good_keeps_retrying_past_the_cap(
     tmp_path, monkeypatch
 ):
     calls = {"good": 0, "broken": 0}
@@ -193,10 +193,12 @@ def test_a_transport_failing_for_good_stops_at_the_attempt_cap(
     record = opened(tmp_path, now=100.0)
     for tick in range(48):
         decisions.flush(tmp_path, config, now=100.0 + tick * 900.0)
-    assert calls == {"good": 1, "broken": decisions.MAX_ATTEMPTS}
+    assert calls["good"] == 1
+    assert calls["broken"] > decisions.MAX_ATTEMPTS
     stored = decisions.get(tmp_path, record["id"])
-    assert stored["attempts"] == decisions.MAX_ATTEMPTS
+    assert stored["attempts"] == calls["broken"]
     assert stored["state"] == decisions.OPEN
+    assert decisions._lease(tmp_path, stored["retry_at"])
     events = [
         json.loads(line)
         for line in (tmp_path / "codex-events.jsonl").read_text().splitlines()
@@ -205,6 +207,54 @@ def test_a_transport_failing_for_good_stops_at_the_attempt_cap(
         "notification_failed"
     ]
     assert "broken: OSError: smtp refused" in events[0]["cause"]
+
+
+def test_a_lasting_condition_keeps_its_answer_until_it_clears(tmp_path):
+    record = opened(tmp_path, now=100.0)
+    decisions.answer(tmp_path, record["id"], "decline", "cli", now=110.0)
+    kept = opened(tmp_path, now=120.0, keep_answered=True)
+    assert kept["state"] == decisions.ANSWERED
+    assert kept["answer"] == "decline"
+    assert decisions.list_open(tmp_path, 120.0) == []
+    held = decisions.list_open(tmp_path, 120.0, answered=True)
+    assert [item["id"] for item in held] == [record["id"]]
+    assert decisions.close(tmp_path, record["id"], now=130.0)
+    assert decisions.get(tmp_path, record["id"])["answer"] == "decline"
+    again = opened(tmp_path, now=140.0, keep_answered=True)
+    assert again["state"] == decisions.OPEN
+
+
+def test_an_applied_answer_is_asked_afresh_on_recurrence(tmp_path):
+    record = opened(tmp_path, now=100.0)
+    decisions.answer(tmp_path, record["id"], "accept", "cli", now=110.0)
+    assert decisions.applied(tmp_path, record["id"], now=111.0)
+    assert decisions.list_open(tmp_path, 120.0, answered=True) == []
+    again = opened(tmp_path, now=120.0, keep_answered=True)
+    assert again["state"] == decisions.OPEN
+
+
+def test_a_notified_situation_asks_again_once_its_decision_expires(
+    tmp_path,
+):
+    event = notify.Event.HANDOFF_OFFERED
+    fields = {"repo": "/repo", "offer": "abc", "issue": "7"}
+    digest = notify._pending(tmp_path, "codex", event, fields)
+    notify._mark(tmp_path, "codex", event, digest)
+    record = decisions.open_or_refresh(
+        tmp_path,
+        project="/repo",
+        lane="codex",
+        kind=event.value,
+        key=digest,
+        question="A handoff offer is waiting",
+        options=("accept", "decline"),
+        ttl=10.0,
+        now=100.0,
+    )
+    assert decisions.get(tmp_path, record["id"])["expires"] == 110.0
+    assert notify._pending(tmp_path, "codex", event, fields) == digest
+    decisions.answer(tmp_path, record["id"], "accept", "cli", now=105.0)
+    assert notify._pending(tmp_path, "codex", event, fields) == ""
 
 
 def test_a_decision_leased_by_one_sender_is_not_sent_by_another(tmp_path):

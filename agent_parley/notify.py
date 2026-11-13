@@ -110,10 +110,19 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 ACKNOWLEDGE = (("acknowledge",), decisions.REVERSIBLE)
+ORPHAN_GIVE = "give to peer"
+ORPHAN_RETURN = "return work"
+ORPHAN_WAIT = "wait"
+BUDGET_RAISE = "raise"
+PERMISSION_DENY = "deny"
+PERMISSION_ALLOW = "allow"
 
 ANSWERS: dict[str, tuple[tuple[str, ...], str]] = {
     Event.HANDOFF_OFFERED: (("accept", "decline"), decisions.REVERSIBLE),
-    Event.PERMISSION_PROMPT: (("deny", "allow"), decisions.IRREVERSIBLE),
+    Event.PERMISSION_PROMPT: (
+        (PERMISSION_DENY, PERMISSION_ALLOW),
+        decisions.IRREVERSIBLE,
+    ),
     Event.PERMISSION_DENIED: (
         ("run it yourself", "add a rule"),
         decisions.IRREVERSIBLE,
@@ -125,9 +134,9 @@ ANSWERS: dict[str, tuple[tuple[str, ...], str]] = {
     Event.NATIVE_DIALOG: (("acknowledge",), decisions.REVERSIBLE),
     Event.IDLE_BLOCKER: (("wake", "release", "leave"), decisions.REVERSIBLE),
     Event.NON_CONVERGENCE: (("acknowledge",), decisions.REVERSIBLE),
-    Event.RUN_BUDGET_EXHAUSTED: (("stop", "raise"), decisions.REVERSIBLE),
+    Event.RUN_BUDGET_EXHAUSTED: (("stop", BUDGET_RAISE), decisions.REVERSIBLE),
     Event.ORPHAN_DECISION: (
-        ("give to peer", "fresh lane", "retry"),
+        (ORPHAN_GIVE, ORPHAN_RETURN, ORPHAN_WAIT),
         decisions.REVERSIBLE,
     ),
     Event.LANE_BLOCKED: ACKNOWLEDGE,
@@ -773,7 +782,9 @@ def _pending(
     that has not changed sends nothing further. The marker mirrors the
     checkpoint's own suppression of unchanged state and carries no secret.
     Reading it claims nothing: only `_mark`, after a send succeeds, records
-    the situation as notified.
+    the situation as notified. A notified situation whose decision expired
+    unanswered notifies again, so a situation that outlasts its decision
+    is asked afresh rather than left with an answer it would refuse.
 
     Args:
         directory: Private project state directory.
@@ -793,7 +804,17 @@ def _pending(
             sent = json.loads(path.read_text()) if path.exists() else {}
     except (OSError, ValueError, BridgeError):
         return ""
-    return "" if sent.get(event.value) == digest else digest
+    if sent.get(event.value) != digest:
+        return digest
+    project = str(fields.get("root") or fields.get("repo") or "")
+    name = decisions.identifier(project, agent, event.value, digest)
+    record = decisions.get(directory, name)
+    if (
+        record.get("state") == decisions.OPEN
+        and float(record.get("expires") or 0.0) < time.time()
+    ):
+        return digest
+    return digest if record.get("state") == decisions.EXPIRED else ""
 
 
 def _mark(directory: Path, agent: str, event: Event, digest: str) -> None:
@@ -1088,6 +1109,8 @@ def problem_decisions(
     that clears it; a decision whose row is gone is closed. The rows cover
     every project, so one derivation is shared by every project polled
     within `PROBLEM_INTERVAL` seconds instead of being repeated per project.
+    An acknowledged problem stays answered while its row lasts and closes
+    with the row, so it is asked again only when it recurs.
 
     Args:
         home: Private bridge state root.
@@ -1132,9 +1155,10 @@ def problem_decisions(
             detail=f"{row.get('detail', '')}\nremedy: {row.get('command', '')}",
             options=("acknowledge",),
             now=stamp,
+            keep_answered=True,
         )
         kept.append(record["id"])
-    for record in decisions.list_open(directory, stamp):
+    for record in decisions.list_open(directory, stamp, answered=True):
         if (
             record.get("kind") in PROBLEM_CONDITIONS
             and record.get("project") == root
