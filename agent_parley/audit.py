@@ -319,11 +319,11 @@ def horizons(
     entries per issue, `supervision.PULL_REQUEST_HISTORY_SECONDS` of closed
     pull requests, and per lane's report log the newest
     `metrics.MAX_REPORT_RECORDS` records that fit under
-    `metrics.MAX_REPORT_LOG_BYTES`. A report log counts as trimmed when it
-    holds the record cap or at least half the byte cap, the size a byte
-    trim leaves. A cap counts as exceeded when records older than the
-    oldest one kept may have fallen inside the window, so a reader knows
-    the bundle can be missing records there.
+    `metrics.MAX_REPORT_LOG_BYTES`. A cap counts as exceeded when records
+    older than the oldest one kept may have fallen inside the window, so a
+    reader knows the bundle can be missing records there; for a report log
+    that is when its rotation dropped a record recorded at or after
+    `since`.
 
     Args:
         directory: Private state directory for the common repository.
@@ -340,19 +340,11 @@ def horizons(
         for record in issues.snapshot(directory)["issues"].values()
         if (entries := record.get("history") or [])
     )
-    report_records = False
-    for name in manifest["participants"]:
-        kept = metrics.report_records(directory, name)
-        try:
-            size = metrics.report_path(directory, name).stat().st_size
-        except OSError:
-            size = 0
-        trimmed = (
-            len(kept) >= metrics.MAX_REPORT_RECORDS
-            or size >= metrics.MAX_REPORT_LOG_BYTES // 2
-        )
-        if kept and trimmed and float(kept[0].get("at") or 0) > since:
-            report_records = True
+    report_records = any(
+        trimmed >= since
+        for name in manifest["participants"]
+        if (trimmed := metrics.report_trimmed_at(directory, name))
+    )
     window = supervision.PULL_REQUEST_HISTORY_SECONDS
     return {
         "issue_history": {

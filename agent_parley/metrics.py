@@ -126,16 +126,71 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
             with lock(directory / f"{name}-reports.lock", timeout=0.2):
                 with path.open("a", encoding="utf-8") as stream:
                     stream.write(line)
-                for dropped in trim_log(
+                dropped = trim_log(
                     path, MAX_REPORT_LOG_BYTES, MAX_REPORT_RECORDS
-                ):
-                    _drop_attachment(directory, dropped)
+                )
+                for line in dropped:
+                    _drop_attachment(directory, line)
+                if dropped:
+                    _mark_trim(directory, name, dropped[-1])
         except BridgeError:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(line)
     except OSError:
         return record
     return record
+
+
+def _trim_path(directory: Path, name: str) -> Path:
+    """Returns the file holding when one lane's report log last lost a record.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The marker path beside the report log.
+    """
+    return directory / f"{name}-reports.trimmed"
+
+
+def _mark_trim(directory: Path, name: str, line: str) -> None:
+    """Records the time of the newest record a report log rotation dropped.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        line: Newest serialized record the rotation dropped; a damaged
+            line is ignored.
+    """
+    try:
+        dropped = json.loads(line)
+        at = float(dropped["at"])
+    except (ValueError, TypeError, KeyError):
+        return
+    _trim_path(directory, name).write_text(f"{at}\n", encoding="utf-8")
+
+
+def report_trimmed_at(directory: Path, name: str) -> float:
+    """Reads when one lane's report log last dropped a record.
+
+    The size of a rotated log says nothing reliable about whether it was
+    rotated, because the byte rotation leaves it at or under half the cap
+    and an unrotated log can be larger. The rotation therefore records the
+    time of the newest record it dropped, and a reader asks for that.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        Unix time of the newest dropped record, or zero when the log has
+        never dropped one.
+    """
+    try:
+        return float(_trim_path(directory, name).read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
 
 
 def _drop_attachment(directory: Path, line: str) -> None:

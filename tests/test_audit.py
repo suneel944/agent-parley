@@ -278,16 +278,29 @@ def test_a_lone_surrogate_exports_and_verifies(
 def test_report_log_trimmed_by_bytes_counts_as_exceeded(tmp_path):
     directory = tmp_path / "state"
     directory.mkdir()
-    for _ in range(100):
+    manifest = {"participants": {"claude": {}}}
+    log = metrics.report_path(directory, "claude")
+    large_untrimmed = False
+    while not metrics.report_trimmed_at(directory, "claude"):
+        if log.exists() and log.stat().st_size >= log_half():
+            stated = audit.horizons(directory, manifest, 0, 0)
+            assert stated["report_records"]["exceeded"] is False
+            large_untrimmed = True
         metrics.record_report(directory, "claude", {"summary": "x" * 4000})
+    assert large_untrimmed
     kept = metrics.report_records(directory, "claude")
     assert len(kept) < metrics.MAX_REPORT_RECORDS
-    manifest = {"participants": {"claude": {}}}
+    assert log.stat().st_size <= log_half()
     stated = audit.horizons(directory, manifest, 0, kept[-1]["at"])
     assert stated["report_records"]["exceeded"] is True
     assert stated["report_records"]["bytes"] == metrics.MAX_REPORT_LOG_BYTES
     later = audit.horizons(directory, manifest, kept[0]["at"], kept[-1]["at"])
     assert later["report_records"]["exceeded"] is False
+
+
+def log_half():
+    """Returns the size a byte rotation leaves a report log at or under."""
+    return metrics.MAX_REPORT_LOG_BYTES // 2
 
 
 def test_bundle_states_each_retention_horizon(
