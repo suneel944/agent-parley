@@ -24,6 +24,7 @@ from typing import Any, TypeGuard, cast
 
 from agent_parley import (
     budgets,
+    children,
     convergence,
     decisions,
     denials,
@@ -9320,6 +9321,7 @@ def _poll(home: Path, directory: Path) -> None:
     stage("presence", _publish_presence, home, manifest, observations)
     with contextlib.suppress(BridgeError, sqlite3.Error):
         store.reclaim_expired(home, manifest["root"])
+    stage("child deadlines", children.expire, home, directory)
     stage("deliveries", deliveries, home, directory, manifest)
     stage("dead lanes", dead_lanes, home, directory, manifest, config)
     stage(
@@ -10735,12 +10737,15 @@ def _mail_digest(rows: list) -> list[str]:
 def held_issue_mail(
     home: Path, directory: Path, manifest: dict, name: str
 ) -> list[str]:
-    """Finds unread direct peer mail that names an issue a lane holds.
+    """Finds unread direct mail a waiting lane must be woken for.
 
     A message counts when another identity sent it to the lane directly,
     rather than on the project feed, the lane has not read it, and its
     subject or body cites a held issue as ``#N``, the form status uses to
-    tie mail to a report.
+    tie mail to a report. The message that carried a child lane's result or
+    expiry to its parent, named by `children.results`, counts as well: it
+    cites no issue, and a parent that spawned children and declared a wait
+    for them often holds no claim at all.
 
     Args:
         home: Private bridge state root.
@@ -10750,17 +10755,21 @@ def held_issue_mail(
 
     Returns:
         Message identifiers as text in ascending order, empty when the lane
-        holds no claim, has no such mail, or the store cannot be read.
+        holds no claim and has no child outcome, has no such mail, or the
+        store cannot be read.
     """
     held = [
         number
         for number, record in issues.snapshot(directory)["issues"].items()
         if record.get("owner") == name and record.get("claim_id")
     ]
-    if not held:
+    outcomes = children.results(manifest, name)
+    if not held and not outcomes:
         return []
     cited = re.compile(
         "#(?:" + "|".join(re.escape(number) for number in held) + r")\b"
+        if held
+        else r"(?!)"
     )
     try:
         with store.connect(home) as db:
@@ -10782,7 +10791,8 @@ def held_issue_mail(
     return [
         str(row["id"])
         for row in rows
-        if cited.search(f"{row['subject']}\n{row['body_md']}")
+        if str(row["id"]) in outcomes
+        or cited.search(f"{row['subject']}\n{row['body_md']}")
     ]
 
 

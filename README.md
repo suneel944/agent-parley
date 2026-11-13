@@ -337,7 +337,9 @@ lane setup.
   child gets its own worktree, cut from the parent's branch, under the
   parent's provider and credential. The parent reads one capped report, never
   the transcript, and merges the branch with Git. A child cannot spawn
-  children; three per parent and eight per project at most.
+  children; three per parent and eight per project at most. A child is
+  retired once it reports, or after four hours without a report, and either
+  outcome wakes a parent that is waiting on it.
 - **Lanes sharing a credential park before its quota runs out.**
   `agent-parley quota set NAME --hours H --tokens N [--threshold F]` records
   the plan's window; `quota show` prints the remaining headroom. Near the

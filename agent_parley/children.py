@@ -25,6 +25,15 @@ child's branch into its own with Git.
 Children are bounded per parent and per project, a child cannot spawn
 children of its own, and the project's participant cap still applies. A
 child that returned its report no longer counts against either limit.
+
+A child's work ends in one of two ways, and both retire it in the roster so
+it is never woken, offered work or counted again. Its result report retires
+it as the report is relayed. A child that files none is given
+`DEADLINE_SECONDS` from its spawn, recorded on its entry as ``deadline``;
+past that time `expire`, run on every supervision poll, tells the parent
+and records the outcome ``expired``. Retiring a child here only records the
+time: its worktree and branch stay for the parent to merge, and a session
+still running is left to end by itself.
 """
 
 from __future__ import annotations
@@ -43,6 +52,8 @@ TOOL = "spawn_child"
 ADDRESS = "@child"
 MAX_PER_PARENT = 3
 MAX_PER_PROJECT = 8
+DEADLINE_SECONDS = 4 * 3600.0
+EXPIRED = "expired"
 MAX_PATHS = 16
 MAX_PATH_CHARACTERS = 200
 TASK_BYTES = 4000
@@ -161,23 +172,63 @@ def _lane_of(manifest: dict, display: str) -> str:
     raise BridgeError(f"{display} is not a participant in this project.")
 
 
-def live(manifest: dict) -> list[str]:
+def due(entry: dict) -> float:
+    """Reads the time by which a child must have returned its result.
+
+    Args:
+        entry: A child's roster entry.
+
+    Returns:
+        The recorded ``deadline`` in epoch seconds. An entry written before
+        deadlines were recorded is given `DEADLINE_SECONDS` from its
+        ``spawned`` time, so an older child expires as a new one does.
+    """
+    recorded = entry.get("deadline")
+    if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+        return float(recorded)
+    return float(entry.get("spawned") or 0.0) + DEADLINE_SECONDS
+
+
+def live(manifest: dict, now: float | None = None) -> list[str]:
     """Lists the children that still count against the limits.
 
     Args:
         manifest: Project manifest.
+        now: Epoch seconds the deadlines are judged at; the current time
+            when omitted.
 
     Returns:
         Child participants, in name order, that neither retired nor returned
-        their result report.
+        their result report and whose deadline has not passed.
     """
+    moment = time.time() if now is None else now
     return sorted(
         name
         for name, entry in manifest["participants"].items()
         if entry.get("parent")
         and not roster.retired(entry)
         and not entry.get("result")
+        and due(entry) > moment
     )
+
+
+def results(manifest: dict, name: str) -> set[str]:
+    """Names the messages that carried a lane's child outcomes to it.
+
+    Args:
+        manifest: Project manifest.
+        name: Parent participant.
+
+    Returns:
+        Identifiers, as text, of the result and expiry messages recorded on
+        the entries of that lane's children.
+    """
+    return {
+        str(entry["result"]["message"])
+        for entry in manifest["participants"].values()
+        if entry.get("parent") == name
+        and (entry.get("result") or {}).get("message") is not None
+    }
 
 
 def of(manifest: dict, name: str) -> list[dict]:
@@ -405,7 +456,10 @@ def launch(
     The launcher is this package's own ``run``, as for a service resume, so
     the child registers, configures its native client and starts it with
     the provider and credential profile recorded for it, and its output
-    goes to the child's wake log.
+    goes to the child's wake log. Standard input is closed, and the launcher
+    still gives a child the pseudo-terminal, dialog watch and wake socket of
+    a resumed lane, because it takes that path for any participant whose
+    entry names a ``parent``.
 
     Args:
         home: Private bridge state root.
@@ -518,6 +572,7 @@ def spawn(home: Path, actor: dict, args: dict) -> dict:
         created = time.monotonic()
         if manifest.get("initialize"):
             worktrees.initialize_lane(lane, manifest["initialize"], base)
+        spawned = time.time()
         participants[name] = {
             "provider": source["provider"],
             "display": name,
@@ -531,7 +586,8 @@ def spawn(home: Path, actor: dict, args: dict) -> dict:
             **{key: source[key] for key in INHERITED if key in source},
             "parent": parent,
             "paths": paths,
-            "spawned": time.time(),
+            "spawned": spawned,
+            "deadline": spawned + DEADLINE_SECONDS,
         }
         write_json(directory / "project.json", manifest)
     launch(
@@ -587,8 +643,11 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
     The message is sent as the child, with a key fixed per child, and the
     child's roster entry records it under ``result`` in the same setup
     lock, so the parent receives one result however often the child
-    reports. A child that is not registered with the store yet is refused
-    by the send, nothing is recorded, and its next report tries again.
+    reports. The same write retires the child, so it stops being served,
+    woken or offered work the moment its result is recorded. A child that
+    is not registered with the store yet is refused by the send, nothing is
+    recorded, and its next report tries again; `expire` ends a child whose
+    result never arrives.
 
     Args:
         home: Private bridge state root.
@@ -620,11 +679,80 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
             f"child-result-{name}",
             sender=entry["display"],
         )
+        at = time.time()
         entry["result"] = {
             "outcome": report.get("state"),
             "commit": report.get("commit"),
             "message": sent.get("id"),
-            "at": time.time(),
+            "at": at,
         }
+        entry["retired"] = at
         write_json(directory / "project.json", manifest)
     return True
+
+
+def expire(home: Path, directory: Path, now: float | None = None) -> list[str]:
+    """Ends every child whose deadline passed without a result report.
+
+    Each such child is recorded with the outcome `EXPIRED` and retired, and
+    its parent is sent one operator message, keyed per child, naming the
+    branch the child left. A parent the store cannot be reached for still
+    has its child ended, with no message recorded, so a failed send never
+    keeps the slot held. The manifest is first read without the setup lock,
+    and the lock is taken only when that reading holds an overdue child, so
+    a poll of a project with none never contends for it.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        now: Epoch seconds the deadlines are judged at; the current time
+            when omitted.
+
+    Returns:
+        The children ended now, in name order.
+    """
+    from agent_parley import store
+
+    moment = time.time() if now is None else now
+    ended: list[str] = []
+    unlocked = roster.read(directory)
+    if live(unlocked, 0.0) == live(unlocked, moment):
+        return ended
+    with lock(directory / "setup.lock", timeout=LOCK_SECONDS):
+        manifest = roster.read(directory)
+        participants = manifest["participants"]
+        for name, entry in sorted(participants.items()):
+            parent = participants.get(entry.get("parent") or "")
+            if (
+                parent is None
+                or entry.get("result")
+                or roster.retired(entry)
+                or due(entry) > moment
+            ):
+                continue
+            sent: dict = {}
+            try:
+                sent = store.speak(
+                    home,
+                    manifest["root"],
+                    parent["display"],
+                    f"Child {name} result: {EXPIRED}",
+                    f"Child lane {name} returned no result report within "
+                    "its deadline and was retired. It no longer counts "
+                    "against the child limits. Its branch "
+                    f"{entry.get('branch', '')} keeps whatever it committed.",
+                    f"child-expired-{name}",
+                )
+            except BridgeError as exc:
+                print(f"Child expiry not relayed: {exc}", file=sys.stderr)
+            entry["result"] = {
+                "outcome": EXPIRED,
+                "commit": None,
+                "message": sent.get("id"),
+                "at": moment,
+            }
+            entry["retired"] = moment
+            ended.append(name)
+        if ended:
+            write_json(directory / "project.json", manifest)
+    return ended
