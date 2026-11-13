@@ -13,9 +13,10 @@ report log (`report`), and a lane's pull request is read from the forge
 checks, and green checks. Test identifiers are pytest node ids,
 `path.py::name`, read from `FAILED <id>`, `<id> FAILED`, the same two forms
 with `ERROR`, and `PASSED <id>` or `<id> PASSED` for a pass; terminal colour
-codes are removed first and nothing else is parsed. Report evidence that
-`convergence.classify` reads as a pass, and checks that finished green,
-pass every test already tracked on that tree. A report counts only when its
+codes are removed first and nothing else is parsed. Checks that finished
+green pass every test already tracked on that tree. Report evidence passes
+only the tests it names as passed, because a report cannot show whether it
+ran the whole suite or one focused file. A report counts only when its
 worktree matched its commit: a ready report always does, since `report`
 refuses one that differs, and any other report counts when it recorded
 `clean`. Evidence spilled to an attachment is read from its retained
@@ -52,7 +53,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from agent_parley import convergence, roster, worktrees
+from agent_parley import roster, worktrees
 from agent_parley.state import BridgeError, lock, write_json
 
 PUBLICATION = "flaky.json"
@@ -169,12 +170,20 @@ def touches(changed: list[str], test: str, imported: set[str]) -> bool:
         imported: Modules the test file imports, from `imports`.
 
     Returns:
-        True when the diff changes the test file itself, or a Python file
-        whose dotted module path equals an imported name or ends with one.
+        True when the diff changes the test file itself, a ``conftest.py``
+        in its directory or a parent, whose fixtures the test can use, or
+        a Python file whose dotted module path equals an imported name or
+        ends with one.
     """
     path = test.split("::", 1)[0]
+    folder = path.rpartition("/")[0]
     for item in changed:
         if item == path:
+            return True
+        parent, _, leaf = item.rpartition("/")
+        if leaf == "conftest.py" and (
+            not parent or folder == parent or folder.startswith(f"{parent}/")
+        ):
             return True
         if not item.endswith(".py"):
             continue
@@ -210,7 +219,39 @@ def read(directory: Path) -> dict:
         return _empty()
     if not isinstance(found.get("reports"), dict):
         found["reports"] = {}
+    found["tests"] = {
+        name: entry for name, entry in found["tests"].items() if _sound(entry)
+    }
     return found
+
+
+def _sound(entry: object) -> bool:
+    """Reports whether one test's stored record has every field read.
+
+    A damaged entry is dropped rather than raised from, so one bad record
+    cannot stop the poll that records every lane's pull request.
+    """
+    if not isinstance(entry, dict) or not isinstance(entry.get("events"), list):
+        return False
+    fields = ("lane", "outcome", "tree", "source")
+    if not all(
+        isinstance(item, dict)
+        and isinstance(item.get("at"), int | float)
+        and isinstance(item.get("touches"), bool)
+        and all(isinstance(item.get(field), str) for field in fields)
+        for item in entry["events"]
+    ):
+        return False
+    held = entry.get("suspected")
+    return held is None or (
+        isinstance(held, dict)
+        and isinstance(held.get("reason"), str)
+        and isinstance(held.get("evidence"), list)
+        and isinstance(held.get("told"), list)
+        and isinstance(held.get("trees"), list)
+        and isinstance(held.get("followup"), str)
+        and isinstance(held.get("since"), int | float)
+    )
 
 
 def _latest(entry: dict) -> float:
@@ -251,9 +292,7 @@ def record(
     """
     stamp = now or time.time()
     failed, passed = tests_in(text)
-    whole = green or (
-        not failed and convergence.classify(text)[0] == convergence.PASS
-    )
+    whole = green and not failed
     tracked = set(read(directory)["tests"])
     passing = [name for name in passed if name in tracked or name in failed]
     if whole:
@@ -420,17 +459,18 @@ def message(test: str, held: dict) -> tuple[str, str]:
     """
     lines = "\n".join(_occurrence(item) for item in held["evidence"])
     pending = (
-        f"Suggestion {held['followup']} "
+        f"Suggestion {held['followup']} for a `test:` issue waits for the "
+        "operator in `agent-parley followup list`; do not file it yourself."
         if held["followup"]
-        else "A suggestion "
+        else "No `test:` suggestion could be recorded yet; name the test in "
+        "your report instead of filing an issue."
     )
     return (
         f"Suspected flaky test {test[:MAX_TITLE_TEST]}",
         f"Test {test} is suspected flaky: it {held['reason']}.\n"
         f"Evidence:\n{lines}\n"
         "This is a label with evidence: no test was skipped or disabled. "
-        f"{pending}for a `test:` issue waits for the operator in "
-        "`agent-parley followup list`; do not file it yourself. A later "
+        f"{pending} A later "
         "failure on a tree whose diff changes the test or its imports "
         "clears the suspicion.",
     )

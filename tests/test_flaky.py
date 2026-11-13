@@ -9,6 +9,7 @@ from agent_parley.worktrees import git
 
 TEST = "tests/test_core.py::test_value"
 FAILED = f"FAILED {TEST} - assert 1 == 2\n1 failed, 11 passed"
+PASSED = f"{TEST} PASSED\n12 passed"
 
 
 @pytest.fixture
@@ -125,6 +126,23 @@ def test_relative_and_from_imports_resolve_to_dotted_modules():
     assert {"os", "pkg.core", "pkg.core.VALUE", "tests.unit.helpers"} <= found
     assert flaky.touches(["src/pkg/core.py"], TEST, found)
     assert not flaky.touches(["pkg/other.py", "notes.txt"], TEST, found)
+    assert flaky.touches(["tests/conftest.py"], TEST, found)
+    assert flaky.touches(["conftest.py"], TEST, found)
+    assert not flaky.touches(["pkg/conftest.py"], TEST, found)
+
+
+def test_a_damaged_test_record_is_dropped_on_read(tmp_path):
+    (tmp_path / flaky.PUBLICATION).write_text(
+        json.dumps(
+            {
+                "tests": {
+                    TEST: {"events": [{"lane": "one"}], "suspected": None},
+                    "tests/a.py::ok": {"events": [], "suspected": None},
+                }
+            }
+        )
+    )
+    assert list(flaky.read(tmp_path)["tests"]) == ["tests/a.py::ok"]
 
 
 def test_a_same_tree_flip_tells_every_lane_once_and_suggests_one_issue(
@@ -134,7 +152,7 @@ def test_a_same_tree_flip_tells_every_lane_once_and_suggests_one_issue(
     report(project, "one", commit, FAILED)
     supervise(project)
     assert project["sent"] == []
-    report(project, "one", commit, "make check passed: 12 passed", "ready")
+    report(project, "one", commit, PASSED, "ready")
     supervise(project)
     supervise(project)
 
@@ -192,10 +210,11 @@ def test_a_real_regression_in_the_changed_code_is_never_marked(project):
         "    assert VALUE == 3\n",
     )
     report(project, "one", broken, FAILED)
+    report(project, "one", broken, "pytest tests/test_other.py: 5 passed")
     report(project, "two", edited, FAILED)
-    report(project, "two", edited, "12 passed", clean=False)
+    report(project, "two", edited, PASSED, clean=False)
     fixed = change(project, "fix", "pkg/core.py", "VALUE = 1\nFIXED = True\n")
-    report(project, "one", fixed, "make check passed: 12 passed", "ready")
+    report(project, "one", fixed, PASSED, "ready")
     supervise(project)
     supervise(project)
 
@@ -209,7 +228,7 @@ def test_a_failure_on_a_changed_tree_clears_and_new_evidence_retells(
 ):
     commit = change(project, "one", "notes.txt", "more notes\n")
     report(project, "one", commit, FAILED)
-    report(project, "one", commit, "12 passed", "ready")
+    report(project, "one", commit, PASSED, "ready")
     supervise(project)
     assert len(project["sent"]) == 3
 
@@ -221,7 +240,7 @@ def test_a_failure_on_a_changed_tree_clears_and_new_evidence_retells(
 
     again = change(project, "three", "pkg/other.py", "OTHER = 3\n")
     report(project, "three", again, FAILED)
-    report(project, "three", again, "12 passed", "ready")
+    report(project, "three", again, PASSED, "ready")
     supervise(project)
     assert len(project["sent"]) == 6
     assert len({key.split(":")[1] for *_, key in project["sent"]}) == 2
