@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+from agent_parley import protocol
 from agent_parley.state import BridgeError, write_json
 
 EVENTS = {
@@ -40,7 +41,10 @@ def configure(
 
     User and project configuration and the normal authentication home remain
     selected by Gemini itself. Existing system policy is copied unchanged;
-    only this lane's named MCP server and additional hooks are added.
+    only this lane's named MCP server and additional hooks are added and,
+    with the opt-in, `protocol.gemini_rule` is appended to any
+    `tools.allowed` entries the policy already holds. `tools.core` is never
+    set, because it would restrict every other tool.
 
     Args:
         directory: Private project state directory.
@@ -52,7 +56,8 @@ def configure(
             location when unset, whatever this process's environment
             exports.
         trusted: Whether the operator opted this lane in to pre-approving
-            the bridge's own tools, which marks only its server as trusted.
+            the bridge's own tools, which marks only its server as trusted
+            and allows only the bridge's own CLI as a shell command.
 
     Returns:
         Path for GEMINI_CLI_SYSTEM_SETTINGS_PATH in this launch only.
@@ -85,6 +90,16 @@ def configure(
     }
     if trusted:
         servers["agent_parley"]["trust"] = True
+        tools = settings.setdefault("tools", {})
+        if not isinstance(tools, dict) or not isinstance(
+            tools.setdefault("allowed", []), list
+        ):
+            raise BridgeError(
+                "Gemini tools and tools.allowed settings must be an object "
+                "and an array to carry the bridge CLI approval."
+            )
+        if protocol.gemini_rule() not in tools["allowed"]:
+            tools["allowed"].append(protocol.gemini_rule())
     for native, common in EVENTS.items():
         existing = configured.setdefault(native, [])
         if not isinstance(existing, list):

@@ -10,7 +10,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, copilot, dialogs, hook, roster, store
+from agent_parley import (
+    cli,
+    copilot,
+    dialogs,
+    hook,
+    protocol,
+    roster,
+    store,
+)
 from agent_parley.cli import COPILOT_EVENTS, main
 from agent_parley.state import BridgeError, write_json
 
@@ -387,7 +395,7 @@ def test_a_copilot_lane_stays_interactive_on_launch_and_on_resume(
     ]
 
 
-def test_an_opted_in_copilot_lane_allows_only_the_bridge_server(
+def test_an_opted_in_copilot_lane_allows_only_the_bridge_server_and_cli(
     lane, bridge, repo, capsys
 ):
     capture = Path(os.environ["CAPTURE"])
@@ -400,8 +408,17 @@ def test_an_opted_in_copilot_lane_allows_only_the_bridge_server(
     manifest.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
     write_json(path, manifest)
     assert bridge.launch("helper", repo, "Coordinate", "copilot", "work") == 0
-    assert "is a copilot lane" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no bridge tool approval is recorded" not in err
+    assert "shell allow rule" not in err
     argv = json.loads(capture.read_text())["argv"]
-    assert argv.count("--allow-tool") == 1
-    assert argv[argv.index("--allow-tool") + 1] == "agent_parley"
+    allowed = [
+        argv[index + 1]
+        for index, value in enumerate(argv)
+        if value == "--allow-tool"
+    ]
+    assert allowed == [
+        "agent_parley",
+        f"shell({protocol.cli_command()})",
+    ]
     assert not {"--allow-all-tools", "--allow-all"} & set(argv)

@@ -776,12 +776,19 @@ reported.
         cannot carry, because its adapter has no such setting or its `codex`
         release predates one, is named on standard error through
         `supervision.opt_in_unsupported` instead of being dropped silently.
-        A lane without that opt-in that the
-        service could resume is named on standard error, because the service
-        withholds its resume rather than start a session nobody can answer.
-        A client whose adapter `denials.EVENTS` names also runs the lane's
-        hook on the event reporting a refused tool call, so the refusal
-        reaches the operator as a decision.
+        With the opt-in, a `claude` lane's settings also allow
+        `protocol.cli_rule`, a `copilot` lane's command line also allows
+        `protocol.copilot_rule`, and the `gemini` and `opencode` overlays
+        also carry `protocol.gemini_rule` and `protocol.opencode_rule`, so
+        the bridge CLI a notice names runs without a shell prompt; any
+        other adapter that carries the opt-in is named through
+        `supervision.opt_in_shell_gap`. A lane without
+        that opt-in that the service could resume is named on standard
+        error, because the service withholds its resume rather than start
+        a session nobody can answer. A client whose adapter
+        `denials.EVENTS` names also runs the lane's hook on the event
+        reporting a refused tool call, so the refusal reaches the operator
+        as a decision.
 
         A resume of a lane whose activity record carries a rotation point,
         left by a ready or blocked report, starts a fresh native session
@@ -919,7 +926,11 @@ reported.
         data = self.add_participant(repo, agent, provider, credential)
         if gap := supervision.opt_in_adapter(self.home, data, agent):
             print(
-                supervision.OPT_IN_WARNING.format(name=agent, adapter=gap),
+                supervision.OPT_IN_WARNING.format(
+                    name=agent,
+                    adapter=gap,
+                    remedy=supervision.opt_in_remedy(gap),
+                ),
                 file=sys.stderr,
             )
         if number:
@@ -1069,6 +1080,8 @@ reported.
                 self.home, data, agent, client_version
             ):
                 print(limit, file=sys.stderr)
+            if gap := supervision.opt_in_shell_gap(self.home, data, agent):
+                print(gap, file=sys.stderr)
             if entry["adapter"] == "claude":
                 config = lane.parent / f"{agent}-mcp.json"
                 write_json(
@@ -1224,7 +1237,12 @@ reported.
                     prompt + "\nUser task:\n" + task,
                 ]
                 if dialogs.pre_approved(data, agent):
-                    command += ["--allow-tool", "agent_parley"]
+                    command += [
+                        "--allow-tool",
+                        "agent_parley",
+                        "--allow-tool",
+                        protocol.copilot_rule(),
+                    ]
             else:
                 command = [
                     executable,

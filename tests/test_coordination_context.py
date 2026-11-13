@@ -364,6 +364,12 @@ def test_a_cli_call_the_pre_approval_cannot_match_is_refused(tmp_path, command):
     assert reason == checkpoints.Reason.CHAINED_CLI
     assert "alone" in text
     assert protocol.cli_command() in text
+    assert "Only that plain form is pre-approved" not in text
+    assert (
+        "Only `claude`, `copilot`, `gemini` and `opencode` lanes get a "
+        "shell allow"
+    ) in text
+    assert "use an agent_parley MCP tool where one covers" in text
 
 
 @pytest.mark.parametrize(

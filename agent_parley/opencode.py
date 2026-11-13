@@ -173,7 +173,10 @@ def configure(
             credential profile; OpenCode's default location when unset,
             whatever the caller's environment exports.
         trusted: Whether the operator opted this lane in to pre-approving
-            the bridge's own tools, which allows only ``agent_parley_*``.
+            the bridge's own tools, which allows only ``agent_parley_*``
+            and, as the last ``permission.bash`` rule so it wins over the
+            user's own, `protocol.opencode_rule`. A ``bash`` value given as
+            one action is kept as the ``*`` rule ahead of it.
 
     Returns:
         Directory for OPENCODE_CONFIG_DIR in this launch only.
@@ -220,6 +223,17 @@ def configure(
                 "the bridge tool approval."
             )
         permission["agent_parley_*"] = "allow"
+        shell = permission.get("bash", {})
+        if isinstance(shell, str):
+            shell = {"*": shell}
+        if not isinstance(shell, dict):
+            raise BridgeError(
+                "OpenCode permission.bash must be a string or an object to "
+                "carry the bridge CLI approval."
+            )
+        shell.pop(protocol.opencode_rule(), None)
+        shell[protocol.opencode_rule()] = "allow"
+        permission["bash"] = shell
     command = shlex.split(hooks["PreToolUse"][0]["hooks"][0]["command"])
     command += ["--adapter", "opencode"]
     if (source / "plugin" / "agent-parley.js").exists():

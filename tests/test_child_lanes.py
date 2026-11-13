@@ -16,6 +16,7 @@ from agent_parley import (
     dashboard,
     followups,
     process,
+    protocol,
     roster,
     server,
     store,
@@ -127,7 +128,7 @@ def test_a_parent_spawns_two_children_and_receives_two_capped_reports(
             Path(source["lane"]), "rev-parse", "HEAD"
         )
         assert f"part{index}" in launched[index - 1]["task"]
-        assert "agent-parley report" in launched[index - 1]["task"]
+        assert f"{protocol.cli_command()} report" in launched[index - 1]["task"]
     tokens = {
         child["child"]: store.register(
             bridge.home, parent["root"], child["child"]

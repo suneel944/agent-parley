@@ -267,7 +267,64 @@ named on standard error when such a lane launches and under `approvals` in
 unreadable starts without the override and says so. `auto_mode` is the
 `claude` CLI's own auto permission mode; it applies to `claude` lanes only,
 and `approval resume --auto-mode on --participant NAME` refuses any other
-adapter by name.
+adapter by name, so the opt-in remedy a warning or `doctor` names offers
+`--auto-mode on` for `claude` lanes only.
+
+Hook notices tell a lane to run the bridge CLI in its pre-approved form,
+`python -P -m agent_parley.cli`, under the interpreter that installed the
+bridge. With the opt-in recorded, four adapters also pre-approve that form:
+
+| Adapter | Shell allow for the bridge CLI |
+| --- | --- |
+| `claude` | `Bash(... -m agent_parley.cli *)` in `permissions.allow` |
+| `copilot` | `--allow-tool 'shell(... -m agent_parley.cli)'` |
+| `gemini` | `run_shell_command(... -m agent_parley.cli)` in `tools.allowed` of the lane's settings overlay |
+| `opencode` | `permission.bash` `"... -m agent_parley.cli *": "allow"` in the lane's `opencode.json` overlay |
+
+The `gemini` entry follows the
+[Gemini CLI configuration reference](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/configuration.md):
+`tools.allowed` lists "Tool names that bypass the confirmation dialog", with
+examples such as `run_shell_command(git)`, and system settings, whose path
+`GEMINI_CLI_SYSTEM_SETTINGS_PATH` overrides, "take precedence over all other
+settings files". The
+[shell tool reference](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/shell.md)
+says the tool "uses prefix matching" and checks each part of a chained
+command. The launch appends the entry, in the lane's private settings
+overlay, to any `tools.allowed` list your system settings already carry, and
+never sets `tools.core`, which would restrict every other tool.
+
+The `opencode` entry follows
+[OpenCode permissions](https://opencode.ai/docs/permissions/): a pattern
+ending in ` *` also matches the command with no arguments, and the last
+matching rule wins. The lane's overlay is written in the configuration form
+it already uses for the bridge tool approval, a `permission` object keyed by
+tool, so the rule goes under `permission.bash` as a glob mapped to `allow`,
+added after any `bash` rules of your own. A `bash` value given as one
+action, such as `"ask"`, is kept as the `*` rule ahead of it. The
+`permissions` list of `action`, `resource` and `effect` entries that
+OpenCode's current documentation shows is not written.
+
+Neither rule has been probed on a live CLI, because neither `gemini` nor
+`opencode` is installed on the host that wrote them. A lane on either
+adapter that still prompts for the bridge CLI is a gap to report.
+
+On `codex` the approval reaches the `agent_parley` MCP tools alone, so
+notices name an MCP tool where one covers the step, such as `next_issues`
+for the ranked shortlist. Issue transitions and `status` have no MCP tool,
+so a notice still names the CLI for them, and a `codex` lane may stop at a
+shell permission prompt when it runs one. The launch names that on standard
+error; `doctor` reads such a lane as approved, because no setup the
+operator records can close it. Answer the prompt in your own terminal with
+`agent-parley run NAME --resume`.
+
+Why `codex` stays open: it accepts an execpolicy `prefix_rule` for the
+bridge CLI, but it reads `.rules` files only from the user's
+`CODEX_HOME/rules` or a project's `.codex/rules`, and takes no launch option
+naming one. Writing either would change every session on that home or the
+target repository, which a launch must not. Whether the `copilot` rule
+matches the bridge CLI when it runs with arguments has not been checked
+against an installed release or a live session, so a copilot lane that
+still prompts for the bridge CLI is a gap to report.
 
 Each preset names one configuration-home variable. A credential profile's
 `--config-home` is applied to that variable for the launch, which is what makes

@@ -19,7 +19,7 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import critical, forecast, forge, issues
+from agent_parley import critical, forecast, forge, issues, protocol
 
 MAX_SHORTLIST = 5
 MAX_LOOKUPS = 3
@@ -761,7 +761,7 @@ def render(result: dict) -> str:
     ]
     lines.extend(loops)
     lines.append(
-        "Claim one with agent-parley issue claim before exploring or "
-        "editing; a peer may be reading the same list."
+        f"Claim one with `{protocol.cli_command()} issue claim NUMBER` "
+        "before exploring or editing; a peer may be reading the same list."
     )
     return "\n".join(lines)

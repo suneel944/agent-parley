@@ -11,6 +11,7 @@ from agent_parley import (
     forge,
     issues,
     lifecycle,
+    protocol,
     recommend,
     store,
     supervision,
@@ -353,7 +354,8 @@ def test_issue_next_ranks_a_forge_only_issue_and_says_claim_first(
     assert ranked["candidates"][0]["title"] == "Brand new"
     closing = recommend.render(ranked).splitlines()[-1]
     assert closing.startswith(
-        "Claim one with agent-parley issue claim before exploring or editing"
+        f"Claim one with `{protocol.cli_command()} issue claim NUMBER` "
+        "before exploring or editing"
     )
 
 
@@ -386,8 +388,8 @@ def test_three_waiting_lanes_get_three_distinct_next_leads(
     for name, offer in offers.items():
         assert offer["kind"] == "continue"
         assert (
-            f"claim #{offer['lead']}, the top agent-parley issue next "
-            f"candidate, with agent-parley issue claim {offer['lead']} "
+            f"claim #{offer['lead']}, the top `next_issues` candidate, with "
+            f"`{protocol.cli_command()} issue claim {offer['lead']}` "
             "before exploring or editing it" in offer["text"]
         )
         record = supervision.published_work(directory, name)

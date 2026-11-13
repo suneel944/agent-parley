@@ -145,6 +145,60 @@ def cli_rules() -> list[str]:
     return [cli_rule()]
 
 
+def copilot_rule() -> str:
+    """Returns the Copilot CLI tool allow for this bridge's own CLI.
+
+    `--allow-tool` takes the shell tool with the command it allows, so a
+    `copilot` lane runs `cli_command` without a shell permission prompt and
+    every other shell command still asks.
+
+    Returns:
+        A `shell` tool pattern spelled from the same string the prompt
+        prints.
+    """
+    return f"shell({cli_command()})"
+
+
+def gemini_rule() -> str:
+    """Returns the Gemini CLI `tools.allowed` entry for this bridge's CLI.
+
+    Gemini matches a `run_shell_command` entry by command prefix and checks
+    each part of a chained command, so a `gemini` lane runs `cli_command`
+    with any arguments without a confirmation and every other shell command
+    still asks.
+
+    Returns:
+        A `run_shell_command` tool pattern spelled from the same string the
+        prompt prints.
+    """
+    return f"run_shell_command({cli_command()})"
+
+
+def opencode_rule() -> str:
+    """Returns the OpenCode `permission.bash` pattern for this bridge's CLI.
+
+    A pattern ending in `` *`` also matches the command with no arguments,
+    so an `opencode` lane runs `cli_command` with or without arguments
+    without a prompt and every other shell command keeps its own rule.
+
+    Returns:
+        A `bash` glob spelled from the same string the prompt prints.
+    """
+    return f"{cli_command()} *"
+
+
+SHELL_ALLOW = frozenset({"claude", "copilot", "gemini", "opencode"})
+"""Adapters whose launch pre-approves `cli_command` as a shell command.
+
+Once the operator opts in, a `claude` lane gets `cli_rule` in its
+permission settings, a `copilot` lane gets `copilot_rule` on its command
+line, and the lane-private overlays carry `gemini_rule` for a `gemini`
+lane and `opencode_rule` for an `opencode` lane. A `codex` lane's approval
+reaches the `agent_parley` MCP tools alone, so a notice to it names an MCP
+tool where one exists.
+"""
+
+
 def manifests(root: Path) -> dict[str, Path]:
     """Locates the shipped plugin manifest of each supported client."""
     return {

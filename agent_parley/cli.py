@@ -3012,8 +3012,8 @@ class Bridge(
         if not claimed:
             raise BridgeError(
                 f"{name} claims no issue, so the pull request would carry no "
-                "issue reference. Run `agent-parley issue claim NUMBER` in "
-                "the lane first."
+                f"issue reference. Run `{protocol.cli_command()} issue claim "
+                "NUMBER` in the lane first."
             )
         policy = data.get("pull_request", {})
         labels, milestone = hygiene_metadata(root, claimed, policy)
@@ -7384,7 +7384,9 @@ def main() -> int:
                 ):
                     print(
                         supervision.OPT_IN_WARNING.format(
-                            name=args.name, adapter=gap
+                            name=args.name,
+                            adapter=gap,
+                            remedy=supervision.opt_in_remedy(gap),
                         ),
                         file=sys.stderr,
                     )

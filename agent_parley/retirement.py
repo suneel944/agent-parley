@@ -33,7 +33,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from agent_parley import issues, lifecycle, roster
+from agent_parley import issues, lifecycle, protocol, roster
 from agent_parley.state import BridgeError, lock, write_json
 
 GIT_SECONDS = 30
@@ -193,12 +193,13 @@ def return_work(directory: Path, manifest: dict, name: str) -> dict:
     ]
     if kept:
         listed = ", ".join(f"#{number}" for number in kept)
+        command = protocol.cli_command()
         raise BridgeError(
             f"{name} holds ready or operator-blocked work ({listed}) that "
-            "must stay claimed; land ready work with agent-parley "
-            f"participant merge {name}, hand it on with agent-parley issue "
-            "offer, or release blocked work on purpose with agent-parley "
-            "issue release, before retiring."
+            f"must stay claimed; land ready work with `{command} "
+            f"participant merge {name}`, hand it on with `{command} issue "
+            f"offer`, or release blocked work on purpose with `{command} "
+            "issue release`, before retiring."
         )
     participants = set(manifest["participants"])
     released: list[str] = []
