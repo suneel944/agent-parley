@@ -1825,6 +1825,41 @@ never handed out twice. A history window cannot reach past rows that
 retention removed. Freed pages stay in `bridge.sqlite3` for reuse rather
 than shrinking the file.
 
+### Audit bundle
+
+`agent-parley audit export` writes one JSON file a third party can check:
+
+```sh
+agent-parley audit export --since v0.22.0 --until v0.23.0 --output audit.json
+agent-parley audit export --since 7d --output audit.json --sign ~/.ssh/id_ed25519
+agent-parley audit verify audit.json --require-signature
+```
+
+The bundle covers the lanes with their provider and model, the issues resolved
+in the window, claims and handoffs, ready reports with their evidence, review
+rounds with their findings count, the pull requests supervision saw open in the
+window, and each lane's commits beyond the base. A `REF` is read first as an
+instant or a window, as every other `--since` reads it, and otherwise as a
+commit of the project, which stands for its committer time; `--until` defaults
+to now. Records are read through the modules that keep them; the store is
+opened read-only and the only file written is the one `--output` names.
+
+Each record carries the SHA-256 of its canonical JSON (sorted keys, no
+insignificant whitespace) with the hash of the record before it, so `audit
+verify` names the first record that was changed, removed or reordered and exits
+1. Credentials, tokens and transcripts never enter the bundle: lanes are copied
+field by field, any key named like a token, secret, password, credential, key
+or prompt is dropped unless it holds a number such as a token count, and text
+claiming assistant authorship is withheld.
+
+The chain proves the bundle is consistent, not who wrote it. `--sign KEY` signs
+the bundle with an existing SSH key through `ssh-keygen -Y sign` under the
+`agent-parley-audit` namespace and embeds the signature. `audit verify` checks
+it with `ssh-keygen -Y check-novalidate`, which needs no allowed-signers file,
+and prints the signing key's fingerprint; compare it with `ssh-keygen -l -f
+KEY.pub` of the key you expect. A bundle without a signature verifies on its
+chain alone unless `--require-signature` is given.
+
 ### Following one lane
 
 `agent-parley watch NAME` sits on one participant and prints its coordination
