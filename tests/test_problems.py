@@ -809,7 +809,14 @@ def test_a_forge_refusing_the_account_names_the_gh_auth_remedy(
     write_json(cache, {**failed, "failure": {"kind": "rate", "detail": ""}})
     [row] = rows(bridge, problems.FORGE_REFUSED)
     assert "retries at" in row["command"]
-    write_json(cache, {**failed, "failure": {"kind": "timeout"}})
+    write_json(
+        cache,
+        {
+            **failed,
+            "read_at": time.time() - 100,
+            "failure": {"kind": "timeout"},
+        },
+    )
     assert not rows(bridge, problems.FORGE_REFUSED)
     write_json(cache, {**failed, "read_at": time.time()})
     assert not rows(bridge, problems.FORGE_REFUSED)

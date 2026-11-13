@@ -73,6 +73,7 @@ class Event(StrEnum):
     LANE_BLOCKED = "lane_blocked"
     ORPHAN_DECISION = "orphan_decision"
     KEY_HOLD = "key_hold"
+    SESSION_ENDED = "session_ended"
 
 
 TITLES: dict[str, str] = {
@@ -90,6 +91,7 @@ TITLES: dict[str, str] = {
     Event.LANE_BLOCKED: "A lane is still blocked past the escalation bound",
     Event.ORPHAN_DECISION: "A dead lane's claims wait on your decision",
     Event.KEY_HOLD: "A lane kept a key refused to a peer past its deadline",
+    Event.SESSION_ENDED: "A session nobody could answer was ended at a prompt",
 }
 
 KEY_FIELDS: dict[str, tuple[str, ...]] = {
@@ -107,6 +109,7 @@ KEY_FIELDS: dict[str, tuple[str, ...]] = {
     Event.LANE_BLOCKED: ("since",),
     Event.ORPHAN_DECISION: ("since", "issue"),
     Event.KEY_HOLD: ("since",),
+    Event.SESSION_ENDED: ("since",),
 }
 
 ACKNOWLEDGE = (("acknowledge",), decisions.REVERSIBLE)
@@ -179,8 +182,16 @@ PROBLEM_CONDITIONS = frozenset(
         "held by a native dialog",
         "crossing ready",
         "plugin stale",
+        "orphaned claims",
+        "supervision failing",
+        "forge refused",
+        "unanswered offer",
+        "blueprint blocked",
+        "escalated plan revision",
+        "plan revisions pending",
     }
 )
+PROBLEM_DELAYS = {"unanswered offer": 600.0}
 
 
 def stored(home: Path) -> dict[str, str]:
@@ -1112,6 +1123,19 @@ def problem_decisions(
     An acknowledged problem stays answered while its row lasts and closes
     with the row, so it is asked again only when it recurs.
 
+    A condition named in `PROBLEM_DELAYS` waits that many seconds first, so
+    a handoff offer its recipient is about to answer is not sent as a
+    problem. An estate row, which names no project, is carried by the first
+    project directory alone, so a failing store prune is asked once rather
+    than once per project. Orphaned claims the supervisor raised as an
+    `ORPHAN_DECISION` for the lane within the last day are not asked a
+    second time, whether that decision is open, answered or carried out, so
+    an operator who answered wait is not asked again. The orphaned claims
+    row disappears while a wake keeps the lane's process alive and returns
+    when the wake fails, so its decision stays as it is while the ledger
+    still marks a claim of that lane orphaned, instead of closing and being
+    sent again on every wake.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -1124,7 +1148,7 @@ def problem_decisions(
     """
     if not enabled(home):
         return []
-    from agent_parley import problems
+    from agent_parley import issues, problems
     from agent_parley.cli import Bridge
 
     stamp = now or time.time()
@@ -1136,13 +1160,36 @@ def problem_decisions(
             _PROBLEMS.update(at=stamp, rows=rows)
     with _THREADS_LOCK:
         rows = list(_PROBLEMS["rows"])
+    first = min(
+        (path.parent.name for path in directory.parent.glob("*/project.json")),
+        default=directory.name,
+    )
+    owners = {root} if directory.name != first else {root, ""}
+    asked = {
+        record.get("lane")
+        for record in decisions._peek(directory).values()
+        if record.get("kind") == Event.ORPHAN_DECISION.value
+        and stamp - record.get("created", 0.0) < problems.STALE_AFTER
+    }
+    marked = {
+        record.get("owner")
+        for record in issues.snapshot(directory)["issues"].values()
+        if record.get("orphan")
+    }
     kept = []
     for row in rows:
+        condition = row.get("condition")
+        age = row.get("seconds") or 0
         if (
-            row.get("project") != root
+            row.get("project") not in owners
             or row.get("actor") != problems.BY_OPERATOR
-            or row.get("condition") not in PROBLEM_CONDITIONS
-            or (row.get("seconds") or 0) >= problems.STALE_AFTER
+            or condition not in PROBLEM_CONDITIONS
+            or age >= problems.STALE_AFTER
+            or age < PROBLEM_DELAYS.get(condition, 0)
+            or (
+                condition == problems.ORPHANED
+                and row.get("participant") in asked
+            )
         ):
             continue
         record = decisions.open_or_refresh(
@@ -1163,6 +1210,10 @@ def problem_decisions(
             record.get("kind") in PROBLEM_CONDITIONS
             and record.get("project") == root
             and record["id"] not in kept
+            and not (
+                record.get("kind") == problems.ORPHANED
+                and record.get("lane") in marked
+            )
         ):
             decisions.close(directory, record["id"], stamp)
     return kept

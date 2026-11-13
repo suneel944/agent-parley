@@ -1105,13 +1105,15 @@ class ClaimsMixin(ReportsMixin):
             evidence: Bounded observations supporting a proposal.
 
         Returns:
-            The proposal record, or the listing for proposals.
+            The proposal record, or the listing for proposals. A decision
+            is also mailed to the lane that proposed it, which otherwise
+            learned the outcome only by listing proposals again.
 
         Raises:
             BridgeError: If the caller lacks the authority the action needs
                 or the plan layer refuses the proposal.
         """
-        from agent_parley.cli import git, plan, roster
+        from agent_parley.cli import git, plan, roster, store
 
         _, directory = self.project(repo)
         if action == "proposals":
@@ -1146,4 +1148,18 @@ class ClaimsMixin(ReportsMixin):
                 "Only the operator approves or rejects a plan revision, from "
                 "the project base checkout."
             )
-        return plan.decide(directory, identity, action == "approve", reason)
+        decided = plan.decide(directory, identity, action == "approve", reason)
+        proposer = data["participants"].get(decided.get("by"))
+        if proposer and not decided.get("replayed"):
+            with contextlib.suppress(BridgeError):
+                store.speak(
+                    self.home,
+                    data["root"],
+                    proposer.get("display", decided["by"]),
+                    f"Plan proposal {identity} {decided['status']}",
+                    f"The operator decided your plan proposal {identity}: "
+                    f"{decided['status']}. "
+                    f"Note: {decided.get('note') or 'none given'}",
+                    f"plan-{identity}-{decided['status']}",
+                )
+        return decided
