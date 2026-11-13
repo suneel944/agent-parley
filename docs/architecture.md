@@ -49,6 +49,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
+| `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
@@ -1049,6 +1050,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `plan` | `plan.json` under `plan.lock` |
 | `decisions` | `decisions.json` under `decisions.lock` |
 | `followups` | `followups.json` under `followups.lock` |
+| `reviews` | `reviews.json` under `reviews.lock` |
 | `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
 | `quota` | `quota-ledger.json` under `quota.lock` |
@@ -1156,6 +1158,14 @@ after `TTL` (seven days). Only `followup accept`, or the decision's Telegram
 button with its confirming tap, files the issue through `forge.file_issue` and
 offers it through the operator `assign` transition of the issue ledger. A
 forge refusal leaves the suggestion pending and the decision open.
+
+Mail to `@review` records a review round in `reviews.json` and then sends
+ordinary mail through the same `store.call`: the offer to the reviewer, or
+the reviewer's findings, cut to `children.REPORT_BYTES`, back to the builder.
+The round is keyed by the builder's claim identifier and never touches the
+issue ledger, so a review is a recorded exchange, not a handoff. A claim gets
+at most `reviews.MAX_ROUNDS` (3) rounds and one open at a time; the cap is a
+constant, not a setting. An offer whose mail fails withdraws its round.
 
 No time-to-live applies to issue ownership, which changes hands through
 release, an explicit offer and acceptance, an orphan takeover, or the

@@ -3490,8 +3490,12 @@ def _dispatch(
     writes only the project's suggestion record and an operator decision
     beside the ledger, never the store, so it runs outside the transaction
     and records its event separately.
+
+    A review round is mail addressed to ``reviews.ADDRESS``. It records the
+    round beside the ledger and then sends ordinary mail, to the reviewer
+    or back to the builder, through this same call.
     """
-    from agent_parley import followups
+    from agent_parley import followups, reviews
 
     if tool == "next_issues":
         return _recommended(home, actor, args)
@@ -3517,6 +3521,8 @@ def _dispatch(
             "paths": to[1:],
         }
         return _suggested(home, actor, suggestion, started)
+    if isinstance(to, list) and to[:1] == [reviews.ADDRESS]:
+        return _review_round(home, actor, args)
     if tool in RESERVING:
         children.confine(home, actor, args.get("paths"))
     declared = (
@@ -3575,6 +3581,122 @@ def _lane_provider(directory: Path, display: str) -> str:
         ),
         "",
     )
+
+
+def _review_round(home: Path, actor: dict, args: dict) -> dict:
+    """Records a review round or its findings, then sends the mail.
+
+    Recipients ``["@review", PATH, ...]`` with the branch as the subject ask
+    for a round on the caller's one held claim. Recipients ``["@review",
+    ROUND]`` from that round's reviewer return the findings, capped like a
+    child report, to the builder. Neither writes the issue ledger, so the
+    claim never moves. A round whose offer mail fails is withdrawn so the
+    builder can ask again.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        args: ``send_message`` arguments addressed to the review address.
+
+    Returns:
+        The sent mail's result with a ``review`` entry naming the round.
+
+    Raises:
+        BridgeError: If the project keeps no ledger, the caller holds no
+            single claim, the round cap is reached, no lane can review, or
+            the findings do not answer the caller's open round.
+    """
+    from agent_parley import reviews
+
+    root = str(actor.get("project", ""))
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        raise BridgeError("This project keeps no issue ledger.")
+    name = actor["name"]
+    rest = args["to"][1:]
+    note = str(args.get("body_md") or "")
+    base = {
+        key: value
+        for key, value in args.items()
+        if key not in ("to", "subject", "body_md")
+    }
+    if len(rest) == 1 and re.fullmatch(r"r[0-9]+", str(rest[0])):
+        entry = reviews.pending(directory, rest[0], name)
+        report = reviews.cap(note)
+        if not report.strip():
+            raise BridgeError("Put the findings in the body.")
+        total = reviews.count(report)
+        sent = call(
+            home,
+            actor,
+            "send_message",
+            {
+                **base,
+                "to": [entry["builder"]],
+                "subject": reviews.findings_subject(entry, total),
+                "body_md": report,
+            },
+        )
+        entry = reviews.returned(directory, entry["id"], name, report)
+    else:
+        claim = held_claim(home, root, name)
+        ledger = issues.snapshot(directory)
+        issue = next(
+            (
+                number
+                for number, record in ledger.get("issues", {}).items()
+                if claim and record.get("claim_id") == claim
+            ),
+            "",
+        )
+        if not issue:
+            raise BridgeError(
+                "Ask for a review round while holding exactly one claim."
+            )
+        manifest = roster.read(directory)
+        entry = reviews.request(
+            directory,
+            builder=name,
+            issue=issue,
+            claim=claim,
+            branch=args.get("subject"),
+            paths=rest,
+            candidates=reviews.idle_lanes(directory, manifest),
+            providers=reviews.providers(manifest),
+            key=str(args.get("idempotency_key") or ""),
+        )
+        subject, body = reviews.offer_text(entry, note)
+        try:
+            sent = call(
+                home,
+                actor,
+                "send_message",
+                {
+                    **base,
+                    "to": [entry["reviewer"]],
+                    "subject": subject,
+                    "body_md": body,
+                },
+            )
+        except (BridgeError, OSError, sqlite3.Error):
+            if not entry["repeated"]:
+                reviews.withdraw(directory, entry["id"])
+            raise
+    return {
+        **sent,
+        "review": {
+            key: entry[key]
+            for key in (
+                "id",
+                "issue",
+                "round",
+                "builder",
+                "reviewer",
+                "state",
+                "findings",
+            )
+        },
+    }
 
 
 def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:

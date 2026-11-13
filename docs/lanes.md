@@ -208,6 +208,35 @@ then, capped by the project's `deadlines.wait` ceiling. A blocked report is for
 a lane that cannot continue: it ends the lane's work on the claim and the next
 resume starts a fresh session.
 
+## Asking for a review round
+
+A lane holding one claim can ask an idle peer to review its branch without
+handing the claim over. It sends mail to `@review` with the branch as the
+subject and the paths to read as the remaining recipients:
+
+```text
+send_message to=["@review", "agent_parley/retries.py"]
+  subject="feat/7-retry" body_md="Check the retry bound."
+```
+
+The coordinator offers the round to an idle lane, one holding no claim and
+no pending offer, and prefers a lane on a different provider than the
+builder. It falls back to any idle lane, and refuses when none is idle. The
+reviewer gets mail naming the round, such as `r3`, and answers once with
+`send_message to=["@review", "r3"]` and its findings in the body, one per
+bullet line. The findings are cut to 2000 bytes like a child report and
+mailed to the builder; the builder never reads the reviewer's transcript.
+
+The claim stays with the builder throughout. Each claim gets at most three
+rounds, one open at a time; a fourth request is refused with "open the pull
+request or ask the operator". The cap is not configurable. A round left
+unanswered for two hours expires: the builder may ask again, the reviewer
+counts as idle again, late findings are refused, and the expired round does
+not count toward the cap. Returned and expired rounds are dropped from
+`reviews.json` a week after they finish. `issue show` and `participant show`
+print each round with its reviewer, round number and finding count, or
+`open` or `expired`.
+
 ## Integrating one lane
 
 When a lane's work is ready, integrate it from the base checkout:
