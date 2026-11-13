@@ -530,10 +530,12 @@ merge or pull request.
 ## No lane waits for a human to give it something to do
 
 When a lane holds no claim, its next checkpoint carries the unclaimed work no
-dependency blocks — the issues other lanes wait on first — and names the peers
-holding more than one claim. When a lane holds several claims and a peer reads
-`idle` past the inactivity threshold, that lane is told which peer could take
-one. Every offer is checked first against what the host can read without asking
+dependency blocks and no pending offer reserves — the issues other lanes wait on
+first — and names the peers holding more than one claim. A lane whose session
+stopped or died and that holds no claim is offered the same work, and the wake
+resumes it on that offer. When a lane holds several claims and a peer reads
+`idle` past the stall interval (`stalled_after`), that lane is told which peer
+could take one. A retired lane is never named as that peer. Every offer is checked first against what the host can read without asking
 a vendor: the session process, the lane's own client records for a recent
 rate-limit or usage-window refusal, the worktree, and the acknowledgements it
 owes. Acknowledgement debt is suspended while the lane's state record has held

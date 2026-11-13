@@ -1588,8 +1588,12 @@ condition, or waiting on an unfinished dependency has nothing to resume. Its
 continue offer names each waiting claim and what it waits on, so the lane does
 not re-check them, and then the next work in order: peer mail that asks for an
 acknowledgement, the top `agent-parley issue next` candidate to claim, and a
-peer claim with no progress past the stall interval to ask for with
-`agent-parley issue request`. When none of those exists, the offer tells the
+peer claim with no progress past the claim idle interval (`claim_idle_after`,
+3600 seconds by default) to ask for with `agent-parley issue request`. A lane
+that already holds `max_claims_per_lane` counted claims is named neither a
+candidate nor a peer claim, because both would be refused; its offer says it is
+capped and names the claims to release or offer. When none of those exists, the
+offer tells the
 lane to call the `retire` MCP tool rather than answer with a status line. A
 lane that can still resume a claim is told to resume it, and the claims that
 wait are listed after it.

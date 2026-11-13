@@ -12,9 +12,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from agent_parley import (
+    checkpoints,
     dashboard,
     issues,
     lanes,
+    lifecycle,
     records,
     roster,
     store,
@@ -1002,6 +1004,33 @@ def test_a_stopped_lane_is_unfit_and_never_named_by_a_rebalance(
     offer = offer_for(directory, "claude")
     assert offer["kind"] == "continue"
     assert "codex" not in offer["text"]
+
+
+def test_a_retired_peer_is_never_named_when_the_offer_is_rederived(
+    bridge, repo, paired
+):
+    registered(bridge, paired)
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    alive(directory, "codex")
+    turn_ended(directory, "codex", 3600)
+    bridge.issue(lane, "claim", "2")
+    bridge.issue(lane, "claim", "3")
+    path = directory / "project.json"
+    manifest = json.loads(path.read_text())
+    manifest["participants"]["codex"]["retired"] = time.time()
+    write_json(path, manifest)
+    supervision.poll(bridge.home, directory)
+    offer = offer_for(directory, "claude")
+    assert offer["kind"] == "continue"
+    manifest = roster.read(directory)
+    config = supervision.configuration(bridge.home, manifest)
+    record = supervision.published_work(directory, "claude")
+    found = supervision._work_backlog(
+        bridge.home, directory, manifest, "claude", config, record
+    )
+    assert found and found[1]["kind"] == "continue"
+    assert "codex" not in found[1]["text"]
 
 
 def test_a_busy_lane_is_told_which_fit_peer_has_been_idle(bridge, repo, paired):
@@ -2088,6 +2117,26 @@ def test_idle_leads_read_mail_the_next_issue_and_a_stalled_peer(
         "next": "7",
         "stalled": {"issue": "3", "owner": "codex"},
     }
+    waiting = {
+        "issues": {
+            **ledger["issues"],
+            "4": held("running", blocked_by=["3"]),
+        }
+    }
+    assert supervision._idle_leads(
+        bridge.home, directory, manifest, "claude", waiting, 0, cap=1
+    ) == {
+        "mail": [f"#{message['id']} from codex"],
+        "next": "",
+        "stalled": None,
+        "capped": ["4"],
+    }
+    assert (
+        supervision._idle_leads(
+            bridge.home, directory, manifest, "claude", ledger, 0, cap=1
+        )["next"]
+        == "7"
+    )
     ledger["issues"]["5"] = held("running")
     assert (
         supervision._idle_leads(
@@ -2095,6 +2144,85 @@ def test_idle_leads_read_mail_the_next_issue_and_a_stalled_peer(
         )
         is None
     )
+
+
+def test_a_capped_lane_is_told_its_cap_instead_of_a_claim():
+    text = waiting_offer(WAITING, {**NO_LEADS, "capped": ["2", "3"]})["text"]
+    assert "You hold 2 claims counted against max_claims_per_lane" in text
+    assert "(#2, #3)" in text
+    assert "agent-parley issue offer" in text
+    assert "retire" not in text
+    assert "issue claim" not in text
+
+
+def recoverable_offer(recoverable):
+    """Derives the offer for a stopped lane holding no claim."""
+    ledger = {
+        "issues": {
+            "7": {"owner": None, "execution": {"authorized": True}},
+        }
+    }
+    return supervision._work_offer(
+        "claude",
+        {"claude": {"fit": False, "checks": {"session": False}}},
+        {"claude": 0},
+        {},
+        ["7"],
+        ledger,
+        600,
+        [],
+        None,
+        recoverable,
+    )
+
+
+def test_a_recoverable_lane_is_pulled_without_reserving_a_lead():
+    assert recoverable_offer(False) is None
+    offer = recoverable_offer(True)
+    assert offer["kind"] == "pull"
+    assert offer["issues"] == ["7"]
+    assert "lead" not in offer
+
+
+def test_only_a_resumable_session_failure_reads_recoverable(
+    monkeypatch, tmp_path
+):
+    recorded = {"state": lanes.STOPPED, "session": "s", "evidence": ""}
+    monkeypatch.setattr(supervision, "condition", lambda *args: recorded)
+    monkeypatch.setattr(checkpoints, "activity", lambda *args: {})
+    manifest = {"root": str(tmp_path), "participants": {"claude": {}}}
+    session = {"failed": ["session"]}
+
+    def reads(result=session):
+        return supervision._recoverable(
+            tmp_path, tmp_path, manifest, "claude", result
+        )
+
+    assert reads()
+    assert not reads({"failed": ["session", "capacity"]})
+    recorded["state"] = lanes.RECLAIMED
+    assert not reads()
+    recorded.update(state=lanes.DEAD, session="")
+    assert not reads()
+    recorded["session"] = "s"
+    manifest["participants"]["claude"]["paused"] = True
+    assert not reads()
+
+
+def test_unclaimed_work_skips_offers_and_ranks_blockers_first():
+    ledger = {
+        "issues": {
+            "3": {"owner": None, "execution": {"authorized": True}},
+            "5": {"owner": None, "execution": {"authorized": True}},
+            "6": {
+                "owner": None,
+                "offer": {"to": "codex"},
+                "execution": {"authorized": True},
+            },
+            "8": {**held("running"), "blocked_by": ["5"]},
+        }
+    }
+    assert lifecycle.actionable(ledger) == ["5", "3"]
 
 
 def work_record(session, observed_at, offer=None):
