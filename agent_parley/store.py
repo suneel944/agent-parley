@@ -3715,8 +3715,9 @@ def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
 
     Returns:
         The suggestion identifier, its state and expiry, whether it was
-        already recorded, the open issues and claims it duplicates and a
-        note that nothing was filed.
+        already recorded, the open issues and claims it duplicates, whether
+        the open forge issues could be checked and a note that nothing was
+        filed.
 
     Raises:
         BridgeError: If the project keeps no state directory, an argument is
@@ -3752,7 +3753,12 @@ def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
                 ),
                 options=(followups.ACCEPT,),
                 detail=recorded["why"]
-                + (f"\nMay duplicate {matched}." if matched else ""),
+                + (f"\nMay duplicate {matched}." if matched else "")
+                + (
+                    ""
+                    if recorded["forge_checked"]
+                    else f"\n{followups.FORGE_UNCHECKED}"
+                ),
                 confirm=(followups.ACCEPT,),
                 ttl=followups.TTL,
             )
@@ -3763,6 +3769,7 @@ def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
         "expires_at": recorded["expires"],
         "repeated": recorded["repeated"],
         "duplicates": recorded["duplicates"],
+        "forge_checked": recorded["forge_checked"],
         "note": recorded["note"],
     }
     _observe(
