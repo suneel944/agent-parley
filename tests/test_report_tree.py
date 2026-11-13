@@ -25,11 +25,27 @@ def test_a_ready_report_refuses_uncommitted_tracked_changes(bridge, paired):
     assert reports(lane.parent) == []
 
 
+def cleanliness(directory):
+    """Returns the `clean` flags of a lane's recorded reports."""
+    return [
+        record.get("clean")
+        for record in metrics.report_records(directory, "claude")
+        if record.get("kind") == "report"
+    ]
+
+
 def test_a_ready_report_ignores_untracked_scratch_files(bridge, paired):
     lane = Path(paired["lanes"]["claude"])
     (lane / "scratch.log").write_text("build output\n")
     bridge.report(lane, "ready", "Parser built", "", "12 tests passed")
     assert reports(lane.parent) == ["ready"]
+    assert cleanliness(lane.parent) == [False]
+
+
+def test_a_report_on_an_untouched_worktree_records_clean(bridge, paired):
+    lane = Path(paired["lanes"]["claude"])
+    bridge.report(lane, "partial", "Parser half built", "Finish it", "")
+    assert cleanliness(lane.parent) == [True]
 
 
 def test_a_partial_report_keeps_accepting_work_in_progress(bridge, paired):
@@ -37,3 +53,4 @@ def test_a_partial_report_keeps_accepting_work_in_progress(bridge, paired):
     (lane / "shared.txt").write_text("half done\n")
     bridge.report(lane, "partial", "Parser half built", "Finish it", "")
     assert reports(lane.parent) == ["partial"]
+    assert cleanliness(lane.parent) == [False]
