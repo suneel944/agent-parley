@@ -586,6 +586,7 @@ def _row(
         "pending_ack": mail.get("pending_ack", "?"),
         "usage_read": context.get("usage_read", True),
         "leases": stats.get("leases", 0),
+        "reserved_symbols": list(mail.get("reserved_symbols", [])),
         "stale_leases": stats.get("stale_leases", 0),
         "lease_age": stats.get("lease_age", 0),
         "stale_lease_age": stats.get("stale_lease_age", 0),

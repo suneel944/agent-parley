@@ -96,6 +96,7 @@ BASE_TOPIC = "base"
 DIRECT_TOPIC = "direct"
 MAX_TOPIC = 80
 MIN_STEM = 3
+SYMBOL_SEPARATOR = "::"
 BROADCAST_MIN = 3
 MARK_READ_TIMEOUT = 0.5
 BASE_NOTE = re.compile(
@@ -2047,7 +2048,9 @@ def named_resource(pattern: str) -> bool:
 
     A resource is written with a scheme, such as ``port:5432`` or
     ``suite:integration``, and a repository-relative path never carries one,
-    so the two key types cannot be confused for each other.
+    so the two key types cannot be confused for each other. A path key that
+    names a Python symbol, such as ``store.py::Store.claim``, is still a
+    path key.
 
     Args:
         pattern: Reservation key as the caller wrote it.
@@ -2055,8 +2058,43 @@ def named_resource(pattern: str) -> bool:
     Returns:
         Whether the key names a resource.
     """
-    scheme, separator, _ = pattern.partition(":")
+    scheme, separator, _ = split_symbol(pattern)[0].partition(":")
     return bool(separator) and "/" not in scheme
+
+
+def split_symbol(key: str) -> tuple[str, str]:
+    """Splits a reservation key into its path and the symbol it names.
+
+    A key such as ``agent_parley/store.py::Store.claim`` reserves one
+    function or class of a Python file; a key without ``::`` reserves the
+    whole path.
+
+    Args:
+        key: Reservation key or repository-relative path.
+
+    Returns:
+        The path part and the dotted symbol, empty when the key names none.
+    """
+    path, _, symbol = key.partition(SYMBOL_SEPARATOR)
+    return path, symbol
+
+
+def nested_symbols(symbol: str, other: str) -> bool:
+    """Reports whether one dotted symbol is the other or encloses it.
+
+    Args:
+        symbol: Qualified name such as ``Store.claim``.
+        other: Qualified name it is compared against.
+
+    Returns:
+        Whether a change to one can change the other: a class covers its
+        methods, and two sibling definitions never overlap.
+    """
+    return (
+        symbol == other
+        or symbol.startswith(other + ".")
+        or other.startswith(symbol + ".")
+    )
 
 
 def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
@@ -2075,6 +2113,11 @@ def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
     that open the same file overlap however each is spelled. Named
     resources are still compared exactly.
 
+    A key naming a Python symbol overlaps only where its path does. A path
+    without a symbol covers every symbol in the file, and two symbol keys
+    on one file overlap only when one is or encloses the other, so two
+    lanes may hold different functions of one module.
+
     Args:
         pattern: Reservation key or repository-relative path.
         other: Reservation key it is compared against.
@@ -2085,6 +2128,10 @@ def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
     """
     if named_resource(pattern) or named_resource(other):
         return pattern == other
+    pattern, symbol = split_symbol(pattern)
+    other, theirs = split_symbol(other)
+    if symbol and theirs and not nested_symbols(symbol, theirs):
+        return False
     if fold:
         pattern = pattern.casefold()
         other = other.casefold()
@@ -2114,10 +2161,12 @@ def overlapping_paths(
     spelling, so either side being one is answered by a set lookup; only a
     globbed path checked against a plain pattern uses the pairwise rule.
     Folding case answers the same question over casefolded paths and
-    reports each match in the spelling the caller gave.
+    reports each match in the spelling the caller gave. A pattern naming a
+    Python symbol is matched by its path, since a path carries no symbol
+    and so overlaps every symbol in its file.
 
     Args:
-        paths: Reservation keys or repository-relative paths.
+        paths: Repository-relative paths or keys naming no symbol.
         patterns: Reservation keys each path is compared against.
         fold: Whether paths are compared without regard to case.
 
@@ -2127,6 +2176,10 @@ def overlapping_paths(
     """
     if not patterns:
         return set()
+    patterns = [
+        pattern if named_resource(pattern) else split_symbol(pattern)[0]
+        for pattern in patterns
+    ]
     if fold:
         spellings: dict[str, list[str]] = {}
         for path in paths:
@@ -2227,15 +2280,23 @@ def _keys(
                 )
             keys.append(pattern)
             continue
-        parts = PurePosixPath(pattern)
+        path, symbol = split_symbol(pattern)
+        if SYMBOL_SEPARATOR in pattern and not all(
+            part.isidentifier() for part in symbol.split(".")
+        ):
+            raise BridgeError(
+                f"{pattern!r} names no Python symbol; write path::Name or "
+                "path::Class.method, such as src/store.py::Store.claim."
+            )
+        parts = PurePosixPath(path)
         if (
             parts.is_absolute()
             or ".." in parts.parts
-            or "\\" in pattern
+            or "\\" in path
             or str(parts) == "."
         ):
             raise BridgeError("Reservations require repository-relative paths.")
-        keys.append(str(parts))
+        keys.append(str(parts) + (SYMBOL_SEPARATOR + symbol if symbol else ""))
     return keys, ttl, exclusive, reason
 
 

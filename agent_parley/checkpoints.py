@@ -28,6 +28,7 @@ from agent_parley import (
     protocol,
     roster,
     store,
+    symbols,
 )
 from agent_parley.issues import deadline_notice, describe, snapshot
 from agent_parley.state import BridgeError, LockBusy, lock, write_json
@@ -2003,6 +2004,98 @@ def touched_path(payload: dict, lane: Path, *, fold: bool = False) -> str:
     return ""
 
 
+def written_text(payload: dict, before: str) -> str | None:
+    """Applies a native ``Write``, ``Edit`` or ``MultiEdit`` call to a text.
+
+    Args:
+        payload: Native ``PreToolUse`` hook payload.
+        before: File text before the call.
+
+    Returns:
+        The text the call would leave, or None when the tool is another one
+        or an edit's old text is not in the file.
+    """
+    tool = str(payload.get("tool_name", ""))
+    tool_input = payload.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        return None
+    if tool == "Write":
+        content = tool_input.get("content")
+        return content if isinstance(content, str) else None
+    edits = (
+        [tool_input]
+        if tool == "Edit"
+        else tool_input.get("edits")
+        if tool == "MultiEdit"
+        else None
+    )
+    if not isinstance(edits, list):
+        return None
+    text = before
+    for edit in edits:
+        old = edit.get("old_string") if isinstance(edit, dict) else None
+        new = edit.get("new_string") if isinstance(edit, dict) else None
+        if not isinstance(old, str) or not isinstance(new, str):
+            return None
+        if old not in text:
+            return None
+        text = text.replace(old, new, -1 if edit.get("replace_all") else 1)
+    return text
+
+
+def written_keys(
+    payload: dict,
+    lane: Path,
+    path: str,
+    patterns: list[str],
+    *,
+    fold: bool = False,
+) -> tuple[list[str], bool]:
+    """Names the reservation keys one file tool call writes.
+
+    A Python file some pattern reserves by symbol is parsed before and
+    after the call, and each changed definition is named as
+    ``path::Qualified.name``; a change at module level names the whole
+    path. Every other file, a call whose result cannot be computed, and a
+    file reserved by path alone are named by path, so the file is never
+    read for them. A file that does not parse before or after the call is
+    named by path and reported as unparsed, so the caller can say it fell
+    back to path semantics.
+
+    Args:
+        payload: Native ``PreToolUse`` hook payload.
+        lane: Resolved lane worktree the call runs in.
+        path: Lane-relative path the call writes.
+        patterns: Reservation keys the keys will be compared against.
+        fold: Whether paths are compared without regard to case.
+
+    Returns:
+        The keys the call writes and whether the file failed to parse.
+    """
+    reserved = any(
+        symbol and store.overlapping(file, path, fold=fold)
+        for file, symbol in map(store.split_symbol, patterns)
+    )
+    if not reserved or not path.endswith(".py"):
+        return [path], False
+    try:
+        before = (lane / path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        before = ""
+    except (OSError, UnicodeDecodeError):
+        return [path], False
+    after = written_text(payload, before)
+    if after is None:
+        return [path], False
+    names = symbols.touched(before, after)
+    if names is None:
+        return [path], True
+    return [
+        f"{path}{store.SYMBOL_SEPARATOR}{name}" if name else path
+        for name in names
+    ] or [path], False
+
+
 def relevance(message: dict, name: str, stems: list[str]) -> int:
     """Scores how much one delivered message concerns the reading lane.
 
@@ -2300,6 +2393,12 @@ def reserved_conflict(
 ) -> tuple[str, dict] | None:
     """Finds the peer reservation one tool call would write into.
 
+    A Python file is compared by the definitions the call changes, so a
+    peer's reservation of another function in the same file is not
+    written into. A file that does not parse is compared by path, and a
+    peer's symbol reservation in it is then left to the overlap notice:
+    a parse failure never refuses a call.
+
     Args:
         payload: Native ``PreToolUse`` hook payload.
         lane: Resolved lane worktree the call runs in.
@@ -2307,18 +2406,26 @@ def reserved_conflict(
         fold: Whether paths are compared without regard to case.
 
     Returns:
-        The lane-relative path the call writes and the overlapping
-        reservation with its ``pattern`` and ``holder``, or None.
+        The lane-relative path or ``path::Symbol`` key the call writes and
+        the overlapping reservation with its ``pattern`` and ``holder``, or
+        None.
     """
     path = touched_path(payload, lane, fold=fold)
     if not path:
         return None
-    for held in mail.get("peer_reservations") or []:
-        pattern = str(held["pattern"])
-        if not store.named_resource(pattern) and store.overlapping(
-            pattern, path, fold=fold
-        ):
-            return path, held
+    held = [
+        item
+        for item in mail.get("peer_reservations") or []
+        if not store.named_resource(str(item["pattern"]))
+    ]
+    patterns = [str(item["pattern"]) for item in held]
+    keys, unparsed = written_keys(payload, lane, path, patterns, fold=fold)
+    for item, pattern in zip(held, patterns, strict=True):
+        if unparsed and store.split_symbol(pattern)[1]:
+            continue
+        for key in keys:
+            if store.overlapping(pattern, key, fold=fold):
+                return key, item
     return None
 
 
@@ -2403,8 +2510,9 @@ def overlaps(
                             "text": f"{peer} reserves {pattern}",
                         }
                     )
+        file = store.split_symbol(path)[0]
         for pull in pulls:
-            if path not in (pull.get("files") or []):
+            if file not in (pull.get("files") or []):
                 continue
             closes = [
                 f"#{number}"
@@ -2418,15 +2526,15 @@ def overlaps(
             lane = pull.get("lane") or ""
             found.append(
                 {
-                    "key": f"pull:{pull.get('number')}:{path}",
+                    "key": f"pull:{pull.get('number')}:{file}",
                     "peer": lane,
                     "text": f"pull request #{pull.get('number')} "
                     f"({pull.get('branch')}{f' by {lane}' if lane else ''}) "
-                    f"changes {path}"
+                    f"changes {file}"
                     + (f" and closes {', '.join(closes)}" if closes else ""),
                 }
             )
-    return found
+    return list({item["key"]: item for item in found}.values())
 
 
 def named_paths(text: str, lane: Path) -> list[str]:
@@ -2580,6 +2688,15 @@ def overlap_notice(
         held = store.active_reservations(home, manifest["root"])
         held.pop(name, None)
         pulls = peer_pull_requests(directory, manifest, agent)
+    own = [
+        pattern
+        for pattern in mail.get("reserved") or []
+        if not store.named_resource(pattern)
+    ]
+    unparsed = False
+    if not filed:
+        patterns = [key for keys in held.values() for key in keys] + own
+        paths, unparsed = written_keys(payload, lane, path, patterns, fold=fold)
     found = overlaps(paths, held, pulls, issues.get("issues") or {}, fold=fold)
     if filed:
         found += claimed_matches(filed[0], issues, agent)
@@ -2601,12 +2718,19 @@ def overlap_notice(
             "filing": True,
         }
     reminder = f"unreserved:{path}"
-    unreserved = reminder not in shown and not any(
-        store.overlapping(pattern, path, fold=fold)
-        for pattern in mail.get("reserved") or []
-        if not store.named_resource(pattern)
+    unreserved = reminder not in shown and not all(
+        any(store.overlapping(pattern, key, fold=fold) for pattern in own)
+        for key in paths
     )
+    fallback = f"unparsed:{path}"
+    unparsed = unparsed and fallback not in shown
     lines = []
+    if unparsed:
+        lines.append(
+            f"{path} does not parse as Python, so its reservations were "
+            "compared by path: a symbol reservation in it covers the whole "
+            "file and was not enforced. Reservations are advisory."
+        )
     if fresh:
         lines.append(
             clip(
@@ -2642,7 +2766,8 @@ def overlap_notice(
     return {
         "text": "\n".join(lines),
         "keys": [item["key"] for item in fresh]
-        + ([reminder] if unreserved else []),
+        + ([reminder] if unreserved else [])
+        + ([fallback] if unparsed else []),
         "filing": False,
     }
 
@@ -3520,6 +3645,7 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
         named = db.execute(
             "SELECT path_pattern FROM file_reservations WHERE agent_id=? "
             "AND released_ts IS NULL AND instr(path_pattern,':')>0 "
+            "AND instr(path_pattern,'::')=0 "
             "AND (instr(path_pattern,'/')=0 "
             "OR instr(path_pattern,':')<instr(path_pattern,'/')) "
             "ORDER BY path_pattern LIMIT 16",
@@ -3554,6 +3680,11 @@ def mailbox(home: Path, root: str, name: str, after: int = 0) -> dict:
             "named_resources": [row["path_pattern"] for row in named],
             "unread_topics": {row["topic"]: row["n"] for row in topics},
             "reserved": [row["path_pattern"] for row in held if row["own"]],
+            "reserved_symbols": [
+                row["path_pattern"]
+                for row in held
+                if row["own"] and store.SYMBOL_SEPARATOR in row["path_pattern"]
+            ],
             "peer_reservations": [
                 {"holder": row["holder"], "pattern": row["path_pattern"]}
                 for row in held
