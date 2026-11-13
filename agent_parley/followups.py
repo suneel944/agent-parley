@@ -389,6 +389,10 @@ def body(entry: dict) -> str:
 def idle_lane(directory: Path, manifest: dict) -> str:
     """Picks a running lane that holds no claim and has no offer waiting.
 
+    A retired lane and a child lane are never picked. A child was spawned
+    for one task inside the paths its parent named, so work from the pool
+    is not its to take, whether or not it has returned its result.
+
     Args:
         directory: Private project state directory.
         manifest: Project manifest naming the participants.
@@ -396,7 +400,7 @@ def idle_lane(directory: Path, manifest: dict) -> str:
     Returns:
         The first such participant by name, or an empty string.
     """
-    from agent_parley import checkpoints, issues, supervision
+    from agent_parley import checkpoints, issues, roster, supervision
 
     ledger = issues.snapshot(directory)
     busy = set(issues.holders(ledger))
@@ -404,8 +408,8 @@ def idle_lane(directory: Path, manifest: dict) -> str:
         str((record.get("offer") or {}).get("to") or "")
         for record in ledger.get("issues", {}).values()
     }
-    for name in sorted(manifest.get("participants", {})):
-        if name in busy:
+    for name, entry in sorted(manifest.get("participants", {}).items()):
+        if name in busy or roster.retired(entry) or entry.get("parent"):
             continue
         derived = supervision.lane_state(checkpoints.activity(directory, name))
         if derived.get("process_alive"):

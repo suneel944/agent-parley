@@ -1,14 +1,28 @@
 """Checks child lanes against the real store, MCP transport and Git."""
 
+import io
 import json
+import os
+import sys
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-from agent_parley import children, roster, server, store, supervision
+from agent_parley import (
+    children,
+    cli,
+    followups,
+    process,
+    roster,
+    server,
+    store,
+    supervision,
+    terminal,
+)
 from agent_parley.cli import git
-from agent_parley.state import BridgeError
+from agent_parley.state import BridgeError, write_json
 
 
 def served(service, token, tool, arguments):
@@ -281,8 +295,17 @@ def test_of_lists_children_with_their_state():
                 "paths": ["y"],
                 "result": {"outcome": "blocked"},
             },
-            "lead-c3": {"parent": "lead", "branch": "b-c3", "paths": []},
-            "other-c1": {"parent": "other", "branch": "o"},
+            "lead-c3": {
+                "parent": "lead",
+                "branch": "b-c3",
+                "paths": [],
+                "spawned": time.time(),
+            },
+            "other-c1": {
+                "parent": "other",
+                "branch": "o",
+                "spawned": time.time(),
+            },
         }
     }
     views = children.of(manifest, "lead")
@@ -344,3 +367,179 @@ def test_the_launcher_runs_the_package_without_bypass_flags(
     ]
     assert seen["options"]["start_new_session"] is True
     assert (tmp_path / "lead-c1-wake.log").exists()
+
+
+def test_a_spawn_records_a_deadline_and_an_overdue_child_stops_counting(
+    bridge, parent, launched
+):
+    actor = {"project": parent["root"], "name": "claude"}
+    child = children.spawn(bridge.home, actor, {"task": "a", "paths": ["a"]})
+    manifest = roster.read(parent["directory"])
+    entry = manifest["participants"][child["child"]]
+    assert entry["deadline"] == entry["spawned"] + children.DEADLINE_SECONDS
+    assert children.live(manifest) == [child["child"]]
+    assert children.live(manifest, entry["deadline"] + 1) == []
+    del entry["deadline"]
+    assert children.due(entry) == entry["spawned"] + children.DEADLINE_SECONDS
+
+
+def test_an_overdue_child_is_retired_and_its_parent_is_told(
+    bridge, parent, launched, monkeypatch
+):
+    monkeypatch.setattr(children, "MAX_PER_PARENT", 1)
+    actor = {"project": parent["root"], "name": "claude"}
+    directory = parent["directory"]
+    name = children.spawn(bridge.home, actor, {"task": "a", "paths": ["a"]})[
+        "child"
+    ]
+    assert children.expire(bridge.home, directory) == []
+    late = time.time() + children.DEADLINE_SECONDS + 1
+    assert children.expire(bridge.home, directory, late) == [name]
+    assert children.expire(bridge.home, directory, late) == []
+    manifest = roster.read(directory)
+    entry = manifest["participants"][name]
+    assert roster.retired(entry)
+    assert entry["result"]["outcome"] == children.EXPIRED
+    assert children.of(manifest, "claude")[0]["state"] == children.EXPIRED
+    assert supervision.held_issue_mail(
+        bridge.home, directory, manifest, "claude"
+    ) == [str(entry["result"]["message"])]
+    again = children.spawn(bridge.home, actor, {"task": "b", "paths": ["b"]})
+    assert again["child"] != name
+
+
+def test_an_overdue_child_is_ended_when_its_parent_cannot_be_told(
+    bridge, parent, launched, monkeypatch
+):
+    actor = {"project": parent["root"], "name": "claude"}
+    directory = parent["directory"]
+    name = children.spawn(bridge.home, actor, {"task": "a", "paths": ["a"]})[
+        "child"
+    ]
+
+    def refuse(*args, **kwargs):
+        raise BridgeError("store refused")
+
+    monkeypatch.setattr(store, "speak", refuse)
+    late = time.time() + children.DEADLINE_SECONDS + 1
+    assert children.expire(bridge.home, directory, late) == [name]
+    entry = roster.read(directory)["participants"][name]
+    assert roster.retired(entry)
+    assert entry["result"]["message"] is None
+
+
+def test_a_report_after_expiry_replaces_the_expired_result(
+    bridge, parent, launched, monkeypatch
+):
+    actor = {"project": parent["root"], "name": "claude"}
+    directory = parent["directory"]
+    child = children.spawn(bridge.home, actor, {"task": "a", "paths": ["a"]})
+    name = child["child"]
+    store.register(bridge.home, parent["root"], name)
+    lane = Path(child["worktree"])
+    commit(lane, "a/x.txt", "x")
+    told = []
+    speak = store.speak
+
+    def spy(home, root, recipient, *args, **kwargs):
+        told.append(recipient)
+        return speak(home, root, recipient, *args, **kwargs)
+
+    monkeypatch.setattr(store, "speak", spy)
+    late = time.time() + children.DEADLINE_SECONDS + 1
+    assert children.expire(bridge.home, directory, late) == [name]
+    entries = roster.read(directory)["participants"]
+    assert told == [entries["claude"]["display"], entries[name]["display"]]
+    expired = entries[name]["result"]["message"]
+    report = {"state": "ready", "commit": "abc", "summary": "Wrote a"}
+    assert children.deliver(bridge.home, directory, name, report)
+    assert not children.deliver(bridge.home, directory, name, report)
+    manifest = roster.read(directory)
+    entry = manifest["participants"][name]
+    assert roster.retired(entry)
+    assert entry["result"]["outcome"] == "ready"
+    assert entry["result"]["message"] not in (None, expired)
+    assert children.live(manifest) == []
+    assert supervision.held_issue_mail(
+        bridge.home, directory, manifest, "claude"
+    ) == [str(entry["result"]["message"])]
+
+
+def test_a_delivered_child_is_retired_and_lifts_its_parents_wait(
+    bridge, parent, launched
+):
+    actor = {"project": parent["root"], "name": "claude"}
+    directory = parent["directory"]
+    child = children.spawn(bridge.home, actor, {"task": "a", "paths": ["a"]})
+    name = child["child"]
+    store.register(bridge.home, parent["root"], name)
+    lane = Path(child["worktree"])
+    commit(lane, "a/x.txt", "x")
+    assert (
+        supervision.held_issue_mail(
+            bridge.home, directory, roster.read(directory), "claude"
+        )
+        == []
+    )
+    bridge.report(lane, "ready", "Wrote a", "", "pytest: 1 passed")
+    manifest = roster.read(directory)
+    entry = manifest["participants"][name]
+    assert roster.retired(entry)
+    assert children.live(manifest) == []
+    assert supervision.held_issue_mail(
+        bridge.home, directory, manifest, "claude"
+    ) == [str(entry["result"]["message"])]
+
+
+def test_a_child_or_retired_lane_is_never_the_idle_lane(bridge, parent):
+    directory = parent["directory"]
+    write_json(
+        directory / "claude-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time(),
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    entry = roster.read(directory)["participants"]["claude"]
+
+    def picked(**extra):
+        return followups.idle_lane(
+            directory, {"participants": {"claude": {**entry, **extra}}}
+        )
+
+    assert picked() == "claude"
+    assert picked(parent="lead") == ""
+    assert picked(retired=time.time()) == ""
+
+
+def test_a_child_launch_takes_the_watched_terminal_path(
+    bridge, repo, parent, launched, monkeypatch
+):
+    actor = {"project": parent["root"], "name": "claude"}
+    name = children.spawn(bridge.home, actor, {"task": "a", "paths": ["a"]})[
+        "child"
+    ]
+
+    async def identity(*args):
+        return {"registration_token": "test-only"}
+
+    original = cli.shutil.which
+    monkeypatch.setattr(bridge, "up", lambda: None)
+    monkeypatch.setattr(bridge, "identity", identity)
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda found: "/bin/true" if found == "claude" else original(found),
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+    seen = []
+    monkeypatch.setattr(
+        terminal, "run", lambda *args, **kwargs: seen.append(kwargs) or 0
+    )
+    monkeypatch.setattr(
+        terminal, "call", lambda *args: pytest.fail("launched unwatched")
+    )
+    assert bridge.launch(name, repo, "Do the task") == 0
+    assert [call["attached"] for call in seen] == [False]

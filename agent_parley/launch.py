@@ -1326,7 +1326,11 @@ reported.
                 with delivery.polling(
                     self.home, lane.parent, agent, entry["adapter"]
                 ):
-                    if sys.stdin.isatty() or resume:
+                    if (
+                        sys.stdin.isatty()
+                        or resume
+                        or participant.get("parent")
+                    ):
                         supervised = supervision.configuration(self.home, data)
                         return terminal.run(
                             command,
