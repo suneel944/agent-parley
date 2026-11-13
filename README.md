@@ -162,6 +162,13 @@ For a pinned, checksummed install, take a wheel from
 completion, upgrades and the supported platforms are in
 [Operations](https://github.com/suneel944/agent-parley/blob/main/docs/operations.md#install-and-upgrade).
 
+`agent-parley doctor` and `agent-parley status` ask PyPI for the latest
+release at most once a day and, when the installed launcher is older, print
+one line on standard error with both versions and the upgrade command for your
+installer (`uv tool upgrade agent-parley`, `pipx upgrade agent-parley` or
+`pip install -U agent-parley`). An unreachable index prints nothing.
+`AGENT_PARLEY_NO_UPDATE_CHECK=1` turns the check off.
+
 ## Run it
 
 Not sure where to start? Run `agent-parley` with no arguments in the

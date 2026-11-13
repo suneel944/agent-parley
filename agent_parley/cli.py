@@ -6444,7 +6444,25 @@ def _plain_status() -> int:
     except (BridgeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(f"agent-parley: {refusal(exc)}", file=sys.stderr)
         return 1
+    _update_notice(home)
     return 0
+
+
+def _update_notice(home: Path) -> None:
+    """Prints the newer-release notice on standard error, if there is one.
+
+    Only `doctor` and `status` call this, so no hook and no service poll
+    waits on the package index; standard error keeps ``--json`` output
+    parseable.
+
+    Args:
+        home: The private state root holding the update check cache.
+    """
+    from agent_parley import updates
+
+    line = updates.notice(home.expanduser())
+    if line:
+        print(line, file=sys.stderr)
 
 
 def _title() -> int:
@@ -7029,6 +7047,7 @@ def main() -> int:
                 if args.json
                 else protocol.render(reported)
             )
+            _update_notice(bridge.home)
             return 0 if reported["consistent"] else 1
         elif args.command == "problems" and args.action == "ack":
             recorded = bridge.acknowledge(args.repo.resolve(), args.message_id)
@@ -7863,6 +7882,7 @@ def main() -> int:
                         every_claim=getattr(args, "all", False),
                         every_project=every_project,
                     )
+            _update_notice(bridge.home)
             if matched and (
                 selection.drifted or selection.pending or selection.over_budget
             ):
