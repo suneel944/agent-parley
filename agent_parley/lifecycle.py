@@ -421,11 +421,15 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
         owner: Existing owner to resume, or None for unowned work.
 
     Returns:
-        Issue numbers ordered numerically. Owner work is limited to its
+        Issue numbers. Owner work is ordered numerically and limited to its
         current generation and to issues that did not close on the forge
         inside it, so a closed issue is never the lane's next action. Free
-        work must be queued, unowned and not released after its issue ended
-        on the forge.
+        work must be queued, unowned, carry no pending offer and not have
+        been released after its issue ended on the forge; a claim of an
+        offered issue is refused, so naming one only spends a turn. It is
+        ordered most unblocking first, as `issues.unblocking_order` orders
+        it, so a pull offer leads with the issue whose completion moves the
+        most other work.
     """
     from agent_parley import issues
 
@@ -439,6 +443,7 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
         if owner is None:
             eligible = (
                 not record.get("owner")
+                and not record.get("offer")
                 and not record.get("ended_on_forge")
                 and execution["state"] == QUEUED
             )
@@ -452,6 +457,8 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
             )
         if eligible:
             found.append(number)
+    if owner is None:
+        return issues.unblocking_order(ledger, found)
     return sorted(found, key=int)
 
 

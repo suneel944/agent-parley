@@ -2931,6 +2931,7 @@ def _idle_leads(
     after: float,
     taken: set[str] | None = None,
     shared: dict[str, list[dict]] | None = None,
+    cap: int | None = None,
 ) -> dict | None:
     """Gathers the next work for a lane whose held claims cannot move.
 
@@ -2957,6 +2958,12 @@ def _idle_leads(
     Nor is a claim whose holder `holder_held` reports held by an operator
     decision, a blocked lane state or a declared wait.
 
+    A lane already holding `max_claims_per_lane` counted claims, as
+    `issues.counted_claims` counts them, is named no candidate and no
+    stalled peer claim, because `issue claim` and `issue request` would
+    refuse it; it is told it is capped instead, so a wake never asks it
+    for a claim it cannot take.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -2968,17 +2975,21 @@ def _idle_leads(
         shared: Live claims per candidate, as `_shared_claims` reports
             them, so work on this lane's own claims' files ranks first and
             work on another lane's is held back.
+        cap: The project's `max_claims_per_lane`, or None for no cap.
 
     Returns:
         The mail senders with their message identifiers, the top candidate
-        issue no other lane was named, and the stalled peer claim, or None
-        when the lane holds no claim or one of its claims can still move.
+        issue no other lane was named, the stalled peer claim, and the
+        counted claims when the lane is at the cap, or None when the lane
+        holds no claim or one of its claims can still move.
     """
     from agent_parley import checkpoints, plan, recommend
 
     held = issues.holders(ledger).get(name, [])
     if not held or lifecycle.actionable(ledger, name):
         return None
+    counted = issues.counted_claims(ledger["issues"], name)
+    capped = bool(cap and len(counted) >= cap)
     participant = manifest["participants"][name]
     try:
         mail = checkpoints.mailbox(
@@ -3020,7 +3031,7 @@ def _idle_leads(
             home, directory, manifest["root"], str(record["owner"]), number
         )
     )
-    return {
+    found = {
         "mail": [f"#{item['id']} from {item['sender']}" for item in mail[:5]],
         "next": ranked[0] if ranked else "",
         "stalled": (
@@ -3029,6 +3040,9 @@ def _idle_leads(
             else None
         ),
     }
+    if capped:
+        found.update(next="", stalled=None, capped=counted)
+    return found
 
 
 def _only_waits(ledger: dict, held: list[str], leads: dict | None) -> bool:
@@ -3075,8 +3089,9 @@ def _continue_text(
 
     Returns:
         The wake text: the claims to resume and the claims that wait, or,
-        when every held claim waits, the next work in order, or the
-        instruction to retire when there is none.
+        when every held claim waits, the next work in order, the counted
+        claims to release or offer when the lane is at its claim cap, or
+        the instruction to retire when there is none.
     """
     waiting = _waiting_claims(ledger, held or [])
     said = (
@@ -3113,11 +3128,23 @@ def _continue_text(
             "no progress past the claim idle interval, with agent-parley "
             f"issue request {stalled['issue']}"
         )
+    capped = ""
+    if counted := leads.get("capped"):
+        named = ", ".join(f"#{number}" for number in counted[:5])
+        capped = (
+            f" You hold {len(counted)} claims counted against "
+            f"max_claims_per_lane ({named}), so no new claim can be taken: "
+            "release a claim whose work already merged, or offer one with "
+            "agent-parley issue offer; otherwise end the turn."
+        )
     if steps:
         listed = "; then ".join(steps)
         return (
-            f"No held claim can move now.{said} Next work, in order: {listed}."
+            f"No held claim can move now.{said} Next work, in order: "
+            f"{listed}.{capped}"
         )
+    if capped:
+        return f"No held claim can move now.{said}{capped}"
     records = [ledger["issues"].get(number) or {} for number in held or []]
     if any(
         lifecycle.state(record)["state"] == lifecycle.READY
@@ -3290,6 +3317,7 @@ def _work_offer(
     after: float,
     recipients: list[str],
     leads: dict | None = None,
+    recoverable: bool = False,
 ) -> dict | None:
     """Derives the current offer for one lane from live eligibility inputs.
 
@@ -3307,6 +3335,10 @@ def _work_offer(
     other work waits. Its text names the waiting claims and the next work
     `_idle_leads` found, or tells the lane to retire when there is none.
 
+    A lane holding no claim whose only failed check is its session, because
+    its process stopped or died and `wake` can resume it, is offered the
+    same pull a fit lane would be, so the resumed turn has work to take.
+
     Args:
         name: Participant receiving the offer.
         results: Current fit result for every participant.
@@ -3318,6 +3350,8 @@ def _work_offer(
         recipients: Participants that read as able to act on a share now.
         leads: Next work for a lane none of whose held claims can move, or
             None when the lane holds no such set of claims.
+        recoverable: Whether `_recoverable` reads the lane as stopped or
+            dead with a session `wake` would resume.
 
     Returns:
         The actionable offer, or None when no work is currently eligible.
@@ -3395,7 +3429,11 @@ def _work_offer(
             and leads.get("next")
         ):
             offer["lead"] = leads["next"]
-    elif results[name]["fit"] and not held and (available or busy):
+    elif (
+        (results[name]["fit"] or recoverable)
+        and not held
+        and (available or busy)
+    ):
         selected = available[:5]
         for holder in busy:
             selected.extend(
@@ -3408,13 +3446,51 @@ def _work_offer(
             "text": _pull_text(available, busy),
             "progress": _work_progress(ledger, selected),
         }
-        if available:
+        if available and results[name]["fit"]:
             offer["lead"] = available[0]
     if offer:
         offer["id"] = hashlib.sha256(
             f"{offer['kind']}\x00{offer['text']}".encode()
         ).hexdigest()[:16]
     return offer
+
+
+def _recoverable(
+    home: Path, directory: Path, manifest: dict, name: str, result: dict
+) -> bool:
+    """Reports whether an unfit lane fails only on a session wake resumes.
+
+    The session check fails a stopped, dead or reclaimed lane alike, but
+    `wake` resumes only a stopped or dead lane whose record names a
+    session, that a host restart did not stop and that the operator did
+    not end with `participant stop`. Such a lane can still take work.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Current participant manifest.
+        name: Participant whose lane is being considered.
+        result: The lane's current `fit` result.
+
+    Returns:
+        Whether the lane would be fit once `wake` resumes its session.
+    """
+    from agent_parley import checkpoints
+
+    participant = manifest["participants"][name]
+    if (
+        result["failed"] != ["session"]
+        or not participant.get("wake", True)
+        or participant.get("paused", False)
+    ):
+        return False
+    recorded = condition(home, manifest["root"], name) or {}
+    return (
+        recorded.get("state") in (lanes.STOPPED, lanes.DEAD)
+        and bool(recorded.get("session"))
+        and not lanes.rebooted(recorded)
+        and not checkpoints.activity(directory, name).get("operator_stopped")
+    )
 
 
 def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
@@ -3440,6 +3516,9 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
     A retired lane is not measured, not offered anything and never named as a
     peer an offer could move work to, so retiring removes a lane from work
     selection rather than leaving it to refuse every offer it is sent.
+    A stopped or dead lane holding no claim, which `_recoverable` reads as
+    resumable, is offered the unclaimed work too, without reserving a lead.
+    A lane at `max_claims_per_lane` is named no next or stalled claim.
 
     Unclaimed work includes the open forge issues the ledger has not yet
     recorded, through `issues.with_forge`, so a newly opened issue reaches
@@ -3532,7 +3611,9 @@ def work(home: Path, directory: Path, manifest: dict, config: dict) -> None:
                 config["claim_idle_after"],
                 taken,
                 shared,
+                config["max_claims_per_lane"],
             ),
+            _recoverable(home, directory, manifest, name, result),
         )
         if offer and offer.get("lead"):
             taken.add(offer["lead"])
@@ -9935,6 +10016,8 @@ def _work_backlog(
     The offer is derived again the way `work` derived it: the leads the
     lanes before this one in name order publish are the issues taken
     earlier in that sweep, so an unchanged sweep reproduces the same offer.
+    Retired peers are left out of that derivation, as `work` leaves them
+    out, so a retired lane is never named as a rebalance target.
 
     Args:
         home: Private bridge state root.
@@ -9961,6 +10044,11 @@ def _work_backlog(
         for lead, peer in named_leads(directory, manifest, name).items()
         if peer < name
     }
+    serving = [
+        peer
+        for peer, participant in manifest["participants"].items()
+        if peer == name or not roster.retired(participant)
+    ]
     results = {
         peer: fit(
             home,
@@ -9970,11 +10058,9 @@ def _work_backlog(
             config["stalled_after"],
             config["inactive_after"],
         )
-        for peer in manifest["participants"]
+        for peer in serving
     }
-    stretches = {
-        peer: idle_seconds(directory, peer) for peer in manifest["participants"]
-    }
+    stretches = {peer: idle_seconds(directory, peer) for peer in serving}
     free = lifecycle.actionable(pool)
     shared = _shared_claims(directory, manifest, pool, free)
     leads = _idle_leads(
@@ -9986,6 +10072,7 @@ def _work_backlog(
         config["claim_idle_after"],
         taken,
         shared,
+        config["max_claims_per_lane"],
     )
     current = _work_offer(
         name,
@@ -10006,6 +10093,7 @@ def _work_backlog(
             config,
         ),
         leads,
+        _recoverable(home, directory, manifest, name, results[name]),
     )
     if not current or (
         current.get("id"),

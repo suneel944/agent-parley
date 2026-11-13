@@ -738,10 +738,9 @@ def unclaimed(state: dict) -> list[str]:
         Issue numbers a lane could claim, most unblocking first.
     """
     issues = state.get("issues", {})
-    planned = waiters(state, owned_only=False)
-    waiting = waiters(state)
-    return sorted(
-        (
+    return unblocking_order(
+        state,
+        [
             number
             for number, record in issues.items()
             if not record.get("owner")
@@ -751,12 +750,59 @@ def unclaimed(state: dict) -> list[str]:
             and lifecycle.state(record)["authorized"]
             and lifecycle.state(record)["state"]
             not in (lifecycle.COMPLETE, lifecycle.BLOCKED)
-        ),
+        ],
+    )
+
+
+def unblocking_order(state: dict, numbers: list[str]) -> list[str]:
+    """Orders candidate issues so the most unblocking one comes first.
+
+    The order `unclaimed` documents: the issues the most authorized,
+    unfinished work waits on first, then the issues more owned work waits
+    on, then the issue number, so the same ledger always gives one order.
+
+    Args:
+        state: Published issue ledger.
+        numbers: Candidate issue numbers.
+
+    Returns:
+        The same issue numbers, most unblocking first.
+    """
+    planned = waiters(state, owned_only=False)
+    waiting = waiters(state)
+    return sorted(
+        numbers,
         key=lambda number: (
             -len(planned.get(number, [])),
             -len(waiting.get(number, [])),
             int(number),
         ),
+    )
+
+
+def counted_claims(ledger: dict, agent: str) -> list[str]:
+    """Lists the claims of one lane that count toward the claim cap.
+
+    A delivered claim waits on verification and integration, not on its
+    holder, and a claim whose issue closed has nothing left to do, so
+    neither counts.
+
+    Args:
+        ledger: Issue records keyed by number.
+        agent: Lane whose claims are counted.
+
+    Returns:
+        The counted issue numbers, ordered numerically.
+    """
+    return sorted(
+        (
+            number
+            for number, item in ledger.items()
+            if item.get("owner") == agent
+            and not delivered(item)
+            and not closed(item)
+        ),
+        key=int,
     )
 
 
@@ -1214,16 +1260,7 @@ def _within_cap(ledger: dict, agent: str, cap: int | None) -> None:
     Raises:
         BridgeError: If the lane already holds the cap.
     """
-    held = sorted(
-        (
-            number
-            for number, item in ledger.items()
-            if item["owner"] == agent
-            and not delivered(item)
-            and not closed(item)
-        ),
-        key=int,
-    )
+    held = counted_claims(ledger, agent)
     if not cap or len(held) < cap:
         return
     now = time.time()
