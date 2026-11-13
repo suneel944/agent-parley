@@ -84,6 +84,12 @@ UNKNOWN = -1
 OK = "ok"
 MISMATCH = "mismatch"
 STALE = "stale"
+DEGRADED = "degraded"
+RECOVERING = (
+    "a background loop of the service failed and is restarted on its own; "
+    "the service log names the failure, and agent-parley down then "
+    "agent-parley up restarts the service if it keeps failing."
+)
 STOPPED = "not running"
 ROOT_GONE = "root gone"
 SETUP_GAP = "setup gap"
