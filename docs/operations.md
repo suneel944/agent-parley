@@ -2858,6 +2858,7 @@ These events notify, and nothing else:
 | `run_finished` | A lane run finished. |
 | `hook_refusal` | A lifecycle hook refused a branch switch or detected branch drift. |
 | `inbound_locked` | Inbound status queries were locked after repeated wrong passcodes. |
+| `session_ended` | The service ended a headless session held at a native prompt nobody could answer, and returned its work. |
 
 Each event is sent once per situation: a digest of the fields that identify it
 is kept per lane in private state, so an unchanged situation sends nothing
@@ -2869,7 +2870,10 @@ stable twelve-character identifier, the options that answer it with one marked
 recommended, whether acting on it can be undone, and an expiry a day out that
 each repeat observation extends; one situation holds exactly one open decision.
 The operator problems `problems` reports, such as a dirty worktree, an
-unresolved completion or a second session, open decisions as well, and a
+unresolved completion, a second session, orphaned claims, supervision failing,
+a forge refused (a timeout or error once it repeats), an operator offer
+unanswered past ten minutes, a blocked blueprint run, or an escalated or
+pending plan revision, open decisions as well, and a
 decision closes when its problem clears. Delivery is durable: a decision
 records each transport that accepted it and is marked sent only after every
 transport did, and a refused or abandoned send is retried on the next

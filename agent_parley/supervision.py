@@ -224,6 +224,7 @@ _READINGS_LOCK = threading.Lock()
 _COMPLETIONS: dict[tuple[str, str], tuple[float, tuple[str, float] | None]] = {}
 _REFRESHING: set[tuple[str, str]] = set()
 _REFRESHING_LOCK = threading.Lock()
+_UPKEEP_FAILED: dict[tuple[str, str], dict[str, str]] = {}
 _POLL_READINGS: contextvars.ContextVar[dict[tuple, object] | None] = (
     contextvars.ContextVar("poll_readings", default=None)
 )
@@ -4659,6 +4660,11 @@ def expire_offers(directory: Path, manifest: dict) -> None:
     own offer-then-release cycle is unaffected: by the time this runs its
     offer is already gone, or about to be released regardless.
 
+    An operator's offer of an issue nobody holds has no lane to return to,
+    so it was skipped and stood forever. Past its deadline it is withdrawn
+    as the operator's own `issue unassign` would, which frees the issue for
+    the next claim.
+
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
@@ -4668,17 +4674,19 @@ def expire_offers(directory: Path, manifest: dict) -> None:
     for number, record in ledger["issues"].items():
         holder = record.get("owner")
         offer = record.get("offer")
-        if (
-            not offer
-            or holder not in manifest["participants"]
-            or not issues.offer_state(offer, now)["overdue"]
-        ):
+        if not offer or not issues.offer_state(offer, now)["overdue"]:
+            continue
+        if holder in manifest["participants"]:
+            actor, action = holder, "cancel"
+        elif not holder and issues.offer_source(offer) == issues.OPERATOR:
+            actor, action = issues.OPERATOR, "unassign"
+        else:
             continue
         with contextlib.suppress(BridgeError):
             issues.change(
                 directory,
-                holder,
-                "cancel",
+                actor,
+                action,
                 number,
                 participants=set(manifest["participants"]),
             )
@@ -6831,6 +6839,21 @@ def headless_prompts(
         )
         _stop_headless(home, directory, root, name, reason, prompting(dialog))
         ended[name] = reason
+        with contextlib.suppress(BridgeError, OSError):
+            notify.deliver(
+                directory,
+                name,
+                notify.Event.SESSION_ENDED,
+                {
+                    "repo": root,
+                    "since": int(since),
+                    "detail": (
+                        f"{reason}, so the service ended its session and "
+                        "returned its work; start it in a terminal to "
+                        "answer the prompt"
+                    ),
+                },
+            )
     if not ended:
         return []
     records = {
@@ -7154,35 +7177,61 @@ def forge_upkeep(
     A catalog read pages through every open issue and can take tens of
     seconds, so `refresh_forge_issues` and then `release_forge_marks` run on
     one daemon thread per project, and a poll that finds the previous run
-    still going starts none. A failure inside the thread is dropped, and the
-    next poll tries again.
+    still going starts none. A failure inside the thread used to be dropped
+    unseen. It is kept in `_UPKEEP_FAILED` until a later run of the same
+    step succeeds, and each poll that finds one raises it after starting
+    the next run, so the poll's stage records a supervision error the
+    operator is told about.
 
     Args:
         directory: Private project state directory.
         manifest: Current participant manifest.
         skip_labels: Labels that keep an open forge issue out of the work
             offered to lanes; the `forge_skip_labels` supervision setting.
+
+    Raises:
+        BridgeError: If the previous run of a step failed and no run of it
+            has succeeded since.
     """
     key = (str(directory), FORGE_ISSUES)
     with _REFRESHING_LOCK:
-        if key in _REFRESHING:
-            return
+        failed = "; ".join(_UPKEEP_FAILED.get(key, {}).values())
+        running = key in _REFRESHING
         _REFRESHING.add(key)
+
+    def step(label: str, call: Callable[..., object], *args: object) -> None:
+        """Runs one upkeep step and keeps or clears its failure."""
+        try:
+            call(*args)
+        except Exception as exc:
+            with _REFRESHING_LOCK:
+                _UPKEEP_FAILED.setdefault(key, {})[label] = failure(label, exc)
+        else:
+            with _REFRESHING_LOCK:
+                _UPKEEP_FAILED.get(key, {}).pop(label, None)
 
     def upkeep() -> None:
         """Refreshes the catalog, then releases stale forge marks."""
         try:
-            with contextlib.suppress(Exception):
-                refresh_forge_issues(directory, manifest, skip_labels)
-            with contextlib.suppress(Exception):
-                release_forge_marks(directory, manifest)
+            step(
+                "forge refresh",
+                refresh_forge_issues,
+                directory,
+                manifest,
+                skip_labels,
+            )
+            step("forge marks", release_forge_marks, directory, manifest)
         finally:
             with _REFRESHING_LOCK:
                 _REFRESHING.discard(key)
 
-    _start_refresh(
-        key, threading.Thread(target=upkeep, name="forge upkeep", daemon=True)
-    )
+    if not running:
+        _start_refresh(
+            key,
+            threading.Thread(target=upkeep, name="forge upkeep", daemon=True),
+        )
+    if failed:
+        raise BridgeError(failed)
 
 
 def release_forge_marks(directory: Path, manifest: dict) -> None:
@@ -11572,25 +11621,42 @@ def run(home: Path, stopped: threading.Event) -> None:
     it, so the first pass repairs the plugin without an operator command.
     `up` does not repeat the call: the service it starts runs this pass at
     once, and two installs into one CLI home at the same time would race.
+
+    A failing prune, plugin repair or launcher reap belongs to no project,
+    so it reached only the service log. Each is also kept in the state
+    root's own supervision error record while it fails, which `problems`
+    reports as an estate row the operator is notified of, and the record
+    is removed by the first pass in which all three succeed.
     """
     from agent_parley import plugins, server
 
     deadlines: dict[Path, float] = {}
     pruned: float | None = None
     repaired: float | None = None
+    failing: dict[str, str] = {}
+    noted = ""
+
+    def upkeep(label: str, call: Callable[[], object]) -> None:
+        """Runs one service upkeep step and keeps or clears its failure."""
+        try:
+            call()
+        except Exception as exc:
+            failing[label] = failure(label, exc)
+            server.log(home, "supervision", failing[label])
+        else:
+            failing.pop(label, None)
+
+    def repair() -> None:
+        """Refreshes stale plugins and logs each line the repair reports."""
+        for line in plugins.repair(home):
+            server.log(home, "plugins", line)
+
     while not stopped.is_set():
         if pruned is None or time.monotonic() >= pruned:
-            try:
-                store.prune(home, time.time())
-            except Exception as exc:
-                server.log(home, "supervision", failure("prune store", exc))
+            upkeep("prune store", lambda: store.prune(home, time.time()))
             pruned = time.monotonic() + PRUNE_INTERVAL
         if repaired is None or time.monotonic() >= repaired:
-            try:
-                for line in plugins.repair(home):
-                    server.log(home, "plugins", line)
-            except Exception as exc:
-                server.log(home, "supervision", failure("repair plugins", exc))
+            upkeep("repair plugins", repair)
             repaired = time.monotonic() + DEFAULTS["interval"]
         try:
             paths = sorted((home / "projects").glob("*/project.json"))
@@ -11625,8 +11691,13 @@ def run(home: Path, stopped: threading.Event) -> None:
                     failure(f"{path.parent.name}: record poll failure", exc),
                 )
             deadlines[path] = time.monotonic() + interval
-        try:
-            reap_launchers()
-        except Exception as exc:
-            server.log(home, "supervision", failure("reap launchers", exc))
+        upkeep("reap launchers", reap_launchers)
+        detail = "; ".join(failing[label] for label in sorted(failing))
+        if detail != noted:
+            with contextlib.suppress(OSError):
+                if detail:
+                    issues.note_supervision_error(home, detail)
+                else:
+                    (home / issues.SUPERVISION_ERROR).unlink(missing_ok=True)
+                noted = detail
         stopped.wait(1)

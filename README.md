@@ -411,23 +411,26 @@ queries and decision answers back once inbound is on, as described in
 inbound off, nothing arrives over the channel and a permission prompt is
 answered only in your terminal.
 
-Fourteen changes notify: a handoff offered to a lane, a lane
+Fifteen changes notify: a handoff offered to a lane, a lane
 blocked on a permission prompt, a lane's tool call denied by its native
 permission check, a lane held by a native dialog, a lane still
 blocked past the escalation bound, a lane idle with no claim past
 `stalled_after`, issues waiting on an idle claim, a dead lane's claims waiting
 on your decision, a lane keeping a key refused to a peer past its deadline, an
 issue that is not converging, the enforced run budget running out, a lane run
-that finished, a hook refusal, and the inbound status path locking after
-repeated wrong passcodes. An unchanged situation sends nothing further.
+that finished, a hook refusal, the inbound status path locking after
+repeated wrong passcodes, and a headless session ended at a prompt nobody
+could answer. An unchanged situation sends nothing further.
 Sending never blocks a hook or tool call. Each of these situations is kept as a
 decision with a stable identifier, its options and a recommended one. So is
 each operator-owned `agent-parley problems` row younger than a day for an
 unresolved completion, an unacknowledged message, a bounced share, shares to a
 retired lane, a dirty worktree, a refused key still held, a second session, a
 refused recovery, an unverified integration, a wake needing attention, a wait
-on approval, a native dialog hold or a crossing ready, and those decisions are
-sent the same way. Nothing else notifies. A decision is retried
+on approval, a native dialog hold, a crossing ready, orphaned claims, supervision
+failing, a forge refused (a timeout or error once it repeats), an operator offer
+unanswered past ten minutes, a blocked blueprint run, or an escalated or
+pending plan revision, and those decisions are sent the same way. Nothing else notifies. A decision is retried
 with backoff on the next supervision poll until every transport accepts it, so
 a send cut short by a hook exiting still arrives. Decisions due together go
 out as one digest with one row of Telegram buttons each.

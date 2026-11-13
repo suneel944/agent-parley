@@ -51,6 +51,7 @@ from agent_parley.status import (
     FORGE_ISSUES,
     FORGE_RETRY,
     FORGE_STALE,
+    FORGE_TTL,
     fold_line,
     folded,
     service_state,
@@ -103,6 +104,7 @@ CI_ROUNDS_EXHAUSTED = "ci rounds exhausted"
 CHILD_SESSION = "session outliving its claim"
 CHILD_RECENT = 60
 FORGE_REFUSED = "forge refused"
+BLUEPRINT = "blueprint blocked"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
@@ -1905,7 +1907,11 @@ def _forge_rows(directory: Path, root: str, now: float) -> list[dict]:
     ``failed_at`` in `FORGE_ISSUES`. A refused credential or a project the
     signed-in account cannot see stops every pull request and completion
     wake, so it is named with the `gh auth` remedy; a rate limit names the
-    next retry instead.
+    next retry instead, as the service's own row. A timeout or any other
+    error is the operator's once it repeats: the first failure follows the
+    last good reading by about `FORGE_TTL`, so the row appears when the
+    newest failure trails that reading by a further `FORGE_RETRY`, or at
+    once when no reading ever succeeded.
 
     Args:
         directory: Private project state directory.
@@ -1926,19 +1932,25 @@ def _forge_rows(directory: Path, root: str, now: float) -> list[dict]:
         return []
     if failed_at <= read_at or now - failed_at >= FORGE_STALE:
         return []
+    retry = time.strftime("%H:%M:%S", time.localtime(failed_at + FORGE_RETRY))
+    actor = BY_OPERATOR
     if kind in ("auth", "missing"):
         project = forge.slug(Path(root)) or "<owner>/<name>"
         owner = project.split("/")[0]
         command = f"gh auth status, then gh auth switch --user {owner}"
         cause = "refused the signed-in account"
     elif kind == "rate":
-        retry = time.strftime(
-            "%H:%M:%S", time.localtime(failed_at + FORGE_RETRY)
-        )
         command = f"none; the supervisor retries at {retry}"
         cause = "rate limited the supervisor"
-    else:
+        actor = BY_SERVICE
+    elif read_at and failed_at - read_at < FORGE_TTL + FORGE_RETRY:
         return []
+    else:
+        command = (
+            "gh issue list --limit 1 to check the forge and the network; "
+            f"the supervisor retries at {retry}"
+        )
+        cause = "did not answer the supervisor"
     return [
         _row(
             FORGE_REFUSED,
@@ -1946,7 +1958,49 @@ def _forge_rows(directory: Path, root: str, now: float) -> list[dict]:
             command,
             _age(failed_at, now),
             project=root,
+            actor=actor,
         )
+    ]
+
+
+def _blueprint_rows(
+    directory: Path, data: dict, root: str, now: float
+) -> list[dict]:
+    """Reports each blueprint run that ended blocked on an issue still open.
+
+    A run ends blocked when its lane lost the issue, a node failed past its
+    retries, the run looped, or its pull request closed or spent its CI
+    rounds. The run record was the only trace, read by `blueprint
+    progress` alone. A blocked run is reported until its issue ends or a
+    new run replaces it.
+
+    Args:
+        directory: Private project state directory.
+        data: Project manifest naming the lanes whose runs are read.
+        root: Canonical project key.
+        now: Unix time the block's age is measured against.
+
+    Returns:
+        One row per blocked run, on the run's lane.
+    """
+    from agent_parley import blueprints
+
+    ledger = issues.snapshot(directory)["issues"]
+    where = f"--repo {shlex.quote(str(root))}"
+    return [
+        _row(
+            BLUEPRINT,
+            blueprints.line(number, run),
+            f"agent-parley blueprint run {lane} {run.get('blueprint')} "
+            f"--issue {number} {where} once the cause is fixed",
+            _age(run.get("updated"), now),
+            lane,
+            root,
+        )
+        for lane in sorted(data["participants"])
+        for number, run in sorted(blueprints.for_lane(directory, lane).items())
+        if run.get("status") == blueprints.BLOCKED
+        and not issues.ended(ledger.get(number) or {})
     ]
 
 
@@ -2373,6 +2427,16 @@ def derive(
                 "agent-parley up",
             )
         )
+    if failing := issues.supervision_error(home):
+        rows.append(
+            _row(
+                SUPERVISING,
+                f"service upkeep failing; last: {failing['detail']}",
+                "read server.log in the state directory and fix the step it "
+                "names; the next clean pass clears this row",
+                max(int(stamp - failing["since"]), 0),
+            )
+        )
     manifests = {}
     for path in (home / "projects").glob("*/project.json"):
         try:
@@ -2445,6 +2509,7 @@ def derive(
         aged.extend(_plugin_rows(home, directory, data, project, stamp))
         aged.extend(_forge_rows(directory, project["root"], stamp))
         aged.extend(_plan_rows(directory, project["root"], stamp))
+        aged.extend(_blueprint_rows(directory, data, project["root"], stamp))
         aged.extend(_run_rows(directory, data, project["root"], stamp))
         aged.extend(_checks_rows(directory, project["root"], stamp))
         aged.extend(_checks_failed_rows(directory, project["root"], stamp))
