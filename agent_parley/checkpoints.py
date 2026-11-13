@@ -39,7 +39,10 @@ MAX_NOTICE_BYTES = 1024
 MAX_ITEM_BYTES = 400
 HOURLY_WINDOW = 24
 ELAPSED = re.compile(r"\b\d+s\b")
-FULL_STATE = "agent-parley status and agent-parley issue list"
+FULL_STATE = (
+    f"`{protocol.cli_command()} status` and "
+    f"`{protocol.cli_command()} issue list`"
+)
 FOREIGN_WINDOW = 600
 MAX_EVENT_LOG_BYTES = 262144
 MAX_EVENT_LOG_AGE = 1209600
@@ -160,7 +163,13 @@ CHECKOUT_SWITCHES = frozenset(
 )
 CHECKOUT_PATCHES = frozenset({"-p", "--patch"})
 RESTORE_CHECK_SECONDS = 2.0
-OUTAGE_CHECK = "Run agent-parley status for the bridge's own report."
+OUTAGE_CHECK = (
+    f"Run `{protocol.cli_command()} status` for the bridge's own report."
+)
+ISSUE_STATE = (
+    f"\nRun `{protocol.cli_command()} issue list` for full state. Pause "
+    "offered work until resolved. Silence never transfers ownership."
+)
 OUTAGE_GUIDANCE = (
     "Reads and agent-parley commands still run; hold edits, commits and "
     "spawns until coordination answers again."
@@ -2250,9 +2259,12 @@ def hazard(
         return Reason.CHAINED_CLI, (
             f"Run each Agent Parley CLI command alone, as `{command} ARGS` "
             "from your worktree: no variable, `cd`, `;`, `&&`, `|`, "
-            "redirect or second command in the same call. Only that plain "
-            "form is pre-approved, so this call would wait on a permission "
-            "prompt. Change directory or filter output in a separate call."
+            "redirect or second command in the same call. Only a `claude` "
+            "lane gets a shell allow rule, once the operator opts in, and it "
+            "matches that plain form alone, so this call would wait on a "
+            "permission prompt; other CLIs get no shell allow rule and "
+            "prompt for either form. Change directory or filter output in a "
+            "separate call."
         )
     if exempt(payload):
         return None
@@ -4415,9 +4427,7 @@ def checkpoint(
                             (
                                 "issues",
                                 notice
-                                + "\nRun agent-parley issue list for full "
-                                "state. Pause offered work until resolved. "
-                                "Silence never transfers ownership."
+                                + ISSUE_STATE
                                 + offered_attachments(issues, agent),
                             )
                         )

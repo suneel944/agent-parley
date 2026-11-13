@@ -191,6 +191,10 @@ UNDELIVERED_WAKES = {
 OPT_IN_MISSING = "setup gap: bridge tool approval not recorded"
 OPT_IN_COMMAND = "agent-parley approval resume --bridge-tools on"
 OPT_IN_REMEDY = (
+    f"run `{OPT_IN_COMMAND}` (add `--participant NAME` for one lane), or "
+    "resume the lane in your own terminal"
+)
+CLAUDE_OPT_IN_REMEDY = (
     f"run `{OPT_IN_COMMAND}` (or `--auto-mode on`; add `--participant NAME` "
     "for one lane), or resume the lane in your own terminal"
 )
@@ -198,13 +202,20 @@ OPT_IN_WARNING = (
     "{name} is a {adapter} lane the coordination service resumes unattended, "
     "and no bridge tool approval is recorded for it, so a service resume "
     "would stop at a permission prompt nobody sees; the service reports "
-    "that lane instead of resuming it. To opt in, " + OPT_IN_REMEDY + "."
+    "that lane instead of resuming it. To opt in, {remedy}."
 )
 OPT_IN_UNSUPPORTED = (
     "{name} is a {adapter} lane with a bridge tool approval recorded, but "
     "{limit}, so the approval cannot reach its session and a resume may "
     "stop at a native permission prompt; answer it in your own terminal "
     "with `agent-parley run {name} --resume`."
+)
+OPT_IN_SHELL_GAP = (
+    "{name} is a {adapter} lane with a bridge tool approval recorded, which "
+    "reaches only its agent_parley MCP tools: the launch gives {adapter} no "
+    "shell allow rule for this bridge's CLI, so a resume may stop at a "
+    "shell permission prompt when the lane runs it; answer it in your own "
+    "terminal with `agent-parley run {name} --resume`."
 )
 WORKING = "working"
 WAITING = "waiting"
@@ -2850,9 +2861,9 @@ def _pull_text(available: list[str], busy: list[str]) -> str:
     if busy:
         parts.append(f"Holding more than one claim: {', '.join(busy)}.")
     parts.append(
-        "Claim one yourself with agent-parley issue claim before exploring "
-        "or editing, or ask a holder for a handoff. Nothing is claimed for "
-        "you."
+        f"Claim one yourself with `{protocol.cli_command()} issue claim "
+        "NUMBER` before exploring or editing, or ask a holder for a "
+        "handoff. Nothing is claimed for you."
     )
     return " ".join(parts)
 
@@ -2863,8 +2874,8 @@ def _rebalance_text(owned: list[str], idle: list[str]) -> str:
     return (
         f"Rebalance offer. {', '.join(idle)} read as fit and have been idle "
         f"past the stall interval while you hold {listed}. Shed one with "
-        "agent-parley issue offer if it helps; you decide, and ownership "
-        "moves only when the recipient accepts."
+        f"`{protocol.cli_command()} issue offer` if it helps; you decide, "
+        "and ownership moves only when the recipient accepts."
     )
 
 
@@ -2876,8 +2887,8 @@ def _split_text(issue: str, count: int, recipients: list[str]) -> str:
         f"claim is held while nothing moves. {', '.join(recipients)} read as "
         "able to take part of it now. Split the backlog and send one part "
         "with send_message and ack_required, or hand the whole claim over "
-        "with agent-parley issue offer. You decide what moves, and nothing "
-        "moves until a recipient answers."
+        f"with `{protocol.cli_command()} issue offer`. You decide what "
+        "moves, and nothing moves until a recipient answers."
     )
 
 
@@ -3122,15 +3133,15 @@ def _continue_text(
     if leads.get("next"):
         number = leads["next"]
         steps.append(
-            f"claim #{number}, the top agent-parley issue next candidate, "
-            f"with agent-parley issue claim {number} before exploring or "
-            "editing it"
+            f"claim #{number}, the top `issue next` candidate, with "
+            f"`{protocol.cli_command()} issue claim {number}` before "
+            "exploring or editing it"
         )
     if stalled := leads.get("stalled"):
         steps.append(
             f"ask for #{stalled['issue']}, held by {stalled['owner']} with "
-            "no progress past the claim idle interval, with agent-parley "
-            f"issue request {stalled['issue']}"
+            "no progress past the claim idle interval, with "
+            f"`{protocol.cli_command()} issue request {stalled['issue']}`"
         )
     capped = ""
     if counted := leads.get("capped"):
@@ -3899,7 +3910,10 @@ def opt_in_unsupported(
     An adapter `roster.APPROVAL` gives no way to carry the opt-in, and a
     `codex` client older than `roster.CODEX_APPROVAL_RELEASE`, would start
     without it, so the operator's recorded choice would change nothing.
-    This names that limitation instead of leaving it silent.
+    Only a `claude` lane also gets a shell allow rule for this bridge's
+    CLI, so on any other adapter the approval reaches the MCP tools alone
+    and a resume may still stop at a shell prompt. This names either
+    limitation instead of leaving it silent.
 
     Args:
         home: Private bridge state root.
@@ -3910,8 +3924,9 @@ def opt_in_unsupported(
             release unjudged.
 
     Returns:
-        `OPT_IN_UNSUPPORTED` filled in for the lane, or an empty
-        string when no approval is recorded or its adapter carries it.
+        `OPT_IN_UNSUPPORTED` or `OPT_IN_SHELL_GAP` filled in for the lane,
+        or an empty string when no approval is recorded or its adapter
+        carries all of it.
     """
     participant = (manifest.get("participants") or {}).get(name) or {}
     if not dialogs.pre_approved(manifest, name):
@@ -3934,9 +3949,28 @@ def opt_in_unsupported(
             f"codex {version or 'of unknown release'} predates the "
             f"per-server tool approval codex {release} reads"
         )
+    elif adapter != "claude":
+        return OPT_IN_SHELL_GAP.format(name=name, adapter=adapter)
     else:
         return ""
     return OPT_IN_UNSUPPORTED.format(name=name, adapter=adapter, limit=limit)
+
+
+def opt_in_remedy(adapter: str) -> str:
+    """Names the opt-in remedies one adapter's lanes accept.
+
+    `--auto-mode on` is the `claude` CLI's own permission mode, so only a
+    `claude` lane counts it as the opt-in, and `settings` refuses it for a
+    lane on any other adapter. Every other adapter is offered the bridge
+    tool approval alone.
+
+    Args:
+        adapter: Adapter of the lane the remedy is for.
+
+    Returns:
+        `CLAUDE_OPT_IN_REMEDY` for a `claude` lane, else `OPT_IN_REMEDY`.
+    """
+    return CLAUDE_OPT_IN_REMEDY if adapter == "claude" else OPT_IN_REMEDY
 
 
 def reminders(
@@ -6422,9 +6456,9 @@ def _announce_orphan(
     body = (
         f"{name} reads as orphaned: no running session process. Orphaned "
         f"claims: {listed}. Reservations it still holds: {held}. Nothing has "
-        "moved: take one with agent-parley issue claim NUMBER "
-        "--take-orphaned, which records you as the owner and releases those "
-        "reservations. Leaving it alone keeps it with " + name + "."
+        f"moved: take one with `{protocol.cli_command()} issue claim NUMBER "
+        "--take-orphaned`, which records you as the owner and releases "
+        "those reservations. Leaving it alone keeps it with " + name + "."
     )
     for peer in audience:
         if peer == name:

@@ -23,6 +23,7 @@ from agent_parley import (
     roster,
     server,
     store,
+    supervision,
     views,
 )
 from agent_parley.state import BridgeError
@@ -249,9 +250,11 @@ def test_doctor_reports_every_component(bridge, repo, paired, answering):
         if entry["component"] == "approvals"
     ]
     assert approvals["state"] == protocol.SETUP_GAP
-    assert approvals["remedy"].endswith(
-        f"{paired['root']} claude, {paired['root']} codex"
+    assert approvals["remedy"] == (
+        f"{supervision.OPT_IN_REMEDY}: {paired['root']} codex; "
+        f"{supervision.CLAUDE_OPT_IN_REMEDY}: {paired['root']} claude"
     )
+    assert "--auto-mode on" not in approvals["remedy"].split("; ")[0]
     text = protocol.render(reported)
     assert "Consistent." in text
     assert f"approvals: {approvals['remedy']}" in text
@@ -298,8 +301,9 @@ def test_doctor_names_a_recorded_opt_in_the_cli_cannot_carry(
     ]
     assert approvals["state"] == protocol.SETUP_GAP
     assert approvals["remedy"] == (
-        "the CLI cannot carry the recorded bridge tool approval, so resume "
-        f"these lanes in your own terminal: {paired['root']} amper"
+        "the CLI cannot carry all of the recorded bridge tool approval, so "
+        f"resume these lanes in your own terminal: {paired['root']} amper, "
+        f"{paired['root']} codex"
     )
 
 

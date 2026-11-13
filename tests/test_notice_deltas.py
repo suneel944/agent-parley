@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import checkpoints, issues, store
+from agent_parley import (
+    checkpoints,
+    issues,
+    protocol,
+    recommend,
+    store,
+    supervision,
+)
 from agent_parley.state import write_json
 
 OFFER = (
@@ -98,7 +105,8 @@ def test_a_change_injects_only_the_changed_entries(bridge, lanes):
     assert "#1: codex" not in changed
     assert "#2: codex" not in changed
     assert "unchanged notice entries omitted" in changed
-    assert "agent-parley status" in changed
+    assert f"`{protocol.cli_command()} status`" in changed
+    assert "Run agent-parley" not in changed
 
 
 def test_a_compaction_resends_everything_once(bridge, lanes):
@@ -126,7 +134,11 @@ def test_entries_past_the_budget_are_named_and_delivered_next():
     assert kinds == ["issues"]
     assert parts[0].split("\n") == [f"#{n}: codex" for n in range(1, 5)]
     assert parts[-1].startswith("4 more notice entries past")
-    assert "agent-parley status and agent-parley issue list" in parts[-1]
+    command = protocol.cli_command()
+    assert (
+        f"`{command} status` and `{command} issue list` report them"
+        in parts[-1]
+    )
     later, record, _ = checkpoints.fresh_notices(sections, record, 40)
     assert later[0].split("\n") == [f"#{n}: codex" for n in range(5, 9)]
     assert "4 unchanged notice entries omitted" in later[1]
@@ -190,3 +202,26 @@ def test_a_replayed_night_injects_under_half_of_a_full_resend(bridge, lanes):
     }
     for entry in checkpoints.notice_items("\n".join(resent)):
         assert checkpoints.item_digest(entry) in given, entry
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        checkpoints.FULL_STATE,
+        checkpoints.OUTAGE_CHECK,
+        checkpoints.ISSUE_STATE,
+        supervision._pull_text(["7"], []),
+        supervision._rebalance_text(["7"], ["codex"]),
+        supervision._split_text("7", 3, ["codex"]),
+        recommend.render(
+            {"candidates": [{"issue": "7", "title": "", "reasons": ["free"]}]}
+        ),
+    ],
+)
+def test_every_command_a_notice_names_is_the_pre_approved_form(text):
+    command = protocol.cli_command()
+    rule = protocol.cli_rule()
+    assert rule == f"Bash({command} *)"
+    assert f"`{command} " in text
+    assert "agent-parley issue" not in text
+    assert "agent-parley status" not in text

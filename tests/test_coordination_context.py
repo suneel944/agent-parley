@@ -364,6 +364,9 @@ def test_a_cli_call_the_pre_approval_cannot_match_is_refused(tmp_path, command):
     assert reason == checkpoints.Reason.CHAINED_CLI
     assert "alone" in text
     assert protocol.cli_command() in text
+    assert "Only that plain form is pre-approved" not in text
+    assert "Only a `claude` lane gets a shell allow rule" in text
+    assert "other CLIs get no shell allow rule" in text
 
 
 @pytest.mark.parametrize(

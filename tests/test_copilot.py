@@ -400,7 +400,9 @@ def test_an_opted_in_copilot_lane_allows_only_the_bridge_server(
     manifest.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
     write_json(path, manifest)
     assert bridge.launch("helper", repo, "Coordinate", "copilot", "work") == 0
-    assert "is a copilot lane" not in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no bridge tool approval is recorded" not in err
+    assert "the launch gives copilot no shell allow rule" in err
     argv = json.loads(capture.read_text())["argv"]
     assert argv.count("--allow-tool") == 1
     assert argv[argv.index("--allow-tool") + 1] == "agent_parley"

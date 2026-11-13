@@ -897,7 +897,11 @@ reported.
         data = self.add_participant(repo, agent, provider, credential)
         if gap := supervision.opt_in_adapter(self.home, data, agent):
             print(
-                supervision.OPT_IN_WARNING.format(name=agent, adapter=gap),
+                supervision.OPT_IN_WARNING.format(
+                    name=agent,
+                    adapter=gap,
+                    remedy=supervision.opt_in_remedy(gap),
+                ),
                 file=sys.stderr,
             )
         if number:

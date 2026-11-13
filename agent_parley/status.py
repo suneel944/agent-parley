@@ -915,7 +915,8 @@ class StatusMixin(BridgeCore):
             not. The `approvals` component names each lane
             `supervision.opt_in_missing` reports as a setup gap, and each
             lane whose recorded opt-in `supervision.opt_in_unsupported` says
-            its CLI cannot carry; it is the operator's choice, so it leaves
+            its CLI cannot carry in full, each with the opt-in remedy its
+            adapter accepts; it is the operator's choice, so it leaves
             the set consistent. The
             `dialogs` component names each lane `dialogs.drift` reports,
             a client newer than its recorded dialog matchers or a dialog
@@ -1107,13 +1108,15 @@ class StatusMixin(BridgeCore):
                 ),
             }
         )
-        unapproved = sorted(
-            f"{manifest['root']} {name}"
-            for manifest in manifests
-            if manifest.get("root")
-            for name in manifest.get("participants") or {}
-            if supervision.opt_in_missing(self.home, manifest, name)
-        )
+        unapproved: dict[str, list[str]] = {}
+        for manifest in manifests:
+            if not manifest.get("root"):
+                continue
+            for name in manifest.get("participants") or {}:
+                if gap := supervision.opt_in_adapter(self.home, manifest, name):
+                    unapproved.setdefault(
+                        supervision.opt_in_remedy(gap), []
+                    ).append(f"{manifest['root']} {name}")
         unsupported = sorted(
             f"{manifest['root']} {name}"
             for manifest in manifests
@@ -1121,15 +1124,14 @@ class StatusMixin(BridgeCore):
             for name in manifest.get("participants") or {}
             if supervision.opt_in_unsupported(self.home, manifest, name)
         )
-        remedies = []
-        if unapproved:
-            remedies.append(
-                supervision.OPT_IN_REMEDY + ": " + ", ".join(unapproved)
-            )
+        remedies = [
+            remedy + ": " + ", ".join(sorted(lanes))
+            for remedy, lanes in sorted(unapproved.items())
+        ]
         if unsupported:
             remedies.append(
-                "the CLI cannot carry the recorded bridge tool approval, so "
-                "resume these lanes in your own terminal: "
+                "the CLI cannot carry all of the recorded bridge tool "
+                "approval, so resume these lanes in your own terminal: "
                 + ", ".join(unsupported)
             )
         components.append(

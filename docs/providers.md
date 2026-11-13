@@ -267,7 +267,19 @@ named on standard error when such a lane launches and under `approvals` in
 unreadable starts without the override and says so. `auto_mode` is the
 `claude` CLI's own auto permission mode; it applies to `claude` lanes only,
 and `approval resume --auto-mode on --participant NAME` refuses any other
-adapter by name.
+adapter by name, so the opt-in remedy a warning or `doctor` names offers
+`--auto-mode on` for `claude` lanes only.
+
+Hook notices tell a lane to run the bridge CLI in its pre-approved form,
+`python -P -m agent_parley.cli`, under the interpreter that installed the
+bridge. Only a `claude` lane gets a shell allow rule for that form, the
+`Bash(... -m agent_parley.cli *)` entry in `permissions.allow`. The other
+adapters' approvals above reach the `agent_parley` MCP tools alone; this
+repository confirms no shell allow format for them, so the launch passes
+none. A recorded opt-in on such a lane is reported on standard error at
+launch and under `approvals` in `doctor`: a resume may stop at a shell
+permission prompt when the lane runs the bridge CLI, and the remedy is to
+answer it in your own terminal with `agent-parley run NAME --resume`.
 
 Each preset names one configuration-home variable. A credential profile's
 `--config-home` is applied to that variable for the launch, which is what makes

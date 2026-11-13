@@ -7287,7 +7287,9 @@ def main() -> int:
                 ):
                     print(
                         supervision.OPT_IN_WARNING.format(
-                            name=args.name, adapter=gap
+                            name=args.name,
+                            adapter=gap,
+                            remedy=supervision.opt_in_remedy(gap),
                         ),
                         file=sys.stderr,
                     )
