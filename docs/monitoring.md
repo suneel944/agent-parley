@@ -376,6 +376,16 @@ also shows a `last turn:` line from its stored turn recap: its last message,
 the failed commands and the changed files, each capped in bytes. `status
 --json` and the live view carry the recap as `recap`, and a lane without one
 shows nothing.
+Two live lanes that share a branch name, a new file named in both task plans,
+or at least three reserved paths that are also half of the smaller lane's set
+are converging on duplicate work. Both lanes read `needs input: converging
+with PEER on ITEM`, `status` prints one `Converging:` line per pair naming both
+lanes and the shared item, and the supervision poll mails each lane once while
+the overlap is unchanged. A plan names a new file only as a path with a
+directory and a letters-only extension that the base checkout lacks. A child
+lane is never paired with its parent, and a stopped, dead, reclaimed or
+retired lane is not compared. The flag clears when the overlap does; nothing
+is refused, renamed or released.
 `--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED,
 FIT and PLAN. The web view shows every column. PLAN is the lane's own task
 list: steps done of all and the step in progress, `-` before the lane records
@@ -470,6 +480,37 @@ minutes between polls, a stopped service, is charged to nothing. `status
 --json` carries both per lane and per project under `accounting`, and each
 time a lane's total crosses a whole minute an `accounting` event is added to
 its lane history.
+
+## Stagnation: more mail than progress
+
+Lanes that talk instead of working keep sending mail while their commits stop.
+`status` and `top` compare each project's last hour with the hour before it.
+Mail is the messages each lane sent. Progress is the commits its branch adds
+past the project base, timed by author time so a rebase or amend does not
+read as new work; the reservations and reservation requests it made; the
+reports it filed; and the handoffs it offered, accepted or assigned. A
+declined, cancelled, refused or unassigned handoff is not progress. Only
+recorded events are counted; no message or commit text is read. A project with
+no progress counts as one event, so the ratio is never infinite. Each source
+is read once for both hours, and `top` reuses a reading for 60 seconds
+(`dashboard.STAGNATION_TTL`) rather than on every refresh.
+
+When mail per progress event reaches 10 and progress did not rise over the
+earlier hour, `status` prints one line at the top of the project and `top`
+prints it under its first summary line:
+
+```text
+Stagnation: last 60 min, 12 mail per 0 progress events (ratio 12, threshold 10; previous 60 min 0 events); most mail per progress: lane-1 2/0, lane-2 2/0, lane-3 2/0. Nothing was sent to lanes.
+```
+
+The line names at most the three lanes with the highest ratio, as mail/progress.
+The window and the threshold are fixed in code with their rationale
+(`stagnation.WINDOW`, `stagnation.THRESHOLD`), so every project is read the
+same way. The signal is for the operator only: nothing is sent to any lane. A
+retired lane is not counted. `status --json` carries the reading per project
+under `stagnation`. `metrics throughput` reports `mail_sent`, `progress` and
+`mail_ratio` per lane and in the project totals, over its own `--since`
+window, and its table ends each project with a `Lane mail:` line.
 
 ## `problems`
 
@@ -664,6 +705,24 @@ window, or the last 7 days when no window is given:
 | `agent_parley_lane_ci_rounds_median` | gauge | Median CI rounds over merged pull requests with a known count |
 | `agent_parley_lane_claim_to_merge_seconds_median` | gauge | Median seconds from the claim to the merge of its pull request |
 | `agent_parley_project_pull_requests_excluded` | gauge | Pull requests in the window that no lane owns, left out of every lane figure |
+| `agent_parley_lane_merge_fraction_ratio` | gauge | Share of pull requests opened in the window that merged, by a claim resolution or by the forge's answer when it left the open list |
+| `agent_parley_lane_pull_requests_abandoned_window` | gauge | Pull requests that left the open list in the window and that the forge reported `CLOSED` |
+| `agent_parley_lane_pull_requests_end_unknown_window` | gauge | Pull requests that left the open list in the window with no recorded merge and no forge answer, never counted as abandoned |
+| `agent_parley_lane_shared_file_degree_ratio` | gauge | Share of the files in the lane's diff that another lane's diff also touches |
+
+The four merge health families are also exported as
+`agent_parley_provider_*`, labelled by project and provider, and
+`agent_parley_project_*`, labelled by project, summed over the reported lanes:
+the fraction is merged over opened summed across them, and the shared-file
+degree is the share of every file those lanes touch that more than one lane of
+the project touches. With no `--provider` filter, the project sums also count
+the outcomes of lanes no longer in the project, so a removed lane's pull
+requests stay in the project's fraction. When supervision re-reads a pull
+request that left the open list, it stores the forge's answer on the archived reading as `ended`. A
+failed read keeps the pull request in the open list, and an archived reading
+with no answer, such as one archived before `ended` was stored, counts as
+unknown rather than abandoned. The file footprint is the diff `top` already reads, so it describes
+the lanes now rather than the window.
 
 Nothing here reads the forge. Supervision's pull request poll already keeps
 each open pull request in `pull-requests.json` with the lane it belongs to and
