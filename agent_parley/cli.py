@@ -368,6 +368,7 @@ REPO_HELP = (
     "Repository root or any of its worktrees; defaults to the current "
     "directory."
 )
+RUN_TASK = "Check shared coordination state and await my task."
 RETRY_HELP = (
     "Idempotency key. Retry a failed command with the key it first used and "
     "the repeat returns the first result without applying the change again. "
@@ -4554,7 +4555,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     run.add_argument(
         "participant",
+        nargs="?",
+        default="",
         help="Participant name; a new name creates its own worktree lane.",
+    )
+    run.add_argument(
+        "--lanes",
+        default="",
+        metavar="NAME[,NAME...]",
+        help=(
+            "Open each named lane in its own tmux window, each on a distinct "
+            "issue of --milestone; without tmux, print one run command per "
+            "lane."
+        ),
+    )
+    run.add_argument(
+        "--milestone",
+        default="",
+        metavar="TITLE",
+        help="Milestone whose issues --lanes claims, one per lane.",
     )
     run.add_argument(
         "--provider",
@@ -4584,7 +4603,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     run.add_argument(
         "--task",
-        default="Check shared coordination state and await my task.",
+        default=RUN_TASK,
         help=(
             "Opening prompt for the session, not an issue; use --issue to "
             "claim one."
@@ -6862,6 +6881,43 @@ def main() -> int:
             if used:
                 with contextlib.suppress(BridgeError, OSError):
                     projects.touch(bridge.home, used)
+            if args.lanes or args.milestone:
+                from agent_parley import lanes_launch
+
+                if args.participant or not (args.lanes and args.milestone):
+                    parser.error("run --lanes needs --milestone, no NAME.")
+                lane_names = [name.strip() for name in args.lanes.split(",")]
+                if not all(lane_names):
+                    parser.error("run --lanes needs a name between commas.")
+                ignored = [
+                    flag
+                    for flag, given in (
+                        ("--provider", args.provider),
+                        ("--credentials", args.credentials),
+                        ("--issue", args.issue),
+                        ("--task", args.task != RUN_TASK),
+                        ("--resume", args.resume),
+                        ("--blueprint", args.blueprint),
+                    )
+                    if given
+                ]
+                if ignored:
+                    parser.error(
+                        f"run --lanes cannot take {', '.join(ignored)}."
+                    )
+                opened = lanes_launch.open_lanes(
+                    bridge, args.repo.resolve(), lane_names, args.milestone
+                )
+                for lane in opened["lanes"]:
+                    if lane["reason"]:
+                        print(
+                            f"{lane['participant']}: {lane['reason']}",
+                            file=sys.stderr,
+                        )
+                print("\n".join(lanes_launch.lines(opened)))
+                return 1 if lanes_launch.failed(opened) else 0
+            if not args.participant:
+                parser.error("run needs a participant NAME, or --lanes.")
             status = bridge.launch(
                 args.participant,
                 args.repo.resolve(),
