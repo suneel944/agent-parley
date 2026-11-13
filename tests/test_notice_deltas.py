@@ -8,6 +8,7 @@ import pytest
 
 from agent_parley import (
     checkpoints,
+    children,
     convergence,
     issues,
     merges,
@@ -244,6 +245,15 @@ LANE_FACING = {
     "recommend": lambda: recommend.render(
         {"candidates": [{"issue": "7", "title": "", "reasons": ["free"]}]}
     ),
+    "overdue": lambda: supervision._overdue_text("7", "is overdue by 9s"),
+    "bounced share": lambda: supervision._bounce_text(
+        {
+            "message_id": 3,
+            "subject": "review",
+            "blocked": [{"recipient": "codex", "reason": "has no session"}],
+        }
+    ),
+    "child brief": lambda: children.brief("claude", "b-c1", ["src"], "go"),
 }
 
 
@@ -251,5 +261,7 @@ LANE_FACING = {
 def test_a_lane_facing_notice_names_no_bare_bridge_command(builder):
     text = builder()
     assert text
-    assert not re.search(r"(?<![\w/.-])agent-parley (issue|status)\b", text)
+    assert not re.search(
+        r"(?<![\w/.-])agent-parley (issue|status|report|participant)\b", text
+    )
     assert protocol.cli_command() in text or "next_issues" in text

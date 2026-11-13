@@ -288,6 +288,17 @@ launch names that on standard error; `doctor` reads such a lane as approved,
 because no setup the operator records can close it. Answer the prompt in
 your own terminal with `agent-parley run NAME --resume`.
 
+Why those three stay open: `codex` accepts an execpolicy `prefix_rule` for
+the bridge CLI, but it reads `.rules` files only from the user's
+`CODEX_HOME/rules` or a project's `.codex/rules`, and takes no launch option
+naming one. Writing either would change every session on that home or the
+target repository, which a launch must not. Shell allow formats for
+`gemini` and `opencode` have not been confirmed against an installed
+release. Whether the `copilot` rule matches the bridge CLI when it runs
+with arguments has not been checked against an installed release or a
+live session, so a copilot lane that still prompts for the bridge CLI is
+a gap to report.
+
 Each preset names one configuration-home variable. A credential profile's
 `--config-home` is applied to that variable for the launch, which is what makes
 a second account of the same provider possible.

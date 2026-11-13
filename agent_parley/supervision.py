@@ -5277,6 +5277,29 @@ def _overdue_step(
         write_json(directory / "issues.json", ledger)
 
 
+def _overdue_text(number: str, cause: str) -> str:
+    """Writes the wake notice that asks an overdue holder for progress.
+
+    The report command is spelled with `protocol.cli_command`, the form a
+    lane's launch pre-approves, so the holder records progress without a
+    shell permission prompt.
+
+    Args:
+        number: Overdue issue number.
+        cause: Clause saying how overdue the claim is and how the wake went.
+
+    Returns:
+        The notice naming the report, offer and release choices.
+    """
+    return (
+        f"Issue #{number} {cause}. Record progress with "
+        f"`{protocol.cli_command()} report --state partial --issue {number} "
+        '--summary "..." --remaining "..."`, or offer or release it; '
+        "otherwise the supervisor offers it to an idle peer, then releases "
+        "it."
+    )
+
+
 def overdue_claims(
     home: Path,
     directory: Path,
@@ -5434,15 +5457,7 @@ def overdue_claims(
                 number,
                 identifier,
                 "wake",
-                (
-                    f"Issue #{number} {cause}. Record progress with "
-                    f"agent-parley report --state partial --issue {number} "
-                    '--summary "..." --remaining "...", or offer or release '
-                    "it; otherwise the supervisor offers it to an idle peer, "
-                    "then releases it."
-                )
-                if idle
-                else "",
+                _overdue_text(number, cause) if idle else "",
             )
         elif current.get("step") == "wake" and elapsed >= window:
             peer = _overdue_peer(
@@ -5791,28 +5806,46 @@ def share_bounces(
         observations: Presence reading per participant from this sweep.
     """
     for share in bounced_shares(home, directory, manifest, observations):
-        listed = "\n".join(
-            f"- {entry['recipient']} {entry['reason']}"
-            for entry in share["blocked"]
-        )
-        body = (
-            f"Message {share['message_id']} ({share['subject']}) asked for an "
-            "acknowledgement that these recipients cannot give:\n"
-            f"{listed}\n"
-            "The share is returned to you. You keep the work: offer it to a "
-            "lane that reads as fit with agent-parley participant status, or "
-            "hold it yourself. Nothing was withdrawn, no ownership moved, and "
-            "the acknowledgement still stands until its deadline."
-        )
         with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
             store.speak(
                 home,
                 manifest["root"],
                 share["sender"],
                 f"Share returned: message {share['message_id']}",
-                body,
+                _bounce_text(share),
                 f"share-bounce-{share['message_id']}",
             )
+
+
+def _bounce_text(share: dict) -> str:
+    """Writes the mail that returns a bounced share to its sender.
+
+    The command it names is spelled with `protocol.cli_command`, the form a
+    lane's launch pre-approves, so the sender can read the roster without a
+    shell permission prompt.
+
+    Args:
+        share: One entry from `bounced_shares`, carrying the message id, its
+            subject and each blocked recipient with its reason.
+
+    Returns:
+        The mail body naming each recipient that cannot answer and what the
+        sender may do next.
+    """
+    listed = "\n".join(
+        f"- {entry['recipient']} {entry['reason']}"
+        for entry in share["blocked"]
+    )
+    return (
+        f"Message {share['message_id']} ({share['subject']}) asked for an "
+        "acknowledgement that these recipients cannot give:\n"
+        f"{listed}\n"
+        "The share is returned to you. You keep the work: offer it to a "
+        "lane that reads as fit with "
+        f"`{protocol.cli_command()} participant status`, or hold it "
+        "yourself. Nothing was withdrawn, no ownership moved, and the "
+        "acknowledgement still stands until its deadline."
+    )
 
 
 def dead_mail(home: Path, directory: Path, manifest: dict) -> None:

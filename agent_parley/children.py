@@ -55,7 +55,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent_parley import roster, worktrees
+from agent_parley import protocol, roster, worktrees
 from agent_parley.state import BridgeError, lock, write_json
 
 TOOL = "spawn_child"
@@ -571,9 +571,10 @@ def brief(parent: str, branch: str, paths: list[str], task: str) -> str:
         f"You are a child lane of {parent}, on branch {branch}, cut from "
         f"{parent}'s branch. Reserve and change only: {', '.join(paths)}. "
         "Commit your work on your branch. When the task is done, file "
-        "exactly one result report and stop: `agent-parley report --state "
-        "ready --summary '<what changed>' --evidence '<checks run and their "
-        "results>'`, or `--state blocked --remaining '<what is left>'`. "
+        "exactly one result report and stop: "
+        f"`{protocol.cli_command()} report --state ready --summary '<what "
+        "changed>' --evidence '<checks run and their results>'`, or "
+        "`--state blocked --remaining '<what is left>'`. "
         f"{parent} receives only that report and merges your branch.\n\n"
         f"Task from {parent}:\n{task}"
     )
