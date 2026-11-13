@@ -602,6 +602,8 @@ live lane; `problems` answers what needs an operator right now.
 agent-parley problems
 agent-parley problems --ack-after 900
 agent-parley problems --json
+agent-parley problems --apply
+agent-parley problems --apply --yes
 ```
 
 The command derives its rows from the same reading `status` and `top` print,
@@ -661,6 +663,30 @@ condition, that count, its age and what clears it:
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
 | `run budget exhausted` | The project's enforced run budget is used up or its ledger was unreadable or missing; no wake, dispatch, retry or launch starts. | `agent-parley budget resume` after raising the limit, or `--reset` |
 | `run budget unmetered` | A lane has no readable token records while a token limit is enforced, or a live session not started by `agent-parley run` while an hours limit is, so it is refused wakes, dispatch and retries. | `agent-parley budget enforce --tokens 0 --hours 0`, or relaunch the lane with `agent-parley run` on a provider whose transcripts Parley reads |
+
+`--apply` runs, after the list, the remedies that cannot drop work. Each
+row whose remedy could be run carries a structured action that marks it safe
+or names why not, so the classification never parses the printed command.
+Two remedies are safe:
+
+- Retiring a lane `ready to retire` whose session process is recorded gone,
+  whose project root still exists and whose worktree Git reads as clean,
+  with no ignored files. It runs the same path as `participant retire NAME`,
+  which checks the session lock and the worktree again before it removes
+  anything.
+- Collecting the private state of a project whose root is gone after the
+  service retired its lanes, as `gc --project ROOT --apply` does. It keeps
+  the recovery checkpoints. No `problems` row names such a project without
+  `--apply`.
+
+Everything else is listed as skipped with its reason: a lane whose session
+may still run, a worktree with uncommitted changes, ignored files or one Git
+could not read, and a gone root whose lanes are live, refused retirement or
+are not retired yet. One question covers the safe set; `--yes` answers it,
+and an unanswered question, as on a closed standard input, declines and runs
+nothing. Each remedy prints its result or its failure. The command exits 1
+when the operator declines or any remedy fails, and 0 otherwise. `--yes`
+without `--apply`, or `--apply` with `--json`, is a usage error.
 
 A retired lane reports nothing but that kept worktree. Its quiet is the state
 it was asked for, so it raises no stall, no inactivity and no acknowledgement
