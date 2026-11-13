@@ -8325,7 +8325,10 @@ def _closed_pull_requests(
     number. One the forge reports open, or cannot answer for, keeps its
     last reading in `kept`, so a failed read is never taken as a close. One
     closed without merging tells its lane once; a merged one ends through
-    claim completion instead. No lane owning it means no read.
+    claim completion instead. No lane owning it means no read. Each gone
+    reading keeps the state that read answered as `ended`, empty when
+    nothing was read, so outcome metrics tell an abandoned pull request
+    from one whose end is unknown without another forge read.
 
     Args:
         home: Private bridge state root.
@@ -8335,7 +8338,8 @@ def _closed_pull_requests(
         kept: This poll's readings keyed by number; gains each carried one.
 
     Returns:
-        The previous readings of the pull requests that left.
+        The previous readings of the pull requests that left, each with
+        its `ended` state.
     """
     root = Path(manifest["root"])
     gone: list[dict] = []
@@ -8350,7 +8354,7 @@ def _closed_pull_requests(
         if ended is None or ended.get("number"):
             kept[number] = previous
             continue
-        gone.append(previous)
+        gone.append({**previous, "ended": str(ended.get("state") or "")})
         if ended.get("state") != "CLOSED":
             continue
         body = (

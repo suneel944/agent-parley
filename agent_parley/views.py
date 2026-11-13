@@ -171,10 +171,43 @@ LANE_METRICS: tuple[tuple[str, str, str, str], ...] = (
     ),
 )
 
+MERGE_HEALTH: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "merge_fraction_ratio",
+        "gauge",
+        "merge_fraction",
+        "Share of pull requests opened in the outcome window that merged.",
+    ),
+    (
+        "pull_requests_abandoned_window",
+        "gauge",
+        "pull_requests_abandoned",
+        "Pull requests the forge reported closed unmerged in the outcome "
+        "window.",
+    ),
+    (
+        "pull_requests_end_unknown_window",
+        "gauge",
+        "pull_requests_end_unknown",
+        "Pull requests that left the open list with no recorded merge and "
+        "no forge answer on how they ended.",
+    ),
+    (
+        "shared_file_degree_ratio",
+        "gauge",
+        "shared_file_degree",
+        "Share of the files in the lane diffs that more than one lane touches.",
+    ),
+)
+
 NO_OUTCOMES: dict[str, int | float | None] = {
     "pull_requests_opened": 0,
     "pull_requests_merged": 0,
     "pull_requests_closed": 0,
+    "pull_requests_opened_merged": 0,
+    "pull_requests_abandoned": 0,
+    "pull_requests_end_unknown": 0,
+    "merge_fraction": None,
     "first_pass": 0,
     "first_pass_known": 0,
     "first_pass_rate": None,
@@ -941,6 +974,8 @@ def _row(row: dict) -> dict:
         "diff_added": row["diff_added"],
         "diff_deleted": row["diff_deleted"],
         "diff_paths": list(row["diff_paths"]),
+        "shared_paths": list(row.get("shared_paths") or []),
+        "shared_file_degree": row.get("shared_file_degree"),
         "host": row["host"],
         "worktree": row["worktree"],
         "hook_events": row["hook_events"],
@@ -1050,7 +1085,10 @@ def families(view: dict) -> list[dict]:
     Every lane series is labelled by project, participant and provider, and
     every project series by project alone; a project series the project
     itself carries, such as its excluded pull requests, is read from the
-    project rather than summed over its rows. Denials are also counted by the
+    project rather than summed over its rows. The merge health families
+    are also reported per provider, labelled by project and provider, and
+    per project, from the sums the collector made over the reported rows;
+    a fraction over nothing has no sample. Denials are also counted by the
     reason class and the tool that drew them. A field that states nothing could
     be read, such as tokens on an unreadable session record, contributes no
     sample rather than a zero, so a reader never mistakes an unread value for
@@ -1066,7 +1104,11 @@ def families(view: dict) -> list[dict]:
         0.18.x alias, as ``_with_aliases`` describes.
     """
     reported = []
-    for name, kind, key, text in LANE_METRICS:
+    lane_health = tuple(
+        (f"agent_parley_lane_{suffix}", kind, key, text)
+        for suffix, kind, key, text in MERGE_HEALTH
+    )
+    for name, kind, key, text in (*LANE_METRICS, *lane_health):
         samples = []
         for project in view["projects"]:
             for row in project["rows"]:
@@ -1127,6 +1169,31 @@ def families(view: dict) -> list[dict]:
                 ],
             }
         )
+    for suffix, kind, key, text in MERGE_HEALTH:
+        for level, label in (("provider", "provider"), ("project", "")):
+            reported.append(
+                {
+                    "name": f"agent_parley_{level}_{suffix}",
+                    "type": kind,
+                    "help": text,
+                    "samples": [
+                        {
+                            "labels": {
+                                "project": project["root"],
+                                **({label: name} if label else {}),
+                            },
+                            "value": value,
+                        }
+                        for project in view["projects"]
+                        for name, health in (
+                            sorted(project.get("provider_health", {}).items())
+                            if label
+                            else [("", project.get("merge_health", {}))]
+                        )
+                        if (value := _measured(health.get(key))) is not None
+                    ],
+                }
+            )
     return _with_aliases(reported)
 
 
