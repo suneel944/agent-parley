@@ -54,6 +54,8 @@ from agent_parley.status import (
     bucket_cell,
     bucket_of,
     bucket_order,
+    contention_lines,
+    contention_reading,
     lane_bucket,
     plan_cell,
     plan_reading,
@@ -591,6 +593,12 @@ def _row(
         "stale_lease_age": stats.get("stale_lease_age", 0),
         "queued": stats.get("queued", 0),
         "queued_by": list(stats.get("queued_by", [])),
+        "contention": contention_reading(
+            stats.get("contention", []),
+            data,
+            context["issues"]["issues"],
+            participant["display"],
+        ),
         "injected_bytes": events["injected_bytes"],
         "injected_per_hour": hourly_rate(state),
         "hook_events": events["events"],
@@ -1037,6 +1045,7 @@ def notes(row: dict) -> list[str]:
     if row["work_dispatch"].get("state") == "escalated":
         found.append(row["work_dispatch"]["last_result"])
     found.append(row.get("blueprint", ""))
+    found.extend(contention_lines([row]))
     found.append(recap_note(row))
     return [str(note) for note in found if note]
 

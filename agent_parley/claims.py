@@ -323,6 +323,13 @@ class ClaimsMixin(ReportsMixin):
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
             raise
+        if action in ("accept", "release"):
+            self._end_contention(
+                data,
+                (record.get("handoff") or {}).get("from")
+                if action == "accept"
+                else agent,
+            )
         if action == "accept":
             return self._inherit(data, agent, record)
         if action == "claim":
@@ -411,6 +418,29 @@ class ClaimsMixin(ReportsMixin):
             )
             carried["diff_bytes"] = len(text.encode())
         return carried
+
+    def _end_contention(self, data: dict, lane: str | None) -> None:
+        """Clears the contention records of the lane whose work moved.
+
+        An accepted handoff or a release is the operator's answer to a
+        flagged pair, so the pair may be flagged again if refusals resume.
+        A store that cannot answer leaves the records, which the next
+        handoff or release clears.
+
+        Args:
+            data: Project manifest.
+            lane: Participant that gave up the work, or None when unknown.
+        """
+        import sqlite3
+
+        from agent_parley.cli import store
+
+        if lane not in data["participants"]:
+            return
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.clear_contention(
+                self.home, data["root"], data["participants"][lane]["display"]
+            )
 
     def _inherit(self, data: dict, agent: str, record: dict) -> dict:
         """Moves an accepted handoff's reservations to the accepting lane.
@@ -984,13 +1014,16 @@ class ClaimsMixin(ReportsMixin):
             issue's record in it, the reservation keys its owner holds, and
             the history reading for the same issue, and the convergence
             account of an owned issue's current claim generation, or None
-            for an unowned issue.
+            for an unowned issue. ``contention`` lists each flagged pair
+            the owner is one lane of, naming the peer, the key, the
+            refusal count and the issues the peer holds.
 
         Raises:
             BridgeError: If the number is unusable or the project has none.
         """
         from agent_parley import convergence
         from agent_parley.cli import parse_issue, roster, snapshot, store
+        from agent_parley.status import held_issues
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
@@ -1004,9 +1037,24 @@ class ClaimsMixin(ReportsMixin):
             if owner in data["participants"]
             else ""
         )
+        contention = [
+            {
+                "peer": peer,
+                "path": flagged["path"],
+                "count": flagged["count"],
+                "issues": held_issues(ledger["issues"], data, peer),
+            }
+            for flagged in (
+                store.contentions(self.home, data["root"]) if identity else []
+            )
+            if identity in flagged["lanes"]
+            for peer in flagged["lanes"]
+            if peer != identity
+        ]
         return {
             "root": str(root),
             "issue": identifier,
+            "contention": contention,
             "ledger": ledger,
             "record": record or None,
             "owner": owner,
