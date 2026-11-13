@@ -953,6 +953,7 @@ def _row(row: dict) -> dict:
         "last_event_at": timestamp(row["last_event_ts"] or None),
         "branch": row["branch"],
         "drift": row["drift"],
+        "worktrees": list(row.get("worktrees", [])),
         "review": row["review"] or None,
         "reviewer": row["reviewer"] or None,
         "reviewed_report": row["reviewed_report"] or None,

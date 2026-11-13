@@ -3053,6 +3053,32 @@ applies a default to it. Nothing retries, rewords or works around the
 refused call, and the service never writes the suggested rule or any bypass
 flag: adding the rule is the operator's edit to their own settings.
 
+### Worktrees a lane's client makes
+
+A Claude Code lane runs its hook on the shared lifecycle events, on
+`PermissionDenied`, and on `TaskCompleted` and `TeammateIdle`. The last two
+record progress or an idle teammate in `<lane>-activity.json`, including for a
+subagent's event, and never block. No `WorktreeCreate` or `WorktreeRemove`
+hook is installed: the `claude` CLI hands checkout creation to a configured
+`WorktreeCreate` hook, which must then make the worktree and print its path,
+and fires `WorktreeRemove` only for worktrees such a hook made. The launcher
+never creates, moves or prunes a checkout for the client.
+
+Instead a hook event whose working directory is another worktree of the lane's
+repository is recorded on the lane's roster entry, accepted as inside the lane,
+and listed in `top` with its path, branch and base. A worktree outside
+`<lane>/.claude/worktrees/` is flagged, because unrecorded checkouts in other
+places are how one audit found 971 stray worktrees. Its base reads `lane` when
+it contains the lane branch tip and `default` otherwise: the CLI's
+`worktree.baseRef` setting can cut a worktree from `origin/<default>` rather
+than from the lane, and a `default` base means its work does not start from
+the lane's. On first sight the lane reserves the worktree's repository-relative
+path, so a peer reserving it is told of the conflict; reservations are
+advisory. A worktree outside the repository is recorded and flagged but not
+reserved. At `Stop` or `SessionEnd` a record whose directory is gone is closed;
+its reservation stays until the lane's own release, because the store releases
+a lane's reservations only all at once.
+
 ### Reclaiming landed lanes
 
 Every lane owns a worktree in the private project state directory and a branch
