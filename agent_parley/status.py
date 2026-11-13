@@ -670,7 +670,8 @@ def pull_request(readings: list[dict], issue: str, branch: str) -> dict | None:
         branch: Branch assigned to the lane that owns the claim.
 
     Returns:
-        The number, URL, check verdict, merge state, seconds since its head
+        The number, URL, check verdict, mergeability, the forge's merge
+        state status such as `BEHIND`, seconds since its head
         was first seen pending and whether that head was reported stalled,
         of the newest pull request that names the issue as one it closes,
         else of the one whose head is the lane's branch, or None when the
@@ -693,6 +694,7 @@ def pull_request(readings: list[dict], issue: str, branch: str) -> dict | None:
         "url": str(found.get("url") or ""),
         "checks": str(found.get("checks") or ""),
         "mergeable": str(found.get("mergeable") or ""),
+        "merge_state": str(found.get("merge_state") or ""),
         "pending_seconds": since(float(found.get("pending_since") or 0)),
         "stalled": bool(found.get("stalled_at")),
     }

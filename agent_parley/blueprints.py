@@ -1193,6 +1193,13 @@ def _wait_ci(root: Path, directory: Path, data: dict, run: dict) -> bool | None:
             "open, so no check verdict will come; the operator decides."
         )
         return None
+    if head and reading and reading.get("none_told") == head:
+        run["status"] = BLOCKED
+        run["message"] = (
+            f"Pull request #{reading['number']} reports no checks at {head}, "
+            "so no check verdict will come; the operator decides."
+        )
+        return None
     if (
         not head
         or not reading

@@ -7386,6 +7386,14 @@ def pull_request_wakes(
         record["mergeable_settled"] = _merge_settled(previous, reading)
         kept[str(reading["number"])] = record
         changes = _pull_request_changes(previous, reading)
+        changes.extend(
+            signal
+            for signal in (
+                _no_checks(previous, record),
+                _merge_blocked(previous, record),
+            )
+            if signal
+        )
         limited = _ci_round_limit(
             directory, manifest["root"], previous, record, rounds, now
         )
@@ -7445,16 +7453,12 @@ def pull_request_wakes(
                 f"pull-request:{digest}",
             )
     _not_started_decisions(directory, manifest["root"], kept, now)
+    gone = _closed_pull_requests(home, manifest, ledger, before, kept)
     history = [
         item
         for item in [
             *(seen.get("history") or []),
-            *(
-                {**record, "gone_at": now}
-                for number, record in before.items()
-                if number not in kept
-                and len(readings) < forge.MAX_PULL_REQUESTS
-            ),
+            *({**record, "gone_at": now} for record in gone),
         ]
         if now - float(item.get("gone_at") or 0) < PULL_REQUEST_HISTORY_SECONDS
     ]
@@ -7515,7 +7519,7 @@ def _past_the_window(
         current = forge.pull_request(root, int(number)) if owned else None
         if current is None:
             carried[number] = previous
-        elif current:
+        elif current.get("number"):
             found.append(current)
     return found, carried
 
@@ -7875,7 +7879,9 @@ def _pull_request_changes(before: dict, after: dict) -> list[str]:
         after: This poll's reading from `forge.open_pull_requests`.
 
     Returns:
-        One phrase per change worth a wake, empty when nothing changed.
+        One phrase per change worth a wake, empty when nothing changed. A
+        conversation comment is new when an earlier reading listed comments
+        without it, so the first reading after an upgrade wakes nobody.
     """
     changes: list[str] = []
     finished = after["checks"] in {"green", "red"}
@@ -7897,6 +7903,20 @@ def _pull_request_changes(before: dict, after: dict) -> list[str]:
             for review in added
         )
         changes.append(f"review submitted: {listed}")
+    if "comments" in before:
+        posted = [
+            comment
+            for comment in after.get("comments") or []
+            if comment not in before["comments"]
+        ]
+        if posted:
+            listed = ", ".join(
+                comment["author"] or "unknown" for comment in posted
+            )
+            changes.append(
+                f"conversation comment from {listed}; read it with "
+                f"`gh pr view {after['number']} --comments`"
+            )
     prior = before.get("mergeable_settled", before.get("mergeable"))
     current = after["mergeable"]
     if (
@@ -7928,6 +7948,133 @@ def _merge_settled(previous: dict, reading: dict) -> str:
         return reading["mergeable"]
     prior = previous.get("mergeable_settled", previous.get("mergeable"))
     return prior if prior in MERGE_SETTLED else ""
+
+
+def _no_checks(before: dict, record: dict) -> str:
+    """Describes a head on which no check reported, once per head.
+
+    A just-pushed head commonly reads no checks until its workflows
+    register, so only a second poll reading none on the same head is a
+    verdict: no workflow runs on this branch and no CI result will come.
+    `none_told` on the record names the head already announced.
+
+    Args:
+        before: The previous reading, or an empty mapping for a first one.
+        record: This poll's reading; gains `none_told` while its head is
+            announced.
+
+    Returns:
+        One phrase for the lane, or an empty string.
+    """
+    if record["checks"] != "none" or before.get("sha") != record["sha"]:
+        return ""
+    if before.get("checks") != "none":
+        return ""
+    record["none_told"] = record["sha"]
+    if before.get("none_told") == record["sha"]:
+        return ""
+    return (
+        "no checks reported on this head, so no CI verdict will come: "
+        "check that a workflow runs on this branch and base, or report "
+        "blocked so the operator decides"
+    )
+
+
+def _merge_blocked(before: dict, record: dict) -> str:
+    """Describes a merge state that needs the lane, once per entry into it.
+
+    `BEHIND` means a rule requires the branch to be current with its base.
+    `BLOCKED` counts only once checks are green, since the forge also
+    reports it while required checks run. An `UNKNOWN` reading carries the
+    announced state forward, as `_merge_settled` does for `mergeable`.
+
+    Args:
+        before: The previous reading, or an empty mapping for a first one.
+        record: This poll's reading; gains `merge_told` naming the state
+            announced while it lasts.
+
+    Returns:
+        One phrase for the lane, or an empty string.
+    """
+    state = str(record.get("merge_state") or "UNKNOWN")
+    told = str(before.get("merge_told") or "")
+    if state == "UNKNOWN":
+        record["merge_told"] = told
+        return ""
+    current = (
+        state
+        if state == "BEHIND"
+        or (state == "BLOCKED" and record["checks"] == "green")
+        else ""
+    )
+    record["merge_told"] = current
+    if not current or current == told:
+        return ""
+    if current == "BEHIND":
+        return (
+            "branch is behind its base and the base requires it current: "
+            "rebase onto the base and push"
+        )
+    return (
+        "merge is blocked though checks passed: a required review, check "
+        f"or rule is unmet; read `gh pr view {record['number']}` and resolve "
+        "it or report blocked"
+    )
+
+
+def _closed_pull_requests(
+    home: Path, manifest: dict, ledger: dict, before: dict, kept: dict
+) -> list[dict]:
+    """Tells each lane whose pull request closed unmerged, and lists the gone.
+
+    A tracked pull request missing from this poll's readings is re-read by
+    number. One the forge reports open, or cannot answer for, keeps its
+    last reading in `kept`, so a failed read is never taken as a close. One
+    closed without merging tells its lane once; a merged one ends through
+    claim completion instead. No lane owning it means no read.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Current participant manifest.
+        ledger: Issue records from the project ledger.
+        before: Previous readings keyed by pull request number.
+        kept: This poll's readings keyed by number; gains each carried one.
+
+    Returns:
+        The previous readings of the pull requests that left.
+    """
+    root = Path(manifest["root"])
+    gone: list[dict] = []
+    for number, previous in before.items():
+        if number in kept or not isinstance(previous, dict):
+            continue
+        name = str(
+            previous.get("lane")
+            or _pull_request_lane(manifest, ledger, previous)
+        )
+        ended = forge.pull_request(root, int(number)) if name else {}
+        if ended is None or ended.get("number"):
+            kept[number] = previous
+            continue
+        gone.append(previous)
+        if ended.get("state") != "CLOSED":
+            continue
+        body = (
+            f"Pull request #{number} {previous.get('url') or ''} was closed "
+            f"without merging at head {previous.get('sha') or 'unknown'}. "
+            "Reopen it, open a replacement, or report blocked so the "
+            "operator decides. Nothing was reopened for you."
+        )
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error, KeyError):
+            store.speak(
+                home,
+                manifest["root"],
+                manifest["participants"][name]["display"],
+                f"Pull request #{number} closed",
+                body,
+                f"pull-request-closed:{number}:{previous.get('sha') or ''}",
+            )
+    return gone
 
 
 def _pull_request_feedback(

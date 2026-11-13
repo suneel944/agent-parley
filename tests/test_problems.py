@@ -1757,6 +1757,16 @@ def test_a_conflicting_or_red_pull_request_is_never_offered_for_merge(
     assert "conflicts with its base" in row["detail"]
     assert row["command"].startswith("rebase the claude branch")
     assert "review and merge" not in row["command"]
+    behind = integrating_lane(
+        monkeypatch,
+        ceiling + 1,
+        mergeable="MERGEABLE",
+        merge_state="BEHIND",
+        checks="green",
+    )
+    [row] = [row for row in behind if row["condition"] == problems.INTEGRATE]
+    assert "is behind its base" in row["detail"]
+    assert row["command"].startswith("rebase the claude branch")
     red = integrating_lane(
         monkeypatch, ceiling + 1, mergeable="MERGEABLE", checks="red"
     )
