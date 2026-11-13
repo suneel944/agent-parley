@@ -809,7 +809,9 @@ def prune(directory: Path, ledger: dict) -> list[str]:
     ever owned; nothing previously removed one. A checkpoint is safe to
     remove once its exact ownership generation is no longer the issue's
     current one: the claim was released, taken again under a new claim
-    identifier, or its issue closed on the forge. A checkpoint a live owner
+    identifier, or its issue closed on the forge. A released claim whose
+    owner was marked orphaned keeps its checkpoint while the issue stays
+    unowned, because the next claimant restores it. A checkpoint a live owner
     took over stays, because `restore` reads it until the take completes; a
     restore receipt goes once its checkpoint is gone. A capture also leaves a
     same-sized temporary bundle behind when the process is killed between
@@ -844,7 +846,13 @@ def prune(directory: Path, ledger: dict) -> list[str]:
             and current.get("claim_id") == claim_id
             and not current.get("ended_on_forge")
         )
-        if live or record_path.stem in taken:
+        released = (
+            not current.get("owner")
+            and (current.get("released_orphan") or {}).get("claim_id")
+            == claim_id
+            and not current.get("ended_on_forge")
+        )
+        if live or released or record_path.stem in taken:
             continue
         try:
             saved = json.loads(record_path.read_text())
