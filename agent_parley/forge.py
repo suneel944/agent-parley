@@ -24,9 +24,13 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agent_parley import critical
+
 MAX_TITLE = 200
 MAX_PATHS = 200
 MAX_OPEN_ISSUES = 100
+EDGE_PAGE_SIZE = 100
+EDGE_PAGES = 10
 MAX_PULL_REQUESTS = 30
 PULL_REQUEST_FIELDS = (
     "number,url,headRefName,headRefOid,mergeable,mergeStateStatus,"
@@ -1090,6 +1094,41 @@ def _title_of(output: str | None) -> str | None:
     return title[:MAX_TITLE] if isinstance(title, str) else None
 
 
+def issue_text(repo: Path, number: str) -> tuple[str | None, str | None]:
+    """Returns an issue's title and Markdown body in one forge reading.
+
+    A claim makes this read instead of `issue_title`, so finding the
+    issue's acceptance criteria costs no client call beyond the title read.
+    On GitHub one ``gh issue view --json title,body`` answers both; Beads
+    and the null forge give the `issue_title` answer and no body. The read
+    is best effort and read only: any failure of the client reports
+    absence of both.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        number: Bare repository issue number.
+
+    Returns:
+        The title as `issue_title` clips it, and the body, empty when the
+        issue has none; either is None when no usable reading answers.
+    """
+    if _implementation(repo) != "github":
+        return issue_title(repo, number), None
+    project = _reachable(repo)
+    if project is None:
+        return None, None
+    output = _run(
+        ["gh", "issue", "view", number, "--repo", project]
+        + ["--json", "title,body"],
+        15,
+    )
+    try:
+        body = json.loads(output or "")["body"] or ""
+    except (ValueError, TypeError, KeyError):
+        body = None
+    return _title_of(output), body if isinstance(body, str) else None
+
+
 def _beads_title(number: str) -> str | None:
     """Reads one issue's title from the Beads ledger through ``bd``."""
     if not _beads_reachable():
@@ -1309,6 +1348,7 @@ def open_issue_catalog(
     limit: int = MAX_OPEN_ISSUES,
     timeout: int = 15,
     since: float | None = None,
+    edges: bool = False,
 ) -> dict[str, dict] | None:
     """Reads the forge's open issues, telling absence apart from none open.
 
@@ -1316,18 +1356,26 @@ def open_issue_catalog(
     instant on, open or closed, so a cached catalog can be brought current
     without paging through every open issue again.
 
+    Given `edges`, the catalog is built first and then enriched by a second,
+    separately bounded and best effort `issue_edges` read, so its failure
+    returns the title catalog unchanged. With `since`, only the open issues
+    of the delta are enriched.
+
     Args:
         repo: Repository or assigned worktree that selects the forge project.
         limit: Most open issues to read in the one call.
-        timeout: Seconds the one client call may take.
+        timeout: Seconds the one client call may take, and again the
+            seconds the enrichment may take.
         since: Unix seconds; when given, read issues updated since then.
+        edges: Whether to add each issue's ``blocked_by`` and ``milestone``.
 
     Returns:
         Bare issue number to its recorded title, label names, assignee
         logins and, when the forge reports one, ``updated_at`` in Unix
-        seconds, plus ``state`` when `since` is given; an empty mapping when
-        the forge reports no such issue, or None when the project has no
-        GitHub forge, no client, or the call failed.
+        seconds, plus ``state`` when `since` is given, plus ``blocked_by``
+        and ``milestone`` for each issue the enrichment read; an empty
+        mapping when the forge reports no such issue, or None when the
+        project has no GitHub forge, no client, or the call failed.
     """
     if _implementation(repo) != "github":
         return None
@@ -1391,7 +1439,151 @@ def open_issue_catalog(
             }
     except (ValueError, TypeError, KeyError, AttributeError):
         return None
+    if edges and catalog:
+        wanted = (
+            None
+            if since is None
+            else {n for n, item in catalog.items() if item["state"] == "OPEN"}
+        )
+        for number, found in issue_edges(repo, wanted, limit, timeout).items():
+            if number in catalog:
+                catalog[number].update(found)
     return catalog
+
+
+def _run_quiet(args: list[str], timeout: int) -> str | None:
+    """Runs an optional forge call that never shows as a forge failure.
+
+    A failed call leaves the shared failure record as it was before the call,
+    but only while the record is still the one this call wrote. A record
+    another thread wrote since, or one a later success cleared, is left
+    alone, so an optional read never erases a real failure or revives a
+    cleared one.
+
+    Args:
+        args: The client command line.
+        timeout: Seconds the call may take.
+
+    Returns:
+        The client's output, or None when the call failed.
+    """
+    with _FAILURE_LOCK:
+        saved = (dict(_failure), dict(_recorded))
+    earlier = getattr(_own, "failure", None)
+    output = _run(args, timeout)
+    if output is None:
+        written = getattr(_own, "failure", None)
+        with _FAILURE_LOCK:
+            if written and _failure == written:
+                _failure.clear()
+                _failure.update(saved[0])
+                _recorded.clear()
+                _recorded.update(saved[1])
+        _own.failure = earlier
+    return output
+
+
+def issue_edges(
+    repo: Path,
+    wanted: set[str] | None = None,
+    limit: int = MAX_OPEN_ISSUES,
+    timeout: int = 15,
+) -> dict[str, dict]:
+    """Reads the body references, milestone and relationships of open issues.
+
+    One GraphQL query lists the open issues, most recently updated first,
+    paged by cursor, each with its body, milestone title and the issues the
+    forge records as blocking it. The read stops at `EDGE_PAGES` pages, at
+    ``limit`` issues, when every issue in `wanted` has been seen, or when
+    `timeout` seconds in all have passed. It is best effort and never fails
+    the caller: a forge without the field, a refusal, a timeout or
+    unreadable output keeps what earlier pages gave, and fails quietly
+    through `_run_quiet`, so an optional enrichment never shows as a forge
+    failure or an operator problem.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        wanted: Issue numbers to stop at once all are read, or None to read
+            up to the page cap.
+        limit: Most open issues to read.
+        timeout: Seconds the whole read may take.
+
+    Returns:
+        Issue number to ``blocked_by``, the numbers the body and the forge
+        relationships say it waits on, and ``milestone``, its title or an
+        empty string. An issue not read is absent.
+    """
+    if _implementation(repo) != "github":
+        return {}
+    project = _reachable(repo)
+    if project is None or "/" not in project:
+        return {}
+    owner, name = project.split("/", 1)
+    query = (
+        "query($owner: String!, $name: String!, $count: Int!,"
+        " $after: String) {"
+        " repository(owner: $owner, name: $name) {"
+        " issues(first: $count, states: OPEN, after: $after,"
+        " orderBy: {field: UPDATED_AT, direction: DESC}) {"
+        " pageInfo { hasNextPage endCursor }"
+        " nodes { number body milestone { title }"
+        " blockedBy(first: 20) { nodes { number } } } } } }"
+    )
+    pages = max(1, min(EDGE_PAGES, -(-limit // EDGE_PAGE_SIZE)))
+    deadline = time.monotonic() + timeout
+    found: dict[str, dict] = {}
+    cursor = ""
+    for _ in range(pages):
+        left = deadline - time.monotonic()
+        if left < 1:
+            break
+        output = _run_quiet(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={query}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-F",
+                f"count={EDGE_PAGE_SIZE}",
+                *(["-f", f"after={cursor}"] if cursor else []),
+            ],
+            int(left),
+        )
+        if output is None:
+            break
+        try:
+            page = json.loads(output)["data"]["repository"]["issues"]
+            for node in page["nodes"]:
+                related = {
+                    str(int(other["number"]))
+                    for other in node["blockedBy"]["nodes"]
+                }
+                found[str(int(node["number"]))] = {
+                    "blocked_by": sorted(
+                        {
+                            *critical.references(str(node["body"] or "")),
+                            *related,
+                        },
+                        key=int,
+                    ),
+                    "milestone": str(
+                        (node.get("milestone") or {}).get("title") or ""
+                    ),
+                }
+            cursor = str(page["pageInfo"].get("endCursor") or "")
+            more = bool(page["pageInfo"].get("hasNextPage"))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            break
+        if (wanted is not None and wanted <= found.keys()) or not (
+            more and cursor
+        ):
+            break
+    return found
 
 
 def issue_providers(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, str]:

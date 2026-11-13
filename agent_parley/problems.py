@@ -93,6 +93,7 @@ ORPHANED = "orphaned claims"
 INTEGRATE = "ready to integrate"
 UNOPENED = "ready without a pull request"
 HOLDING = "holding a refused key"
+CONTENTION = "reservation contention"
 FOREIGN = "second session"
 REFUSED = "recovery refused"
 INTEGRATION = "integration unverified"
@@ -1472,6 +1473,54 @@ def _offer_rows(project: dict, now: float) -> list[dict]:
     return rows
 
 
+def _contention_rows(project: dict, now: float) -> list[dict]:
+    """Reports each flagged pair of lanes contending for one key once.
+
+    Reservations are advisory declarations, so the row asks the operator to
+    settle who owns the work. It is not a lock and clears when the operator
+    hands the work off or releases it.
+
+    Args:
+        project: One project block from the status reading.
+        now: Unix time the flag ages are measured against.
+
+    Returns:
+        One row per pair and key, however many lanes carry the record,
+        naming both lanes, the key and the issues each lane holds.
+    """
+    repo = f"--repo {shlex.quote(str(project['root']))}"
+    seen: set[tuple[str, str, str]] = set()
+    rows = []
+    for record in project["participants"]:
+        for item in record.get("contention") or []:
+            first, second = sorted((item["lane"], item["peer"]))
+            if (first, second, item["path"]) in seen:
+                continue
+            seen.add((first, second, item["path"]))
+            claims = {item["lane"]: item["own"], item["peer"]: item["theirs"]}
+            held = [
+                f"{lane} ("
+                + (", ".join(f"#{n}" for n in claims[lane]) or "no issue")
+                + ")"
+                for lane in (first, second)
+            ]
+            rows.append(
+                _row(
+                    CONTENTION,
+                    f"{held[0]} and {held[1]} refused each other "
+                    f"{item['count']} times on {item['path']}",
+                    f"agent-parley issue offer N --to PEER {repo} to hand "
+                    f"the work to one lane, or agent-parley issue release N "
+                    f"{repo} to free it",
+                    max(0, int(now - float(item["since"]))),
+                    "",
+                    project["root"],
+                    BY_OPERATOR,
+                )
+            )
+    return rows
+
+
 def _request_rows(project: dict, now: float) -> list[dict]:
     """Groups the unanswered peer takeover requests, one row per holder.
 
@@ -2633,6 +2682,7 @@ def derive(
         aged.extend(_grouped_gaps(found, repo))
         aged.extend(_offer_rows(project, stamp))
         aged.extend(_request_rows(project, stamp))
+        aged.extend(_contention_rows(project, stamp))
         aged.extend(_bounce_rows(home, directory, data, project, config))
         aged.extend(_retired_rows(home, project))
         aged.extend(_refused_rows(directory, project["root"], stamp))
