@@ -151,9 +151,48 @@ def test_an_unaccepted_suggestion_expires(lane):
         lane["directory"], "codex", "New idea", "Fresh.", now=later
     )
     record = json.loads((lane["directory"] / followups.RECORD_NAME).read_text())
-    assert [entry["title"] for entry in record["suggestions"].values()] == [
-        "New idea"
+    states = {
+        entry["title"]: (entry["state"], entry.get("expired_at"))
+        for entry in record["suggestions"].values()
+    }
+    assert states == {
+        "Old idea": (followups.EXPIRED, later),
+        "New idea": (followups.PENDING, None),
+    }
+
+
+def test_expired_suggestions_are_bounded_and_cannot_be_accepted(
+    bridge, repo, lane, filed, monkeypatch
+):
+    monkeypatch.setattr(followups, "KEPT_EXPIRED", 1)
+    for index, title in enumerate(("First", "Second")):
+        followups.suggest(
+            lane["directory"], "codex", title, "Why.", now=1000.0 + index
+        )
+    followups.suggest(lane["directory"], "codex", "Now", "Why.")
+    record = json.loads((lane["directory"] / followups.RECORD_NAME).read_text())
+    expired = [
+        entry["id"]
+        for entry in record["suggestions"].values()
+        if entry["state"] == followups.EXPIRED
     ]
+    assert len(expired) == 1
+    with pytest.raises(BridgeError, match="No pending suggestion"):
+        bridge.followup_accept(repo, expired[0])
+    assert filed == []
+
+
+def test_another_lane_suggesting_the_same_title_joins_the_record(lane):
+    first = followups.suggest(lane["directory"], "codex", "Cache reads", "A.")
+    again = followups.suggest(lane["directory"], "claude", "cache READS", "B.")
+    twice = followups.suggest(lane["directory"], "claude", "Cache reads", "B.")
+    assert again["id"] == twice["id"] == first["id"]
+    assert again["repeated"] is True
+    assert again["lane"] == "codex"
+    assert twice["lanes"] == ["codex", "claude"]
+    rows = followups.pending(lane["directory"])
+    assert len(rows) == 1
+    assert "also suggested by: claude" in followups.render(rows)
 
 
 def test_a_suggestion_matching_a_claim_or_open_issue_shows_duplicates(
@@ -187,6 +226,34 @@ def test_a_stale_forge_cache_is_not_matched(lane):
         },
     )
     assert followups.duplicates(lane["directory"], "Status forge read") == []
+
+
+@pytest.mark.parametrize("cache", ["stale", "damaged", "missing"])
+def test_an_unchecked_forge_is_reported_not_silent(lane, cache):
+    path = lane["directory"] / FORGE_ISSUES
+    if cache == "stale":
+        write_json(path, {"issues": {"52": "Forge read"}, "read_at": 0})
+    elif cache == "damaged":
+        path.write_text("{not json")
+    result = followups.suggest(
+        lane["directory"], "codex", "Status forge read", "Why."
+    )
+    assert result["forge_checked"] is False
+    assert followups.FORGE_UNCHECKED in result["note"]
+    rows = followups.pending(lane["directory"])
+    assert rows[0]["forge_checked"] is False
+    assert followups.FORGE_UNCHECKED in followups.render(rows)
+
+
+def test_a_fresh_forge_cache_is_reported_checked(lane):
+    write_json(
+        lane["directory"] / FORGE_ISSUES,
+        {"issues": {}, "read_at": time.time()},
+    )
+    result = followups.suggest(lane["directory"], "codex", "Idea", "Why.")
+    assert result["forge_checked"] is True
+    assert result["note"] == followups.NOTE
+    assert followups.pending(lane["directory"])[0]["forge_checked"] is True
 
 
 def test_accept_files_in_the_active_milestone_and_offers_an_idle_lane(
