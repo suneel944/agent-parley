@@ -64,6 +64,14 @@ from agent_parley.status import (
 )
 
 BRANCH_TTL = 5.0
+STAGNATION_TTL = 60.0
+"""Seconds a project's stagnation reading is reused by a live view.
+
+The reading compares two one-hour windows, so it moves little within a
+minute, while it costs a store query per table and a ``git log`` per lane.
+Reading it once a minute instead of on every branch refresh keeps ``top``
+cheap without hiding a stalled project for long.
+"""
 MAX_PROMPT = 120
 COLUMNS = (
     ("PARTICIPANT", 14),
@@ -321,22 +329,29 @@ def _fitness(row: dict) -> str:
     return f"{value}+{row.get('offer_kind', '')}"
 
 
-def _cached(cache: dict, key: object, read: Callable[[], Any]) -> Any:
-    """Runs a Git reading at most once per branch refresh interval.
+def _cached(
+    cache: dict,
+    key: object,
+    read: Callable[[], Any],
+    ttl: float = BRANCH_TTL,
+) -> Any:
+    """Runs a Git reading at most once per refresh interval.
 
     Args:
         cache: Caller-owned mapping of key to its last reading.
         key: What the reading is about, such as a lane or a project root.
         read: Produces a fresh reading.
+        ttl: Seconds a reading is reused; the branch refresh interval
+            unless the reading names a longer one.
 
     Returns:
-        The last reading when it is younger than ``BRANCH_TTL``, otherwise a
-        fresh one. Git subprocesses dominate a frame, so a live view pays for
+        The last reading when it is younger than ``ttl``, otherwise a fresh
+        one. Git subprocesses dominate a frame, so a live view pays for
         them on this interval instead of on every redraw.
     """
     now = time.monotonic()
     cached = cache.get(key)
-    if cached and now - cached[0] < BRANCH_TTL:
+    if cached and now - cached[0] < ttl:
         return cached[1]
     value = read()
     cache[key] = (now, value)
@@ -949,6 +964,7 @@ def collect(
                     functools.partial(
                         _stagnation, home, path.parent, data, ledger
                     ),
+                    STAGNATION_TTL,
                 ),
                 "ready_groups": plan.ready_groups(
                     plan.groups(path.parent),

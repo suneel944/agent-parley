@@ -39,106 +39,204 @@ no progress at all is read as one event, so fewer than ten messages in the
 window never flag. Fixed in code so every project is read the same way.
 """
 TOP_LANES = 3
+PROGRESS_HANDOFFS = frozenset({"offer", "accept", "assign"})
+"""Handoff actions that count as progress.
+
+An offer, an acceptance or an assignment moves work toward a lane. A
+decline, cancellation, refusal or unassignment refuses or undoes a handoff,
+so a lane that only turns work away reads as making no progress.
+"""
 
 
 def _mail(
     db: sqlite3.Connection, root: str, since: float, until: float
-) -> dict[str, int]:
-    """Counts the mail each identity sent in one project inside a window.
+) -> dict[str, list[int]]:
+    """Reads when each identity sent mail in one project inside a span.
 
-    The store records whole seconds, so the end is rounded up: mail sent in
-    the second the window closes is inside it.
+    The stored text stamps are compared directly, so an index on
+    ``created_ts`` can serve the query. The store records whole seconds, so
+    the start is rounded down and the end up: mail sent in the second the
+    span closes is inside it.
+
+    Returns:
+        Sender name to the Unix second of each message it sent.
     """
     rows = db.execute(
-        "SELECT s.name AS sender, COUNT(*) AS sent FROM messages m "
+        "SELECT s.name AS sender, "
+        "CAST(strftime('%s',m.created_ts) AS INTEGER) AS at, "
+        "COUNT(*) AS sent FROM messages m "
         "JOIN agents s ON s.id=m.sender_id "
         "JOIN projects p ON p.id=m.project_id "
         "WHERE p.human_key=? "
-        "AND CAST(strftime('%s',m.created_ts) AS INTEGER) >= ? "
-        "AND CAST(strftime('%s',m.created_ts) AS INTEGER) < ? "
-        "GROUP BY s.name",
+        "AND m.created_ts>=datetime(?,'unixepoch') "
+        "AND m.created_ts<datetime(?,'unixepoch') "
+        "GROUP BY s.name,m.created_ts",
         (root, int(since), math.ceil(until)),
     ).fetchall()
-    return {row["sender"]: row["sent"] for row in rows}
+    stamps: dict[str, list[int]] = {}
+    for row in rows:
+        stamps.setdefault(row["sender"], []).extend([row["at"]] * row["sent"])
+    return stamps
 
 
 def _reservations(
     db: sqlite3.Connection, root: str, since: float, until: float
-) -> dict[str, int]:
-    """Counts the reservations and queued requests each identity made."""
-    counted: dict[str, int] = {}
+) -> dict[str, list[int]]:
+    """Reads when each identity made reservations and queued requests.
+
+    Returns:
+        Holder name to the Unix second of each reservation or request it
+        made inside the span, rounded as `_mail` rounds it.
+    """
+    stamps: dict[str, list[int]] = {}
     for table in ("file_reservations", "reservation_requests"):
         rows = db.execute(
-            f"SELECT a.name AS holder, COUNT(*) AS made FROM {table} r "
+            "SELECT a.name AS holder, "
+            "CAST(strftime('%s',r.created_ts) AS INTEGER) AS at, "
+            f"COUNT(*) AS made FROM {table} r "
             "JOIN agents a ON a.id=r.agent_id "
             "JOIN projects p ON p.id=r.project_id "
             "WHERE p.human_key=? "
-            "AND CAST(strftime('%s',r.created_ts) AS INTEGER) >= ? "
-            "AND CAST(strftime('%s',r.created_ts) AS INTEGER) < ? "
-            "GROUP BY a.name",
+            "AND r.created_ts>=datetime(?,'unixepoch') "
+            "AND r.created_ts<datetime(?,'unixepoch') "
+            "GROUP BY a.name,r.created_ts",
             (root, int(since), math.ceil(until)),
         ).fetchall()
         for row in rows:
-            counted[row["holder"]] = counted.get(row["holder"], 0) + row["made"]
-    return counted
+            stamps.setdefault(row["holder"], []).extend(
+                [row["at"]] * row["made"]
+            )
+    return stamps
 
 
-def _reports(directory: Path, name: str, since: float, until: float) -> int:
-    """Counts the reports one lane filed inside a window."""
+def _reports(
+    directory: Path, name: str, since: float, until: float
+) -> list[float]:
+    """Reads when one lane filed each report inside a span."""
     from agent_parley import metrics
 
-    return sum(
-        1
+    return [
+        at
         for record in metrics.report_records(directory, name, since)
-        if float(record.get("at", 0) or 0) < until
-    )
+        if (at := float(record.get("at", 0) or 0)) < until
+    ]
 
 
-def _handoffs(ledger: dict, since: float, until: float) -> dict[str, int]:
-    """Counts the handoff actions each lane recorded in the issue ledger."""
-    from agent_parley import history
+def _handoffs(
+    ledger: dict, since: float, until: float
+) -> dict[str, list[float]]:
+    """Reads when each lane recorded a progress handoff in the issue ledger.
 
-    counted: dict[str, int] = {}
+    Only the actions in `PROGRESS_HANDOFFS` are read.
+    """
+    stamps: dict[str, list[float]] = {}
     for record in ledger.get("issues", {}).values():
         for entry in record.get("history", []):
-            if entry.get("action") not in history.HANDOFF_ACTIONS:
+            if entry.get("action") not in PROGRESS_HANDOFFS:
                 continue
-            if since <= float(entry.get("at", 0) or 0) < until:
-                actor = str(entry.get("actor", ""))
-                counted[actor] = counted.get(actor, 0) + 1
-    return counted
+            if since <= (at := float(entry.get("at", 0) or 0)) < until:
+                stamps.setdefault(str(entry.get("actor", "")), []).append(at)
+    return stamps
 
 
-def _commits(
-    root: Path, base: str, branch: str, since: float, until: float
-) -> int:
-    """Counts the commits a lane branch adds to the base inside a window.
+def _commits(root: Path, base: str, branch: str) -> list[int]:
+    """Reads the author time of each commit a lane branch adds to the base.
 
-    A branch Git cannot read counts no commits, so a removed branch reads
-    as no progress rather than failing the reading. The window is applied
-    to the commit stamps rather than through ``git log --since``, which
-    reads a small Unix time such as ``@0`` as an approximate date.
+    Author time survives a rebase or an amend, which reset the committer
+    time, so rewritten work is not read as new progress. A branch Git cannot
+    read has no commits, so a removed branch reads as no progress rather
+    than failing the reading. Callers apply their windows to the stamps
+    rather than through ``git log --since``, which reads a small Unix time
+    such as ``@0`` as an approximate date.
     """
     from agent_parley.worktrees import git
 
     if not base or not branch:
-        return 0
+        return []
     try:
         stamps = git(
             root,
             "log",
-            "--format=%ct",
+            "--format=%at",
             branch,
             "--not",
             base,
         )
     except (BridgeError, OSError, subprocess.TimeoutExpired):
-        return 0
-    return sum(
-        1
-        for stamp in stamps.split()
-        if stamp.isdigit() and since <= int(stamp) < until
-    )
+        return []
+    return [int(stamp) for stamp in stamps.split() if stamp.isdigit()]
+
+
+def _events(
+    db: sqlite3.Connection | None,
+    directory: Path,
+    manifest: dict,
+    ledger: dict,
+    span: tuple[float, float],
+) -> dict[str, dict[str, list[float]]]:
+    """Reads each lane's mail and progress stamps once for a whole span.
+
+    Every source is read once, so a reading of two windows costs one query
+    per table and one ``git log`` per lane.
+
+    Returns:
+        Lane name to ``mail``, ``recorded``, the reservation stamps the
+        store keeps in whole seconds, and ``progress``, the exact stamps of
+        its reports, handoffs and commits.
+    """
+    since, until = span
+    root = manifest["root"]
+    mail: dict[str, list[int]] = {}
+    reserved: dict[str, list[int]] = {}
+    if db is not None:
+        try:
+            mail = _mail(db, root, since, until)
+            reserved = _reservations(db, root, since, until)
+        except sqlite3.Error:
+            mail, reserved = {}, {}
+    handed = _handoffs(ledger, since, until)
+    events: dict[str, dict[str, list[float]]] = {}
+    for name in sorted(manifest["participants"]):
+        participant = manifest["participants"][name]
+        identity = str(participant.get("display", name))
+        commits = _commits(
+            Path(root),
+            str(manifest.get("base", "")),
+            str(participant.get("branch", "")),
+        )
+        events[name] = {
+            "mail": list(mail.get(identity, [])),
+            "recorded": list(reserved.get(identity, [])),
+            "progress": [
+                *_reports(directory, name, since, until),
+                *handed.get(name, []),
+                *(stamp for stamp in commits if since <= stamp < until),
+            ],
+        }
+    return events
+
+
+def _bucket(
+    events: dict[str, dict[str, list[float]]], window: tuple[float, float]
+) -> dict[str, dict[str, int]]:
+    """Counts each lane's stamps that fall inside one window.
+
+    Stamps the store keeps in whole seconds count from the second holding
+    the start through the second holding the end, as `_mail` reads them.
+
+    Returns:
+        Lane name to ``mail_sent`` and ``progress`` inside the window.
+    """
+    since, until = window
+    first, last = int(since), math.ceil(until)
+    return {
+        name: {
+            "mail_sent": sum(1 for at in lane["mail"] if first <= at < last),
+            "progress": sum(1 for at in lane["recorded"] if first <= at < last)
+            + sum(1 for at in lane["progress"] if since <= at < until),
+        }
+        for name, lane in events.items()
+    }
 
 
 def counts(
@@ -161,37 +259,10 @@ def counts(
     Returns:
         Lane name to ``mail_sent`` and ``progress``, the commits on its
         branch past the base, reservations and reservation requests,
-        reports and handoff actions it recorded inside the window.
+        reports and the offers, acceptances and assignments it recorded
+        inside the window.
     """
-    since, until = window
-    root = manifest["root"]
-    mail: dict[str, int] = {}
-    reserved: dict[str, int] = {}
-    if db is not None:
-        try:
-            mail = _mail(db, root, since, until)
-            reserved = _reservations(db, root, since, until)
-        except sqlite3.Error:
-            mail, reserved = {}, {}
-    handed = _handoffs(ledger, since, until)
-    measured = {}
-    for name in sorted(manifest["participants"]):
-        participant = manifest["participants"][name]
-        identity = str(participant.get("display", name))
-        measured[name] = {
-            "mail_sent": mail.get(identity, 0),
-            "progress": reserved.get(identity, 0)
-            + _reports(directory, name, since, until)
-            + handed.get(name, 0)
-            + _commits(
-                Path(root),
-                str(manifest.get("base", "")),
-                str(participant.get("branch", "")),
-                since,
-                until,
-            ),
-        }
-    return measured
+    return _bucket(_events(db, directory, manifest, ledger, window), window)
 
 
 def ratio(mail_sent: int, progress: int) -> float:
@@ -216,7 +287,8 @@ def reading(
 ) -> dict:
     """Reads one project's stagnation signal over the last two windows.
 
-    Retired lanes are left out of both windows.
+    Retired lanes are left out of both windows. Each source is read once
+    for both windows and its stamps are split between them.
 
     Args:
         db: Open coordination store connection, or None.
@@ -241,10 +313,9 @@ def reading(
             if not roster.retired(participant)
         },
     }
-    current = counts(db, directory, live, ledger, (ends - WINDOW, ends))
-    earlier = counts(
-        db, directory, live, ledger, (ends - 2 * WINDOW, ends - WINDOW)
-    )
+    events = _events(db, directory, live, ledger, (ends - 2 * WINDOW, ends))
+    current = _bucket(events, (ends - WINDOW, ends))
+    earlier = _bucket(events, (ends - 2 * WINDOW, ends - WINDOW))
     sent = sum(lane["mail_sent"] for lane in current.values())
     progress = sum(lane["progress"] for lane in current.values())
     previous = sum(lane["progress"] for lane in earlier.values())

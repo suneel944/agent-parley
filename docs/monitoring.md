@@ -486,10 +486,14 @@ its lane history.
 Lanes that talk instead of working keep sending mail while their commits stop.
 `status` and `top` compare each project's last hour with the hour before it.
 Mail is the messages each lane sent. Progress is the commits its branch adds
-past the project base, the reservations and reservation requests it made, the
-reports it filed and the handoff actions it recorded. Only recorded events are
-counted; no message or commit text is read. A project with no progress counts
-as one event, so the ratio is never infinite.
+past the project base, timed by author time so a rebase or amend does not
+read as new work; the reservations and reservation requests it made; the
+reports it filed; and the handoffs it offered, accepted or assigned. A
+declined, cancelled, refused or unassigned handoff is not progress. Only
+recorded events are counted; no message or commit text is read. A project with
+no progress counts as one event, so the ratio is never infinite. Each source
+is read once for both hours, and `top` reuses a reading for 60 seconds
+(`dashboard.STAGNATION_TTL`) rather than on every refresh.
 
 When mail per progress event reaches 10 and progress did not rise over the
 earlier hour, `status` prints one line at the top of the project and `top`

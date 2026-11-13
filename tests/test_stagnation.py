@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from agent_parley import cli, metrics, stagnation, store
+from agent_parley import cli, dashboard, metrics, stagnation, store
 from agent_parley.cli import git
 
 NAMES = [f"lane-{index}" for index in range(1, 7)]
@@ -93,6 +93,59 @@ def test_six_talking_lanes_show_one_line_and_one_commit_each_clears_it(
     assert snapshot["projects"][0]["stagnation"]["stagnant"] is False
 
 
+def test_top_shows_the_stagnation_line_under_its_first_summary_line(
+    bridge, repo
+):
+    six_lanes(bridge, repo)
+
+    summary = dashboard._summary(
+        dashboard.collect(bridge.home, False, {}), "0%"
+    )
+
+    lines = stagnation_lines("\n".join(summary))
+    assert len(lines) == 1
+    assert summary[1] == lines[0]
+    assert "12 mail per 0 progress events" in lines[0]
+    assert "lane-1 2/0" in lines[0]
+
+
+def test_mail_sent_before_the_two_windows_is_not_counted(
+    bridge, repo, tmp_path
+):
+    data = six_lanes(bridge, repo)
+    with store.connect(bridge.home, write=True) as db:
+        db.execute(
+            "UPDATE messages SET created_ts=datetime('now','-3 hours') "
+            "WHERE id=(SELECT MIN(id) FROM messages "
+            "WHERE subject='status 0')"
+        )
+
+    with store.connect(bridge.home) as db:
+        signal = stagnation.reading(db, tmp_path, data, {})
+
+    assert signal["mail_sent"] == 11
+    assert signal["progress"] == 0
+
+
+def test_refused_or_undone_handoffs_are_not_progress(tmp_path):
+    actions = ["decline", "cancel", "refuse", "unassign", "offer", "assign"]
+    ledger = {
+        "issues": {
+            "7": {
+                "history": [
+                    {"action": action, "actor": "one", "at": 100.0}
+                    for action in actions
+                ]
+            }
+        }
+    }
+    manifest = {"root": str(tmp_path), "participants": {"one": {}}}
+
+    measured = stagnation.counts(None, tmp_path, manifest, ledger, (0, 200))
+
+    assert measured == {"one": {"mail_sent": 0, "progress": 2}}
+
+
 def test_rising_progress_or_little_mail_never_reads_as_stagnant(
     tmp_path, monkeypatch
 ):
@@ -102,7 +155,7 @@ def test_rising_progress_or_little_mail_never_reads_as_stagnant(
             {"one": {"mail_sent": 0, "progress": 1}},
         ]
     )
-    monkeypatch.setattr(stagnation, "counts", lambda *args: next(windows))
+    monkeypatch.setattr(stagnation, "_bucket", lambda *args: next(windows))
     manifest = {"root": "/p", "participants": {"one": {}}}
     rising = stagnation.reading(None, tmp_path, manifest, {}, now=10_000)
     assert rising["ratio"] == 15
@@ -132,7 +185,7 @@ def test_falling_progress_names_the_lanes_with_the_most_mail_per_event(
             {"a": {"mail_sent": 3, "progress": 2}},
         ]
     )
-    monkeypatch.setattr(stagnation, "counts", lambda *args: next(windows))
+    monkeypatch.setattr(stagnation, "_bucket", lambda *args: next(windows))
     manifest = {"root": "/p", "participants": {"a": {}, "b": {}, "c": {}}}
     signal = stagnation.reading(None, tmp_path, manifest, {}, now=10_000)
     assert signal["stagnant"]
