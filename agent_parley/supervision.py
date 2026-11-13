@@ -7450,6 +7450,7 @@ def refresh_forge_issues(
             FORGE_PAGE,
             FORGE_TIMEOUT,
             since=float(cached.get("read_at") or 0) - FORGE_OVERLAP,
+            edges=True,
         )
         full = delta is not None and len(delta) >= FORGE_PAGE
         if delta is not None and not full:
@@ -7460,13 +7461,22 @@ def refresh_forge_issues(
                     if number not in delta
                 },
                 **{
-                    number: item
+                    number: {
+                        **{
+                            key: value
+                            for key, value in (kept.get(number) or {}).items()
+                            if key in ("blocked_by", "milestone")
+                        },
+                        **item,
+                    }
                     for number, item in delta.items()
                     if item.get("state") == "OPEN"
                 },
             }
     if full:
-        catalog = forge.open_issue_catalog(root, FORGE_LIMIT, FORGE_TIMEOUT)
+        catalog = forge.open_issue_catalog(
+            root, FORGE_LIMIT, FORGE_TIMEOUT, edges=True
+        )
         complete_at = now
     if catalog is None:
         failure = forge.last_failure(own=True) or {}
@@ -7518,6 +7528,11 @@ def refresh_forge_issues(
                         if item.get("updated_at")
                         else {}
                     ),
+                    **{
+                        key: item[key]
+                        for key in ("blocked_by", "milestone")
+                        if key in item
+                    },
                 }
                 for number, item in catalog.items()
                 if isinstance(item, dict)

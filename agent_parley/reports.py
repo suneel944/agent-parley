@@ -137,6 +137,12 @@ class ReportsMixin(BridgeCore):
         reviewer and the integration gate never see. Untracked files are not
         considered, because lanes keep scratch state and build output there.
 
+        A ready report on a claim whose issue stated acceptance criteria must
+        carry one evidence line per criterion, written ``N: <evidence>``
+        (`criteria.matched`); a report missing one is refused, naming each
+        missing criterion, before any attachment is stored. The matched lines
+        are recorded on the claim's execution as ``criteria_evidence``.
+
         Args:
             repo: Assigned agent worktree.
             outcome: Partial, blocked, ready-for-review, or waiting state.
@@ -167,6 +173,7 @@ class ReportsMixin(BridgeCore):
             BridgeError: If the lane or required report fields are invalid, or
                 if the key already names a report with other content.
         """
+        from agent_parley import criteria as acceptance
         from agent_parley.cli import (
             attachments,
             change_attempt,
@@ -244,6 +251,14 @@ class ReportsMixin(BridgeCore):
                 + ". Commit or revert them first, so the evidence describes "
                 "the recorded commit."
             )
+        stated = (
+            issues.snapshot(directory)["issues"]
+            .get(str(claim["issue"]), {})
+            .get("criteria")
+            if outcome == "ready" and claim["issue"] is not None
+            else None
+        )
+        proven = acceptance.matched(stated, evidence) if stated else None
         ceiling = (data.get("deadlines") or {}).get(
             "wait", supervision.DEFAULT_WAIT_CEILING
         )
@@ -283,6 +298,7 @@ class ReportsMixin(BridgeCore):
                     claim["claim_id"] or "",
                     resume_on,
                     backlog,
+                    proven,
                 )
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
