@@ -3338,6 +3338,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "metrics",
             "history",
             "events",
+            "audit",
             "problems",
             "doctor",
             "notify",
@@ -4469,6 +4470,74 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     "otherwise."
                 ),
             )
+    audited = commands.add_parser(
+        "audit",
+        help="Export or verify a hash-chained, signable audit bundle.",
+    )
+    audits = audited.add_subparsers(dest="action", required=True)
+    exported = audits.add_parser(
+        "export",
+        help=(
+            "Write one JSON bundle of the lanes, resolved issues, claims, "
+            "handoffs, ready reports, review rounds, pull requests and "
+            "commits inside a window."
+        ),
+    )
+    exported.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    exported.add_argument(
+        "--since",
+        required=True,
+        metavar="REF",
+        help=(
+            "Window start: an instant such as 2026-10-15T09:01:00Z, a "
+            "window such as 7d, or a commit such as a tag, standing for "
+            "its committer time."
+        ),
+    )
+    exported.add_argument(
+        "--until",
+        metavar="REF",
+        help="Window end, in the same forms as --since; now by default.",
+    )
+    exported.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="FILE",
+        help="The bundle file to write.",
+    )
+    exported.add_argument(
+        "--sign",
+        type=Path,
+        metavar="KEY",
+        help=(
+            "Sign the bundle with this SSH key through ssh-keygen -Y sign; "
+            "unsigned by default."
+        ),
+    )
+    checked = audits.add_parser(
+        "verify",
+        help=(
+            "Check a bundle's hash chain and, when present, its SSH signature."
+        ),
+    )
+    checked.add_argument("bundle", type=Path, help="The bundle file.")
+    checked.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="Fail when the bundle carries no signature.",
+    )
+    checked.add_argument(
+        "--signer",
+        type=Path,
+        metavar="PUBKEY_FILE",
+        help=(
+            "Require a signature by this SSH public key; another key's "
+            "signature fails."
+        ),
+    )
     archived = commands.add_parser(
         "state",
         help="Export, inspect or import the coordination state as one archive.",
@@ -6485,6 +6554,71 @@ def root_parser(
     return parser, commands
 
 
+def _audit(bridge: Bridge, args: argparse.Namespace) -> str:
+    """Exports or verifies an audit bundle and words the outcome.
+
+    A reference is read first as an instant or a window, as every other
+    `--since` reads it, and otherwise as a commit of the project, which
+    stands for its committer time.
+
+    Args:
+        bridge: Command object holding the state root.
+        args: Parsed `audit` command line.
+
+    Returns:
+        One account of what was written or checked.
+
+    Raises:
+        BridgeError: If a reference names nothing, signing fails, or the
+            bundle fails verification.
+    """
+    from agent_parley import audit
+
+    if args.action == "verify":
+        checked = audit.verify(
+            args.bundle,
+            require_signature=args.require_signature,
+            signer=args.signer,
+        )
+        signed = (
+            f" {checked['signer']}"
+            if checked["signed"]
+            else " No signature; the chain alone does not show who exported it."
+        )
+        return (
+            f"Chain intact: {checked['records']} records, head "
+            f"{checked['head']}.{signed}"
+        )
+    root, directory = bridge.project(args.repo.resolve(), create=False)
+    bounds = []
+    for ref in (args.since, args.until):
+        if ref is None:
+            bounds.append(("now", time.time()))
+            continue
+        try:
+            bounds.append((ref, instant(ref)))
+        except ValueError:
+            bounds.append((ref, audit.commit_time(root, ref)))
+    bundle = audit.export(
+        bridge.home,
+        directory,
+        roster.read(directory),
+        args.output,
+        since=bounds[0],
+        until=bounds[1],
+        key=args.sign,
+    )
+    tally = ", ".join(
+        f"{count} {kind}" for kind, count in audit.counts(bundle).items()
+    )
+    return (
+        f"Exported {len(bundle['records'])} records ({tally or 'none'}) "
+        f"to {args.output}, "
+        + ("signed" if "signature" in bundle else "unsigned")
+        + "; credentials, tokens and transcripts excluded."
+    )
+
+
 def _plain_status() -> int:
     """Runs the bare status command without building its parser.
 
@@ -6806,6 +6940,8 @@ def main() -> int:
                 message,
                 file=sys.stdout if output else sys.stderr,
             )
+        elif args.command == "audit":
+            print(_audit(bridge, args))
         elif args.command == "state" and args.action == "show" and args.json:
             print(
                 views.render(

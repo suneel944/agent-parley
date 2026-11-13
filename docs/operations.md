@@ -1826,6 +1826,56 @@ never handed out twice. A history window cannot reach past rows that
 retention removed. Freed pages stay in `bridge.sqlite3` for reuse rather
 than shrinking the file.
 
+### Audit bundle
+
+`agent-parley audit export` writes one JSON file a third party can check:
+
+```sh
+agent-parley audit export --since v0.22.0 --until v0.23.0 --output audit.json
+agent-parley audit export --since 7d --output audit.json --sign ~/.ssh/id_ed25519
+agent-parley audit verify audit.json --require-signature
+```
+
+The bundle covers the lanes with their provider and model, the issues resolved
+in the window, claims and handoffs, ready reports with their evidence, review
+rounds with their findings count, the pull requests supervision saw open in the
+window, and each lane's commits beyond the base. A `REF` is read first as an
+instant or a window, as every other `--since` reads it, and otherwise as a
+commit of the project, which stands for its committer time; `--until` defaults
+to now. Records are read through the modules that keep them; the store is
+opened read-only and the only file written is the one `--output` names.
+
+Each record carries the SHA-256 of its canonical JSON (sorted keys, no
+insignificant whitespace, non-ASCII text escaped) with the hash of the record
+before it, so `audit verify` names the first record that was changed, removed
+or reordered and exits with status 1. Credentials, tokens and transcripts never
+enter the bundle: lanes are copied field by field, and any key named like a
+token, secret, password, credential or prompt is dropped unless it holds a
+number such as a token count. A key whose last underscore-separated part is
+`key`, such as `key`, `api_key`, `ssh_key` or `signing_key`, is dropped too,
+while `monkey` or `keyboard` stay. Text claiming assistant authorship is
+withheld.
+
+The bundle can hold only what coordination still keeps. Each issue keeps its
+newest 50 history entries, closed pull requests are kept for 30 days, and each
+lane's report log keeps its newest 2000 records that fit under 262144 bytes;
+past that size it is trimmed to half of it, so long reports leave far fewer
+than 2000. The bundle's `horizons` field names each cap with its limit and
+unit, plus the byte bound for the report log, and marks it `exceeded` when
+records older than the oldest one kept may have fallen inside the window, so
+the bundle can be missing records there.
+
+The chain proves the bundle is consistent, not who wrote it. `--sign KEY` signs
+the bundle with an existing SSH key through `ssh-keygen -Y sign` under the
+`agent-parley-audit` namespace and embeds the signature. `audit verify` checks
+it with `ssh-keygen -Y check-novalidate`, which needs no allowed-signers file,
+and prints the signing key's fingerprint; compare it with `ssh-keygen -l -f
+KEY.pub` of the key you expect. `--signer PUBKEY_FILE` makes that comparison
+for you: the signature is checked with `ssh-keygen -Y verify` against an
+allowed-signers file trusting only that public key, and a signature by any
+other key, or no signature, fails. A bundle without a signature verifies on
+its chain alone unless `--require-signature` or `--signer` is given.
+
 ### Following one lane
 
 `agent-parley watch NAME` sits on one participant and prints its coordination
