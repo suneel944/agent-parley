@@ -1848,7 +1848,7 @@ class StatusMixin(BridgeCore):
             dashboard does; one whose root is missing or whose lanes all
             stopped over `DORMANT_SECONDS` ago reads as dormant.
         """
-        from agent_parley import collisions, decisions, pool
+        from agent_parley import collisions, decisions, pool, stagnation
         from agent_parley.cli import (
             inbound_status,
             issues,
@@ -1954,6 +1954,9 @@ class StatusMixin(BridgeCore):
                         "supervision_poll": supervision.last_poll(path.parent),
                         "fold_after": context["configuration"]["fold_after"],
                         "pull_request_outcomes": outcomes,
+                        "stagnation": stagnation.reading(
+                            db, path.parent, data, context["ledger"]
+                        ),
                         **self._integration(path.parent, data, context),
                     }
                 )
@@ -2180,11 +2183,13 @@ class StatusMixin(BridgeCore):
             every_claim: Also list claims whose work ended on the forge and
                 lanes folded out as long dead.
         """
-        from agent_parley import metrics, supervision
+        from agent_parley import metrics, stagnation, supervision
         from agent_parley.cli import supervision_failure, tables
 
         dormancy = " (dormant)" if project["dormant"] else ""
         print(f"\nProject: {project['root']}{dormancy}")
+        if stalled := stagnation.line(project.get("stagnation") or {}):
+            print(stalled)
         if failing := project.get("supervision_error"):
             print(supervision_failure(failing))
         known = self.forge_issues(Path(project["directory"]), project["root"])
@@ -2299,7 +2304,7 @@ class StatusMixin(BridgeCore):
             The number of lanes reported, so a caller can gate on a filter
             having matched at least one lane.
         """
-        from agent_parley import collisions, pool
+        from agent_parley import collisions, pool, stagnation
         from agent_parley.cli import (
             Selection,
             describe,
@@ -2339,6 +2344,8 @@ class StatusMixin(BridgeCore):
             if selection.filtered() and not reported:
                 continue
             print(f"\nProject: {data['root']}")
+            if stalled := stagnation.line(project.get("stagnation") or {}):
+                print(stalled)
             if failing := project.get("supervision_error"):
                 print(supervision_failure(failing))
             polled = project.get("supervision_poll") or {}
