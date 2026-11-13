@@ -34,6 +34,7 @@ from agent_parley import (
     lanes,
     lifecycle,
     notify,
+    polling,
     process,
     protocol,
     quota,
@@ -1029,7 +1030,9 @@ def stall(
         the interval is not stalled, and the idle age an operator view prints
         is that silence rather than the waiting item's age. A lane whose
         recorded session process is not alive is never reported as stalled:
-        it is stopped, which the session state already says.
+        it is stopped, which the session state already says. Under
+        `polling` is the lane's open polling episode from `polling.marker`,
+        empty when it is not polling.
     """
     from agent_parley import checkpoints
 
@@ -1041,6 +1044,7 @@ def stall(
         "age_seconds": 0,
         "served_age_seconds": None,
         "silent_seconds": None,
+        "polling": polling.marker(directory, name),
     }
     state = checkpoints.activity(directory, name)
     if not process.alive(state.get("session_pid"), state.get("session_ticks")):
@@ -1109,9 +1113,13 @@ def silence(
 
 
 def stall_marker(idle: dict) -> str:
-    """Describes a stall in one line, naming the oldest waiting item."""
+    """Describes a stall in one line, naming the oldest waiting item.
+
+    A lane that is not stalled but polls without progress is described by
+    its polling marker instead, so ``status`` and ``top`` mark it polling.
+    """
     if not idle["stalled"]:
-        return ""
+        return str(idle.get("polling") or "")
     item = (
         f"message {idle['message_id']} from {idle['sender']}"
         if idle["kind"] == "unread"
@@ -9384,7 +9392,16 @@ def _poll(home: Path, directory: Path) -> None:
     )
     stage("lane accounting", account_lanes, home, directory, manifest)
     stage("run budget", budgets.account, home, directory, manifest)
-    stage("quota", quota.account, home, directory, manifest, published_capacity)
+    polled = stage("polling", polling.observe, home, directory, manifest)
+    stage(
+        "quota",
+        quota.account,
+        home,
+        directory,
+        manifest,
+        published_capacity,
+        polled if isinstance(polled, dict) else None,
+    )
     recorded = stage(
         "recorded presence",
         recorded_observations,

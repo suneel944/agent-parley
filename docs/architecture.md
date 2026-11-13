@@ -68,6 +68,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `evidence` | Review evidence built from a claim window's retained coordination records |
 | `budgets` | A lane's consumption against its advisory budget, from recorded tokens, served calls and session hours; crossing a limit marks and notifies, never stops. Also the opt-in run budget: a durable per-project ledger, `run-budget.json`, of the same readings summed across lanes, restarts and retries. `supervision` admits every wake, work dispatch and capacity retry through it, `launch` refuses to launch or resume a lane while it is exhausted, and a `Stop` hook continuation (`checkpoints.continuation_refused`) is admitted through it like any other dispatch; exhaustion is recorded once and cleared only by the operator's `budget resume` |
 | `quota` | Per-credential quota parking for lanes that share one explicit credential profile on one adapter. A vendor rate-limit refusal that named a reset on any of them parks every lane on that credential until the reset; an optional window the operator records with `quota set` sums the lanes' native token counts and, past its threshold, parks every lane but the one holding the most unfinished claims, and all of them at the limit. Each poll rewrites `quota-ledger.json`; `supervision` defers wakes and fails the capacity fit check of a parked lane, and `checkpoints.continuation_refused` refuses its `Stop` hook continuation. Parking never moves a lane to another provider or credential and never touches its claims or reservations, and a park whose time passed reads as cleared. `headroom` derives remaining headroom per credential from the ledger, marked estimated when it comes from native counts rather than a vendor refusal |
+| `polling` | Flags a lane whose coordination reads, counted in the store's `events` table, reach `THRESHOLD` in `WINDOW` seconds with no claim, reservation, commit, report or handoff; marks it polling through `supervision.stall_marker`, sends it one notice, and if it goes on parks it through `quota.account`'s `parked` map until progress or an operator message. `wait_for_message` never counts |
 | `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `timeouts` | The table of decision kinds with their reversibility and recommended default, every one of which waits for the operator, the decision deadline other modules measure against, and the project policy that can only make a kind more cautious |
 | `history` | Read-only ownership history across the ledger, reports and store |
@@ -1054,6 +1055,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
 | `quota` | `quota-ledger.json` under `quota.lock` |
+| `polling` | `polling.json` under `polling.lock` |
 | `convergence` | `convergence.json` under `convergence.lock` |
 | `claims` | `forge-assigned.json` under `forge-assigned.json.lock` |
 | `status` | `forge-issues.json` (forge issue cache) |

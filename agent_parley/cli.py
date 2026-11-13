@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         metrics,
         notify,
         plan,
+        polling,
         problems,
         process,
         protocol,
@@ -161,6 +162,7 @@ DEFERRED_MODULES = (
     "notify",
     "opencode",
     "plan",
+    "polling",
     "problems",
     "process",
     "protocol",
@@ -1028,7 +1030,7 @@ def lane_detail(record: dict, data: dict) -> None:
         )
     if timing := launch_line(data["participants"][agent].get("launch")):
         print(f"    {timing}")
-    if record["idle"]["stalled"]:
+    if record["idle"]["marker"]:
         print(f"    {record['idle']['marker']}")
     if record["budget"]["marker"]:
         print(f"    {record['budget']['marker']}")
@@ -6397,6 +6399,7 @@ def _plain_status() -> int:
     )
     try:
         bridge = Bridge(home)
+        polling.record(home, "cli:status")
         bridge.board(
             Selection(project=bridge.project_at(Path.cwd())), terminal_width()
         )
@@ -6889,6 +6892,7 @@ def main() -> int:
         ):
             return assigned_selection(bridge, args.repo.resolve(), args)
         elif args.command == "issue" and args.action == "next":
+            polling.record(bridge.home, "cli:issue-next")
             ranked = bridge.issue_next(args.repo.resolve(), args.limit)
             print(
                 views.render("issue_next", ranked)
@@ -7188,6 +7192,7 @@ def main() -> int:
                     else plan.render_diff(applied)
                 )
         elif args.command == "mail":
+            polling.record(bridge.home, "cli:mail")
             page = bridge.mail(
                 args.repo.resolve(),
                 args.action,
@@ -7790,6 +7795,7 @@ def main() -> int:
                 else json.dumps(registered, indent=2)
             )
         else:
+            polling.record(bridge.home, "cli:status")
             selection = selected_status(args)
             workspace = getattr(args, "workspace", "")
             if workspace:
