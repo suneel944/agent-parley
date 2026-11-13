@@ -916,12 +916,13 @@ def change(
 
 
 def _clear_recovery(record: dict) -> dict:
-    """Removes the previous generation's take and orphan marker.
+    """Removes the previous generation's take and orphan markers.
 
-    Both describe one ownership generation. Left on the record past a change
+    Each describes one ownership generation. Left on the record past a change
     of owner, a take makes the next claim restore a dead owner's checkpoint
-    over work handed on since, and an orphan marker hides the new owner's
-    continue offers and names an owner that no longer holds the issue.
+    over work handed on since, an orphan marker hides the new owner's
+    continue offers and names an owner that no longer holds the issue, and a
+    released orphan marker keeps a checkpoint the new owner did not take.
 
     Args:
         record: Mutable issue record whose ownership is changing.
@@ -931,7 +932,7 @@ def _clear_recovery(record: dict) -> dict:
     """
     return {
         field: record.pop(field)
-        for field in ("taken", "orphan")
+        for field in ("taken", "orphan", "released_orphan")
         if record.get(field)
     }
 
@@ -1009,6 +1010,47 @@ def _taken(
         "claim_id": record["claim_id"],
         "orphan_id": orphan.get("id", ""),
         "fence": fence["id"],
+    }
+
+
+def _released_take(directory: Path, issue: str, record: dict | None) -> dict:
+    """Returns a take of the checkpoint a released orphaned claim left.
+
+    A dead owner's claim released before anyone took it keeps its last
+    checkpoint, so the next claimant of the issue resumes that work rather
+    than starting from nothing. The owner is already gone and its claim
+    retired, so no fence is written: nothing remains to stop.
+
+    Args:
+        directory: Private state directory for the common repository.
+        issue: Repository issue number being claimed.
+        record: Published record for the issue, if any.
+
+    Returns:
+        A take naming the released owner and its checkpoint, or an empty
+        mapping when the issue has an owner, an offer pending, no released
+        orphan, or no durable checkpoint for that claim.
+    """
+    record = record or {}
+    released = record.get("released_orphan") or {}
+    if not released or record["owner"] or record.get("offer"):
+        return {}
+    from agent_parley import recovery
+
+    claim_id = str(released.get("claim_id") or "")
+    try:
+        saved = recovery.checkpoint(directory, issue, claim_id)
+    except BridgeError:
+        return {}
+    return {
+        "from": released.get("owner", ""),
+        "reason": released.get("reason", ""),
+        "at": time.time(),
+        "reservations": [],
+        "checkpoint": saved,
+        "claim_id": claim_id,
+        "orphan_id": released.get("id", ""),
+        "fence": "",
     }
 
 
@@ -1490,6 +1532,8 @@ def _change(
                             else f"agent-parley issue request {issue}"
                         ),
                     )
+            elif taken := _released_take(directory, issue, record):
+                logged = "take"
             elif take_orphaned:
                 raise BridgeError(
                     f"Issue #{issue} has no orphaned owner to take it from; "
@@ -1676,10 +1720,17 @@ def _change(
                     inherited = record.pop("handoff", None) or {}
                     attachments.remove(directory, inherited.get("diff", ""))
                     lifecycle.drop_offer(directory, record)
+                    orphan = record.get("orphan") or {}
+                    dead = orphan.get("owner") == record["owner"]
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )
                     cleared = _clear_recovery(record)
+                    if dead:
+                        record["released_orphan"] = {
+                            **orphan,
+                            "claim_id": retired,
+                        }
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
                     known = state["issues"].get(blocker)
