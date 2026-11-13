@@ -520,9 +520,16 @@ def _row(
         "alive": process.alive(
             state.get("session_pid"), state.get("session_ticks")
         ),
-        "provider": (
-            f"{participant['provider']}/"
-            f"{participant['credential'] or 'default'}"
+        "provider": " ".join(
+            filter(
+                None,
+                (
+                    f"{participant['provider']}/"
+                    f"{participant['credential'] or 'default'}",
+                    participant.get("model"),
+                    participant.get("effort"),
+                ),
+            )
         ),
         "credential": participant["credential"],
         "state": tables.session(

@@ -1583,6 +1583,8 @@ class StatusMixin(BridgeCore):
                 self.home, directory, agent, participant["provider"]
             ),
             "credential": participant["credential"],
+            "model": participant.get("model", ""),
+            "effort": participant.get("effort", ""),
             "session": liveness,
             "condition": lanes.view(condition),
             "provenance": provenance,
