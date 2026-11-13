@@ -108,6 +108,69 @@ def test_a_new_file_in_both_plans_flags_the_pair(tmp_path):
     assert collisions.shared(pairs[0]) == "new file agent_parley/new.py"
 
 
+def test_prose_versions_bare_names_and_unreadable_paths_are_not_files(
+    tmp_path, monkeypatch
+):
+    long = "d/" + "x" * 300 + ".py"
+    exists = Path.exists
+
+    def refusing(path, *args, **kwargs):
+        if path.name.startswith("xxx"):
+            raise OSError(36, "File name too long")
+        return exists(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", refusing)
+    plan = {
+        "items": [
+            {
+                "text": (
+                    "ship 0.23.0, e.g. status.py, i.e. tidy; see "
+                    f"docs/v0.23 and {long}"
+                ),
+                "status": "",
+            }
+        ]
+    }
+    assert collisions.plan_files(tmp_path, plan) == set()
+
+
+def test_a_child_lane_is_never_paired_with_its_parent():
+    paths = ["a.py", "b.py", "c.py"]
+    child = {**lane("feature/x", paths), "parent": "lead"}
+    assert not collisions.find({"lead": lane("feature/x", paths), "kid": child})
+    assert collisions.find({"peer": lane("feature/x", paths), "kid": child})
+
+
+def test_a_shifting_path_set_is_told_once_and_a_failed_send_retries_alone(
+    tmp_path, monkeypatch
+):
+    manifest = {
+        "root": "/project",
+        "participants": {"one": {"lane": "/one"}, "two": {"lane": "/two"}},
+    }
+    pair = {"lanes": ["one", "two"], "kind": "paths", "count": 3}
+    readings = iter([{**pair, "item": "a.py"}, {**pair, "item": "b.py"}] * 2)
+    monkeypatch.setattr(
+        collisions, "read", lambda *args, **kwargs: [next(readings)]
+    )
+    sent = []
+    failing = {"two"}
+
+    def speak(home, root, name, subject, body, key):
+        if name in failing:
+            failing.discard(name)
+            raise store.BridgeError("store busy")
+        sent.append((name, key))
+
+    monkeypatch.setattr(store, "speak", speak)
+    for _ in range(4):
+        collisions.supervise(tmp_path, tmp_path, manifest)
+    assert [name for name, _ in sent] == ["one", "two"]
+    assert sent[0][1].split(":")[1] == sent[1][1].split(":")[1]
+    kept = json.loads((tmp_path / collisions.PUBLICATION).read_text())
+    assert kept["one|two|paths"]["told"] == ["one", "two"]
+
+
 def test_two_lanes_on_one_branch_show_one_line_and_clear_on_rename(
     bridge, repo, paired, capsys
 ):

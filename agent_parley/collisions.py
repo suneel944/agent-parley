@@ -40,9 +40,16 @@ the same flag; a knob would let one project hide a duplicate another sees.
 PUBLICATION = "collisions.json"
 MAX_ITEM = 120
 PLAN_PATH = re.compile(
-    r"(?<![\w./-])(?:[\w-]+/)*[\w-]+\.[A-Za-z0-9]{1,8}(?![\w/-])"
+    r"(?<![\w./-])(?:[\w.-]+/)+[\w-][\w.-]*\.[A-Za-z]{1,8}(?![\w/-])"
 )
-"""A repository path such as ``agent_parley/collisions.py`` in plan text."""
+"""A repository path such as ``agent_parley/collisions.py`` in plan text.
+
+A directory part and a letters-only extension are required, so prose such
+as ``e.g``, a version such as ``0.23.0`` and a bare module name are not read
+as a file the lane means to create.
+"""
+ENDED = frozenset({lanes.STOPPED, lanes.DEAD, lanes.RECLAIMED})
+"""Lane states whose session is not running, so its lane is not compared."""
 
 
 def usable_branch(branch: str) -> bool:
@@ -67,15 +74,21 @@ def plan_files(root: Path, plan: dict | None) -> set[str]:
 
     Returns:
         Paths named in unfinished plan items that do not exist in the base
-        checkout, so only a file the lane means to create is compared.
+        checkout, so only a file the lane means to create is compared. A
+        name the file system cannot check, such as one too long, is left
+        out.
     """
     found: set[str] = set()
     for item in (plan or {}).get("items", []):
         if item.get("status") == "completed":
             continue
         for path in PLAN_PATH.findall(str(item.get("text", ""))):
-            if not (root / path).exists():
-                found.add(path)
+            try:
+                if (root / path).exists():
+                    continue
+            except OSError:
+                continue
+            found.add(path)
     return found
 
 
@@ -84,19 +97,24 @@ def find(readings: dict[str, dict]) -> list[dict]:
 
     Args:
         readings: Lane name to ``branch``, ``paths``, the reservation keys
-            it holds, and ``files``, the new files its plan names.
+            it holds, ``files``, the new files its plan names, and
+            optionally ``parent``, the lane that started it.
 
     Returns:
         One entry per converging pair, ordered by lane names, with
         ``lanes``, the two names in order, ``kind``, one of ``branch``,
         ``file`` or ``paths``, ``item``, the shared item, and ``count``,
-        how many items the pair shares of that kind.
+        how many items the pair shares of that kind. A child lane and its
+        parent are never paired: the child works inside the parent's scope
+        by design.
     """
     names = sorted(readings)
     pairs = []
     for index, first in enumerate(names):
         for second in names[index + 1 :]:
             one, two = readings[first], readings[second]
+            if second == one.get("parent") or first == two.get("parent"):
+                continue
             shared_paths = set(one["paths"]) & set(two["paths"])
             smaller = min(len(set(one["paths"])), len(set(two["paths"])))
             files = sorted(set(one["files"]) & set(two["files"]))
@@ -140,20 +158,31 @@ def read(
         db: A status frame's open read transaction, or None to open one.
 
     Returns:
-        The pairs `find` returns. A store that cannot be read compares
-        branches and plans only.
+        The pairs `find` returns among lanes that are neither retired nor
+        stopped, dead or reclaimed. A store that cannot be read compares
+        branches and plans only, of every lane not retired.
     """
     from agent_parley import store
     from agent_parley.checkpoints import lane_branch
 
+    held: dict[str, list[str]] = {}
+    ended: set[str] = set()
     try:
-        held = store.active_reservations(home, manifest["root"], db=db)
+        if db is not None or store.present(home):
+            with store.reading(home, db) as reader:
+                held = store.active_reservations(
+                    home, manifest["root"], db=reader
+                )
+                for name in manifest["participants"]:
+                    record = lanes.read(reader, manifest["root"], name)
+                    if record and record["state"] in ENDED:
+                        ended.add(name)
     except (BridgeError, OSError, sqlite3.Error):
-        held = {}
+        held, ended = {}, set()
     root = Path(manifest["root"])
     readings = {}
     for name, participant in manifest["participants"].items():
-        if roster.retired(participant):
+        if roster.retired(participant) or name in ended:
             continue
         branch = (branches or {}).get(name)
         if branch is None:
@@ -162,6 +191,7 @@ def read(
             "branch": branch,
             "paths": held.get(participant.get("display", name), []),
             "files": plan_files(root, lanes.lane_task_plan(directory, name)),
+            "parent": participant.get("parent"),
         }
     return find(readings)
 
@@ -223,13 +253,15 @@ def peers(pairs: list[dict], lane: str) -> list[str]:
 def supervise(home: Path, directory: Path, manifest: dict) -> None:
     """Tells each lane of a newly converging pair once.
 
-    The pairs flagged now are kept in the project's `PUBLICATION` with the
-    time each was first seen. A pair already kept is not told again while
-    the shared item is unchanged; a pair that cleared is dropped, so the
-    same pair converging again later is told again. Each message carries
-    an idempotency key naming the pair, the item and the time first seen,
-    so a retried pass cannot send it twice. A send that fails leaves the
-    pair unkept and the next pass tries again.
+    The pairs flagged now are kept in the project's `PUBLICATION` under the
+    two lane names and the kind they share, with the time each was first
+    seen and the lanes already told. The shared item itself is not part of
+    the key, so a reserved path set that shifts while it still overlaps is
+    not told again. A pair that cleared is dropped, so the same pair
+    converging again later is told again under a new first-seen time. Each
+    message carries an idempotency key derived from the pair key and that
+    first-seen time, so a retried pass cannot send it twice. A send that
+    fails leaves only that lane untold, and the next pass retries it alone.
 
     Args:
         home: Private bridge state root.
@@ -248,14 +280,16 @@ def supervise(home: Path, directory: Path, manifest: dict) -> None:
         kept = {}
     current = {}
     for pair in pairs:
-        key = "|".join([*pair["lanes"], pair["kind"], pair["item"]])
-        if key in kept:
-            current[key] = kept[key]
-            continue
-        seen = time.time()
+        key = "|".join([*pair["lanes"], pair["kind"]])
+        entry = kept.get(key)
+        if not isinstance(entry, dict):
+            entry = {"seen": time.time(), "told": []}
+        told = [lane for lane in entry.get("told", []) if lane in pair["lanes"]]
+        seen = entry.get("seen", time.time())
         digest = hashlib.sha256(f"{key}|{seen}".encode()).hexdigest()[:16]
-        told = True
         for lane in pair["lanes"]:
+            if lane in told:
+                continue
             other = next(name for name in pair["lanes"] if name != lane)
             participant = manifest["participants"][lane]
             try:
@@ -272,9 +306,9 @@ def supervise(home: Path, directory: Path, manifest: dict) -> None:
                     f"converging:{digest}:{lane}",
                 )
             except (BridgeError, OSError, sqlite3.Error):
-                told = False
-        if told:
-            current[key] = seen
+                continue
+            told.append(lane)
+        current[key] = {"seen": seen, "told": told}
     if current != kept:
         with contextlib.suppress(OSError):
             write_json(path, current)
