@@ -218,6 +218,71 @@ def test_scrub_drops_secret_fields_and_withholds_attribution():
     }
 
 
+def test_scrub_drops_key_only_as_a_whole_name_part():
+    cleaned = audit.scrub(
+        {
+            "key": "k",
+            "ssh_key": "k",
+            "signing_key": "k",
+            "api_key": "k",
+            "apikey": "k",
+            "private_keys": "k",
+            "monkey": "kept",
+            "keyboard": "kept",
+            "turnkey": "kept",
+            "key_count": "kept",
+            "keys": 4,
+        }
+    )
+    assert cleaned == {
+        "monkey": "kept",
+        "keyboard": "kept",
+        "turnkey": "kept",
+        "key_count": "kept",
+        "keys": 4,
+    }
+
+
+def test_a_lone_surrogate_exports_and_verifies(tmp_path):
+    records = audit.chain([("report", {"summary": "half \ud800 pair"})])
+    path = tmp_path / "audit.json"
+    path.write_text(
+        json.dumps(
+            {
+                "kind": audit.KIND,
+                "records": records,
+                "head": records[-1]["hash"],
+            }
+        )
+    )
+    assert audit.verify(path)["head"] == records[-1]["hash"]
+
+
+def test_bundle_states_each_retention_horizon(
+    bridge, repo, paired, worked, tmp_path, monkeypatch, capsys
+):
+    bundle, _ = export(monkeypatch, capsys, bridge, repo, tmp_path / "a.json")
+    horizons = bundle["horizons"]
+    assert horizons["issue_history"]["limit"] == lifecycle.MAX_HISTORY
+    assert horizons["issue_history"]["exceeded"] is False
+    assert horizons["report_records"]["exceeded"] is False
+    assert horizons["pull_request_history"]["exceeded"] is True
+    directory = worked["directory"]
+    ledger = issues.snapshot(directory)
+    record = ledger["issues"]["42"]
+    for count in range(lifecycle.MAX_HISTORY):
+        lifecycle.append_history(
+            record, {"action": "note", "at": 10**9 + count}
+        )
+    write_json(directory / "issues.json", ledger)
+    manifest = {"participants": {}}
+    stated = audit.horizons(directory, manifest, 10**9 - 1, 10**9)
+    assert stated["issue_history"]["exceeded"] is True
+    assert stated["pull_request_history"]["exceeded"] is False
+    later = audit.horizons(directory, manifest, 2 * 10**9, 2 * 10**9)
+    assert later["issue_history"]["exceeded"] is False
+
+
 def test_verify_names_the_first_tampered_record_and_exits_nonzero(
     bridge, repo, paired, worked, tmp_path, monkeypatch, capsys
 ):
@@ -319,6 +384,40 @@ def test_signature_fails_when_a_signed_bundle_is_edited(
     status, printed = verify(monkeypatch, capsys, output)
     assert status == 1
     assert "signature does not match" in printed
+
+
+@needs_ssh
+def test_signer_accepts_its_own_signature_and_rejects_another_key(
+    bridge, repo, paired, worked, tmp_path, monkeypatch, capsys
+):
+    key = keypair(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    stranger = keypair(other)
+    output = tmp_path / "audit.json"
+    export(monkeypatch, capsys, bridge, repo, output, "--sign", str(key))
+    status, printed = verify(
+        monkeypatch, capsys, output, "--signer", f"{key}.pub"
+    )
+    assert status == 0, printed
+    assert "Chain intact" in printed
+    status, printed = verify(
+        monkeypatch, capsys, output, "--signer", f"{stranger}.pub"
+    )
+    assert status == 1
+    assert "signature does not match" in printed
+
+
+def test_signer_fails_an_unsigned_bundle(
+    bridge, repo, paired, worked, tmp_path, monkeypatch, capsys
+):
+    output = tmp_path / "audit.json"
+    export(monkeypatch, capsys, bridge, repo, output)
+    status, printed = verify(
+        monkeypatch, capsys, output, "--signer", str(tmp_path / "x.pub")
+    )
+    assert status == 1
+    assert "carries no signature" in printed
 
 
 @needs_ssh

@@ -1845,20 +1845,33 @@ to now. Records are read through the modules that keep them; the store is
 opened read-only and the only file written is the one `--output` names.
 
 Each record carries the SHA-256 of its canonical JSON (sorted keys, no
-insignificant whitespace) with the hash of the record before it, so `audit
-verify` names the first record that was changed, removed or reordered and exits
-1. Credentials, tokens and transcripts never enter the bundle: lanes are copied
-field by field, any key named like a token, secret, password, credential, key
-or prompt is dropped unless it holds a number such as a token count, and text
-claiming assistant authorship is withheld.
+insignificant whitespace, non-ASCII text escaped) with the hash of the record
+before it, so `audit verify` names the first record that was changed, removed
+or reordered and exits with status 1. Credentials, tokens and transcripts never
+enter the bundle: lanes are copied field by field, and any key named like a
+token, secret, password, credential or prompt is dropped unless it holds a
+number such as a token count. A key whose last underscore-separated part is
+`key`, such as `key`, `api_key`, `ssh_key` or `signing_key`, is dropped too,
+while `monkey` or `keyboard` stay. Text claiming assistant authorship is
+withheld.
+
+The bundle can hold only what coordination still keeps. Each issue keeps its
+newest 50 history entries, closed pull requests are kept for 30 days, and each
+lane's report log keeps its newest 2000 records. The bundle's `horizons` field
+names each cap with its limit and unit, and marks it `exceeded` when records
+older than the oldest one kept may have fallen inside the window, so the
+bundle can be missing records there.
 
 The chain proves the bundle is consistent, not who wrote it. `--sign KEY` signs
 the bundle with an existing SSH key through `ssh-keygen -Y sign` under the
 `agent-parley-audit` namespace and embeds the signature. `audit verify` checks
 it with `ssh-keygen -Y check-novalidate`, which needs no allowed-signers file,
 and prints the signing key's fingerprint; compare it with `ssh-keygen -l -f
-KEY.pub` of the key you expect. A bundle without a signature verifies on its
-chain alone unless `--require-signature` is given.
+KEY.pub` of the key you expect. `--signer PUBKEY_FILE` makes that comparison
+for you: the signature is checked with `ssh-keygen -Y verify` against an
+allowed-signers file trusting only that public key, and a signature by any
+other key, or no signature, fails. A bundle without a signature verifies on
+its chain alone unless `--require-signature` or `--signer` is given.
 
 ### Following one lane
 

@@ -4478,6 +4478,15 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         action="store_true",
         help="Fail when the bundle carries no signature.",
     )
+    checked.add_argument(
+        "--signer",
+        type=Path,
+        metavar="PUBKEY_FILE",
+        help=(
+            "Require a signature by this SSH public key; another key's "
+            "signature fails."
+        ),
+    )
     archived = commands.add_parser(
         "state",
         help="Export, inspect or import the coordination state as one archive.",
@@ -6474,7 +6483,9 @@ def _audit(bridge: Bridge, args: argparse.Namespace) -> str:
 
     if args.action == "verify":
         checked = audit.verify(
-            args.bundle, require_signature=args.require_signature
+            args.bundle,
+            require_signature=args.require_signature,
+            signer=args.signer,
         )
         signed = (
             f" {checked['signer']}"

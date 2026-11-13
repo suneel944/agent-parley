@@ -16,7 +16,9 @@ the bundle is internally consistent; only a signature shows who exported it.
 Signing uses the operator's existing SSH key through `ssh-keygen -Y sign`
 under `NAMESPACE`, and `verify` checks it with `ssh-keygen -Y
 check-novalidate`, which needs no allowed-signers file and reports the
-signing key's fingerprint for the operator to compare.
+signing key's fingerprint for the operator to compare. Given the expected
+public key, `verify` uses `ssh-keygen -Y verify` against an allowed-signers
+file trusting only that key, so a signature by any other key fails.
 
 Reading is the whole contract on the state side: the store is opened
 read-only by `history`, no lock is taken, and the only file written is the
@@ -36,7 +38,15 @@ import tempfile
 import time
 from pathlib import Path
 
-from agent_parley import history, issues, metrics, policy, reviews, supervision
+from agent_parley import (
+    history,
+    issues,
+    lifecycle,
+    metrics,
+    policy,
+    reviews,
+    supervision,
+)
 from agent_parley.state import BridgeError, write_text
 from agent_parley.worktrees import git
 
@@ -47,8 +57,8 @@ GENESIS = "0" * 64
 RESOLVED_ACTIONS = frozenset({"resolve", "complete"})
 LANE_FIELDS = ("provider", "model", "effort", "branch")
 SECRET_KEY = re.compile(
-    r"(token|secret|password|passphrase|passcode|credential|api_?key|"
-    r"private_?key|authorization|cookie|transcript|prompt)s?$",
+    r"(token|secret|password|passphrase|passcode|credential|apikey|"
+    r"privatekey|(^|_)key|authorization|cookie|transcript|prompt)s?$",
     re.IGNORECASE,
 )
 WITHHELD = "[withheld: assistant attribution]"
@@ -61,9 +71,12 @@ def scrub(value: object) -> object:
     A key whose name ends like a secret or a transcript (``token``,
     ``registration_token``, ``password``, ``credential``, ``api_key``,
     ``handoff_prompt`` and the like) is dropped with its value, at any
-    depth. A numeric value under such a key is kept, because it is a count,
-    such as the ``tokens`` a claim used, and cannot carry a secret. A string
-    that claims assistant authorship under `policy` is withheld.
+    depth. ``key`` counts only as a whole underscore-separated part, so
+    ``key``, ``ssh_key`` and ``signing_key`` are dropped while ``monkey``
+    and ``keyboard`` are kept. A numeric value under such a key is kept,
+    because it is a count, such as the ``tokens`` a claim used, and cannot
+    carry a secret. A string that claims assistant authorship under
+    `policy` is withheld.
 
     Args:
         value: A JSON-compatible value.
@@ -87,15 +100,19 @@ def scrub(value: object) -> object:
 def canonical(value: object) -> bytes:
     """Serializes a value the one way its hash and signature are taken over.
 
+    Every character outside ASCII is written as a JSON escape, so text
+    holding a lone surrogate, which UTF-8 cannot encode, still hashes, and
+    the bundle read back from its file hashes to the same bytes.
+
     Args:
         value: A JSON-compatible value.
 
     Returns:
-        UTF-8 JSON with sorted keys and no insignificant whitespace.
+        ASCII JSON with sorted keys and no insignificant whitespace.
     """
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode(
+        "ascii"
+    )
 
 
 def _digest(index: int, kind: str, data: object, previous: str) -> str:
@@ -293,6 +310,61 @@ def _commits(
     return sorted(found, key=lambda entry: entry["at"])
 
 
+def horizons(
+    directory: Path, manifest: dict, since: float, now: float
+) -> dict[str, dict]:
+    """States each retention cap that bounds what the bundle can hold.
+
+    Coordination keeps a bounded history: the newest `lifecycle.MAX_HISTORY`
+    entries per issue, `supervision.PULL_REQUEST_HISTORY_SECONDS` of closed
+    pull requests, and the newest `metrics.MAX_REPORT_RECORDS` records per
+    lane's report log. A cap counts as exceeded when records older than the
+    oldest one kept may have fallen inside the window, so a reader knows
+    the bundle can be missing records there.
+
+    Args:
+        directory: Private state directory for the common repository.
+        manifest: Project manifest holding the roster.
+        since: Window start as a Unix time, inclusive.
+        now: Export time as a Unix time.
+
+    Returns:
+        Each cap's limit, its unit and whether the window exceeded it.
+    """
+    issue_history = any(
+        len(entries) >= lifecycle.MAX_HISTORY
+        and float(entries[0].get("at") or 0) > since
+        for record in issues.snapshot(directory)["issues"].values()
+        if (entries := record.get("history") or [])
+    )
+    report_records = False
+    for name in manifest["participants"]:
+        kept = metrics.report_records(directory, name)
+        if (
+            len(kept) >= metrics.MAX_REPORT_RECORDS
+            and float(kept[0].get("at") or 0) > since
+        ):
+            report_records = True
+    window = supervision.PULL_REQUEST_HISTORY_SECONDS
+    return {
+        "issue_history": {
+            "limit": lifecycle.MAX_HISTORY,
+            "unit": "entries per issue",
+            "exceeded": issue_history,
+        },
+        "pull_request_history": {
+            "limit": window,
+            "unit": "seconds after a pull request closes",
+            "exceeded": now - since > window,
+        },
+        "report_records": {
+            "limit": metrics.MAX_REPORT_RECORDS,
+            "unit": "records per lane",
+            "exceeded": report_records,
+        },
+    }
+
+
 def collect(
     home: Path, directory: Path, manifest: dict, since: float, until: float
 ) -> list[tuple[str, object]]:
@@ -415,13 +487,15 @@ def export(
             f"--since {since[0]} is later than --until {until[0]}."
         )
     records = chain(collect(home, directory, manifest, since[1], until[1]))
+    now = time.time()
     bundle: dict = {
         "format": FORMAT,
         "kind": KIND,
         "project": str(manifest["root"]),
         "since": {"ref": since[0], "at": since[1]},
         "until": {"ref": until[0], "at": until[1]},
-        "exported_at": time.time(),
+        "exported_at": now,
+        "horizons": horizons(directory, manifest, since[1], now),
         "records": records,
         "head": records[-1]["hash"] if records else GENESIS,
     }
@@ -474,29 +548,60 @@ def _check_chain(records: list) -> str:
     return previous
 
 
-def _check_signature(bundle: dict) -> str:
-    """Checks the embedded signature with `ssh-keygen -Y check-novalidate`.
+def _allowed_signer(signer: Path) -> str:
+    """Builds one allowed-signers line trusting only the given public key.
+
+    Raises:
+        BridgeError: If the file holds no single-line SSH public key.
+    """
+    try:
+        lines = [
+            line.strip()
+            for line in signer.read_text().splitlines()
+            if line.strip()
+        ]
+    except (OSError, ValueError) as exc:
+        raise BridgeError(f"{signer} is not a readable public key.") from exc
+    if len(lines) != 1 or len(lines[0].split()) < 2:
+        raise BridgeError(f"{signer} does not hold one SSH public key.")
+    key_type, key = lines[0].split()[:2]
+    return f'{NAMESPACE} namespaces="{NAMESPACE}" {key_type} {key}\n'
+
+
+def _check_signature(bundle: dict, signer: Path | None = None) -> str:
+    """Checks the embedded signature with `ssh-keygen -Y`.
+
+    Without a signer the signature is checked with `check-novalidate`, which
+    accepts any key and reports its fingerprint. With a signer it is checked
+    with `verify` against an allowed-signers file trusting only that public
+    key, so a signature by any other key is rejected.
 
     Returns:
         The line `ssh-keygen` printed, naming the signing key's fingerprint.
 
     Raises:
-        BridgeError: If `ssh-keygen` is missing or rejects the signature.
+        BridgeError: If `ssh-keygen` is missing, the signer file holds no
+            public key, or `ssh-keygen` rejects the signature.
     """
     with tempfile.TemporaryDirectory() as scratch:
         path = Path(scratch) / "bundle.sig"
         path.write_text(str(bundle["signature"]))
+        command = ["ssh-keygen", "-Y", "check-novalidate"]
+        if signer is not None:
+            allowed = Path(scratch) / "allowed_signers"
+            allowed.write_text(_allowed_signer(signer))
+            command = [
+                "ssh-keygen",
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed),
+                "-I",
+                NAMESPACE,
+            ]
         try:
             result = subprocess.run(
-                [
-                    "ssh-keygen",
-                    "-Y",
-                    "check-novalidate",
-                    "-n",
-                    NAMESPACE,
-                    "-s",
-                    str(path),
-                ],
+                [*command, "-n", NAMESPACE, "-s", str(path)],
                 input=_payload(bundle),
                 capture_output=True,
                 timeout=SIGN_SECONDS,
@@ -510,12 +615,19 @@ def _check_signature(bundle: dict) -> str:
     return said
 
 
-def verify(path: Path, *, require_signature: bool = False) -> dict:
+def verify(
+    path: Path,
+    *,
+    require_signature: bool = False,
+    signer: Path | None = None,
+) -> dict:
     """Checks a bundle's hash chain and, when present, its signature.
 
     Args:
         path: Bundle file.
         require_signature: Refuse a bundle that carries no signature.
+        signer: Public key the signature must be made by; giving one also
+            refuses an unsigned bundle.
 
     Returns:
         The record count, head hash, whether it was signed, and the
@@ -524,7 +636,8 @@ def verify(path: Path, *, require_signature: bool = False) -> dict:
     Raises:
         BridgeError: If the file is not a bundle, a record breaks the chain
             (named by index), the head does not match, the signature is
-            rejected, or a required signature is missing.
+            rejected or made by a key other than the signer, or a required
+            signature is missing.
     """
     try:
         bundle = json.loads(path.read_text())
@@ -541,14 +654,14 @@ def verify(path: Path, *, require_signature: bool = False) -> dict:
             f"Record {len(records)} is missing: the bundle head does not "
             "match the last record."
         )
-    signer = ""
+    said = ""
     if bundle.get("signature"):
-        signer = _check_signature(bundle)
-    elif require_signature:
+        said = _check_signature(bundle, signer)
+    elif require_signature or signer is not None:
         raise BridgeError(f"{path} carries no signature.")
     return {
         "records": len(records),
         "head": head,
-        "signed": bool(signer),
-        "signer": signer,
+        "signed": bool(said),
+        "signer": said,
     }
