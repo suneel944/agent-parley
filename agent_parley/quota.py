@@ -41,6 +41,7 @@ from agent_parley.state import BridgeError, lock, write_json
 WINDOWS = "quotas.json"
 LEDGER = "quota-ledger.json"
 LOCK_SECONDS = 10.0
+TIERED = frozenset({"claude"})
 _CACHE: dict = {}
 
 
@@ -121,9 +122,11 @@ def accounts(home: Path, manifest: dict) -> dict[str, dict]:
         manifest: Project manifest.
 
     Returns:
-        Per ``adapter:credential`` key, the ``credential``, ``adapter`` and
-        sorted ``lanes``. Lanes on the default account or an unknown
-        provider are left out.
+        Per ``adapter:credential`` key, the ``credential``, ``adapter``,
+        sorted ``lanes`` and ``models``: the model each lane was started on
+        by request, kept only for an adapter in `TIERED`, whose vendor
+        meters each model's use separately. Lanes on the default account or
+        an unknown provider are left out.
     """
     groups: dict[str, dict] = {}
     for name, participant in manifest["participants"].items():
@@ -138,9 +141,16 @@ def accounts(home: Path, manifest: dict) -> dict[str, dict]:
             continue
         group = groups.setdefault(
             f"{adapter}:{credential}",
-            {"credential": credential, "adapter": adapter, "lanes": []},
+            {
+                "credential": credential,
+                "adapter": adapter,
+                "lanes": [],
+                "models": {},
+            },
         )
         group["lanes"].append(name)
+        if adapter in TIERED and participant.get("model"):
+            group["models"][name] = str(participant["model"])
     for group in groups.values():
         group["lanes"].sort()
     return groups
@@ -462,8 +472,10 @@ def headroom(ledger: Mapping, now: float) -> list[dict]:
         Per credential, sorted by key: ``credential``, ``adapter``,
         ``lanes``, ``state`` (``exhausted``, ``spent``, ``near``,
         ``available`` or ``unknown``), ``remaining``, ``used`` and ``limit``
-        in tokens or None, ``reset_at`` or None, ``estimated`` and the
-        currently ``parked`` lanes.
+        in tokens or None, ``reset_at`` or None, ``estimated``, the
+        currently ``parked`` lanes and ``tiers``: for an adapter in
+        `TIERED`, the tokens counted in the window per requested model,
+        because that vendor meters each model's use separately.
     """
     parked = {
         name
@@ -488,7 +500,23 @@ def headroom(ledger: Mapping, now: float) -> list[dict]:
             "reset_at": None,
             "estimated": False,
             "parked": sorted(parked & set(item["lanes"])),
+            "tiers": {},
         }
+        readings = (
+            entry.get("readings") or {}
+            if float(entry.get("ends") or 0) > now
+            else {}
+        )
+        for lane, model in sorted((item.get("models") or {}).items()):
+            reading = readings.get(lane)
+            if reading is None:
+                continue
+            row["tiers"][model] = (
+                row["tiers"].get(model, 0)
+                + reading.get("carried", 0)
+                + reading["last"]
+                - reading["base"]
+            )
         if reported and float(reported[1]) > now:
             row.update(state="exhausted", remaining=0, reset_at=reported[1])
         elif window and entry and float(entry["ends"]) > now:
@@ -548,8 +576,12 @@ def lines(rows: list[dict]) -> list[str]:
         parked = (
             f"; parked: {', '.join(row['parked'])}" if row["parked"] else ""
         )
+        tiers = "".join(
+            f"; {model}: {used} tokens"
+            for model, used in sorted((row.get("tiers") or {}).items())
+        )
         shown.append(
             f"{row['credential']} ({row['adapter']}): {row['state']}, "
-            f"{left}; lanes: {', '.join(row['lanes'])}{parked}"
+            f"{left}; lanes: {', '.join(row['lanes'])}{parked}{tiers}"
         )
     return shown

@@ -13,6 +13,7 @@ import pytest
 from agent_parley import (
     children,
     cli,
+    dashboard,
     followups,
     process,
     roster,
@@ -332,6 +333,160 @@ def test_message_is_capped_and_names_the_merge():
     assert len(body.encode()) <= children.REPORT_BYTES
     assert "Branch: b-c1 at aaaaaaaaaaaa" in body
     assert body.endswith("git merge --no-ff b-c1")
+
+
+def test_a_child_spawned_on_a_model_and_effort_records_and_shows_them(
+    bridge, parent, service, launched, capsys
+):
+    body = "model: claude-sonnet-5-5\nEffort: high\nWrite the parser."
+    spawned = decoded(
+        served(
+            service, parent["token"], "send_message", spawning(body, ["src"])
+        )
+    )
+    entry = roster.read(parent["directory"])["participants"]["claude-c1"]
+    source = roster.read(parent["directory"])["participants"]["claude"]
+    assert (entry["model"], entry["effort"]) == ("claude-sonnet-5-5", "high")
+    assert (entry["provider"], entry["credential"]) == (
+        source["provider"],
+        source["credential"],
+    )
+    assert "model" not in source
+    assert (spawned["model"], spawned["effort"]) == (
+        "claude-sonnet-5-5",
+        "high",
+    )
+    assert launched[0]["task"].endswith("Task from claude:\nWrite the parser.")
+    view = children.of(roster.read(parent["directory"]), "claude")[0]
+    assert (view["model"], view["effort"]) == ("claude-sonnet-5-5", "high")
+    body = children.message(
+        "claude-c1", "b-c1", {"state": "ready"}, children.tier_label(entry)
+    )
+    assert "Ran on: model claude-sonnet-5-5, effort high" in body
+    rows = {
+        row["participant"]: row
+        for row in dashboard.select(dashboard.collect(bridge.home, False, {}))[
+            "projects"
+        ][0]["rows"]
+    }
+    column = [name for name, _ in dashboard.COLUMNS].index("PROVIDER")
+    assert dashboard.row_cells(rows["claude-c1"])[column].endswith(
+        " claude-sonnet-5-5 high"
+    )
+    assert "sonnet" not in dashboard.row_cells(rows["claude"])[column]
+    record = {
+        item["participant"]: item
+        for item in bridge.status_snapshot()["projects"][0]["participants"]
+    }["claude-c1"]
+    cli.lane_detail(record, roster.read(parent["directory"]))
+    assert "Model: claude-sonnet-5-5; effort: high" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ("effort: turbo\nDo it", "takes effort low, medium, high"),
+        ("model: x;rm\nDo it", "is not a model or effort name"),
+        ("model: a\nmodel: b\nDo it", "names model: more than once"),
+        ("model:\nDo it", "names model: with no value"),
+        ("Effort:  \nDo it", "names effort: with no value"),
+    ],
+)
+def test_a_tier_the_cli_cannot_honour_is_refused_with_the_reason(
+    bridge, parent, service, launched, body, reason
+):
+    refused = served(
+        service, parent["token"], "send_message", spawning(body, ["src"])
+    )
+    assert refused.get("isError") is True
+    assert reason in refused["content"][0]["text"]
+    assert launched == []
+    assert "claude-c1" not in roster.read(parent["directory"])["participants"]
+
+
+def test_a_child_without_tier_headers_keeps_the_provider_default(
+    bridge, parent, service, launched
+):
+    spawned = decoded(
+        served(
+            service,
+            parent["token"],
+            "send_message",
+            spawning("model of the parser is wrong", ["src"]),
+        )
+    )
+    entry = roster.read(parent["directory"])["participants"]["claude-c1"]
+    assert "model" not in entry and "effort" not in entry
+    assert "model" not in spawned
+    assert children.tier_label(entry) == ""
+    assert "model of the parser is wrong" in launched[0]["task"]
+
+
+def test_tier_refuses_a_cli_without_the_setting():
+    assert children.tier("claude") == []
+    assert children.tier("codex", "gpt-5", "low") == [
+        "--model",
+        "gpt-5",
+        "-c",
+        'model_reasoning_effort="low"',
+    ]
+    with pytest.raises(BridgeError, match="amp CLI takes no model"):
+        children.tier("amp", model="smart")
+    with pytest.raises(BridgeError, match="gemini CLI takes no effort"):
+        children.tier("gemini", effort="high")
+
+
+@pytest.mark.parametrize(
+    ("recorded", "expected"),
+    [
+        (
+            {"model": "claude-haiku-5-5", "effort": "low"},
+            ["--model", "claude-haiku-5-5", "--effort", "low"],
+        ),
+        ({}, []),
+    ],
+)
+def test_the_native_launch_starts_on_the_recorded_tier(
+    bridge, repo, monkeypatch, recorded, expected
+):
+    from agent_parley import cli, terminal
+    from agent_parley.state import write_json
+
+    manifest = bridge.add_participant(repo, "claude", "claude")
+    directory = Path(manifest["lanes"]["claude"]).parent
+    data = roster.read(directory)
+    data["participants"]["claude"].update(recorded)
+    write_json(directory / "project.json", data)
+    session = "12345678-abcd-1234-abcd-123456789abc"
+    write_json(
+        directory / "claude-activity.json",
+        {"activity": "stopped", "session_id": session},
+    )
+    monkeypatch.setattr(bridge, "up", lambda: None)
+
+    async def identity(*args):
+        return {"registration_token": "test-only"}
+
+    monkeypatch.setattr(bridge, "identity", identity)
+    original = cli.shutil.which
+    monkeypatch.setattr(
+        cli.shutil,
+        "which",
+        lambda name: "/bin/true" if name == "claude" else original(name),
+    )
+    captured = []
+    monkeypatch.setattr(
+        terminal,
+        "run",
+        lambda command, *args, **kwargs: captured.append(command) or 0,
+    )
+    assert bridge.launch("claude", repo, terminal.PROMPT, resume=True) == 0
+    assert captured[0][1 : 3 + len(expected)] == [
+        "--resume",
+        session,
+        *expected,
+    ]
+    assert "--model" not in captured[0][3 + len(expected) :]
 
 
 def test_the_launcher_runs_the_package_without_bypass_flags(

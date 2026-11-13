@@ -144,6 +144,54 @@ def test_headroom_marks_derived_figures_estimated_and_vendor_ones_not():
     assert after["other"]["parked"] == []
 
 
+def test_a_tiered_vendor_reports_window_use_per_requested_model(bridge):
+    manifest = {
+        "participants": {
+            "a": {"provider": "claude", "credential": "shared"},
+            "b": {
+                "provider": "claude",
+                "credential": "shared",
+                "model": "claude-sonnet-5-5",
+            },
+            "c": {
+                "provider": "claude",
+                "credential": "shared",
+                "model": "claude-sonnet-5-5",
+            },
+            "x": {
+                "provider": "codex",
+                "credential": "other",
+                "model": "gpt-5",
+            },
+        }
+    }
+    groups = quota.accounts(bridge.home, manifest)
+    assert groups["claude:shared"]["models"] == {
+        "b": "claude-sonnet-5-5",
+        "c": "claude-sonnet-5-5",
+    }
+    assert groups["codex:other"]["models"] == {}
+    entry = quota.roll({}, WINDOW, {"a": 0, "b": 0, "c": 0}, 100.0)
+    entry = quota.roll(entry, WINDOW, {"a": 300, "b": 120, "c": 30}, 200.0)
+    ledger = {
+        "credentials": {
+            "claude:shared": {
+                **groups["claude:shared"],
+                "window": WINDOW,
+                "entry": entry,
+                "reported": None,
+            }
+        },
+        "parked": {},
+    }
+    (row,) = quota.headroom(ledger, 300.0)
+    assert row["tiers"] == {"claude-sonnet-5-5": 150}
+    (line,) = quota.lines([row])
+    assert line.endswith("; claude-sonnet-5-5: 150 tokens")
+    (expired,) = quota.headroom(ledger, 100.0 + 5 * 3600)
+    assert expired["tiers"] == {}
+
+
 def test_a_window_needs_a_defined_profile_and_usable_values(bridge):
     with pytest.raises(BridgeError):
         quota.set_window(bridge.home, "missing", 5, 1000)

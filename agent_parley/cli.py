@@ -1019,6 +1019,11 @@ def lane_detail(record: dict, data: dict) -> None:
         f"  {agent} ({record['identity']}): {record['session']}\n"
         f"    Provider: {record['provider']}; {account}"
     )
+    if record.get("model") or record.get("effort"):
+        print(
+            f"    Model: {record.get('model') or 'provider default'}; "
+            f"effort: {record.get('effort') or 'provider default'}"
+        )
     print(
         f"    Availability: {record['availability']['state']}; "
         "session process alive: "
@@ -3405,6 +3410,41 @@ class Absorbed:
 
 
 WHOLE_PARSER = frozenset({"completion", "__complete"})
+SHOW_BY_DEFAULT = frozenset(
+    {"unattended", "verify", "init", "pool", "approval", "timeout"}
+)
+
+
+def with_default_action(arguments: Sequence[str]) -> list[str]:
+    """Adds ``show`` to a policy command typed without an action.
+
+    Only a command in `SHOW_BY_DEFAULT` that is followed by nothing, or by an
+    option other than a help flag, gains the action, so a command that
+    changes state still demands its own action.
+
+    Args:
+        arguments: Arguments as typed, without the program name.
+
+    Returns:
+        The arguments, with ``show`` after the command when it was omitted.
+    """
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token in ("-V", "--version"):
+            index += 1
+        elif token == "--home":
+            index += 2
+        elif token.startswith("--home="):
+            index += 1
+        else:
+            break
+    if index >= len(arguments) or arguments[index] not in SHOW_BY_DEFAULT:
+        return list(arguments)
+    rest = arguments[index + 1 :]
+    if rest and (not rest[0].startswith("-") or rest[0] in ("-h", "--help")):
+        return list(arguments)
+    return [*arguments[: index + 1], "show", *rest]
 
 
 class CommandIndex:
@@ -4178,8 +4218,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help=(
             "Show only these columns, comma separated, such as "
             "PARTICIPANT,STATE,IDLE, or all for every column. The default "
-            "leaves out PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and "
-            "FIT."
+            "leaves out PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED, FIT "
+            "and MERGED, the merge fraction over the --since window or the "
+            "last 7 days."
         ),
     )
     watch.add_argument(
@@ -6437,7 +6478,7 @@ def main() -> int:
     parser, commands = root_parser(typed)
     if typed is not None and typed not in commands.declared:
         parser, commands = root_parser(None)
-    args = parser.parse_args()
+    args = parser.parse_args(with_default_action(sys.argv[1:]))
     home = args.home.expanduser()
     if args.version:
         print(protocol.launcher_version())

@@ -197,11 +197,28 @@ would. With no idle lane it stays unclaimed for the next lane that pulls work.
 A repeat prints the issue already filed. Filing needs the GitHub forge; a
 refusal leaves the suggestion pending. With Telegram configured, each
 suggestion also arrives as a decision with an `accept` button that takes a
-confirming tap. Unaccepted suggestions expire after seven days.
+confirming tap. Unaccepted suggestions expire after seven days; an expired one
+stays in `followups.json` in the `expired` state with `expired_at`, the time it
+lapsed, the newest 100 of them, and can no longer be accepted. Listing
+suggestions records the expiry too, so the file never shows a lapsed suggestion
+as pending.
+
+A title already pending, compared without case or extra spaces, is one
+suggestion whichever lane proposes it: a second lane gets the recorded one back
+as repeated. `lane`, `why` and `paths` keep the first lane's, `lanes` lists
+every lane and `reasons` keeps each lane's `why` and `paths`; `followup list`
+prints each other lane under `also suggested by` with its reasons.
+Open forge issues are matched from the supervisor's cached forge reading. When
+that cache is missing, unreadable or stale, the suggestion result and each
+listed suggestion carry `forge_checked: false`, and the note, the Telegram
+decision and `followup list` say open issues could not be checked, so
+duplicates cover claims only.
 
 `followup list --json` prints `kind: followup_list` with `suggestions`, each
-carrying `id`, `lane`, `title`, `why`, `paths`, `created`, `expires`, `state`
-and `duplicates` (`issue`, `title`, `owner`). `followup accept --json` prints
+carrying `id`, `lane`, `lanes`, `reasons`, `title`, `why`, `paths`, `created`,
+`expires`,
+`state`, `forge_checked` and `duplicates` (`issue`, `title`, `owner`).
+`followup accept --json` prints
 `kind: followup_accept` with the same fields plus `issue`, `milestone`,
 `offered_to`, `offer_id` and `repeated`.
 
@@ -2108,16 +2125,28 @@ every project series `project`. The lane families are
 `agent_parley_lane_pull_requests_merged_window`,
 `agent_parley_lane_pull_requests_closed_window`,
 `agent_parley_lane_first_pass_ratio`, `agent_parley_lane_ci_rounds_unknown`,
-`agent_parley_lane_ci_rounds_median` and
-`agent_parley_lane_claim_to_merge_seconds_median`. The project families are
+`agent_parley_lane_ci_rounds_median`,
+`agent_parley_lane_claim_to_merge_seconds_median`,
+`agent_parley_lane_merge_fraction_ratio`,
+`agent_parley_lane_pull_requests_abandoned_window`,
+`agent_parley_lane_pull_requests_end_unknown_window` and
+`agent_parley_lane_shared_file_degree_ratio`. The project families are
 `agent_parley_project_participants`, `agent_parley_project_idle_seconds`,
 `agent_parley_project_context_bytes_window`,
 `agent_parley_project_hook_events_window`,
-`agent_parley_project_hook_denials_window` and
-`agent_parley_project_pull_requests_excluded`; the summed families add up the
+`agent_parley_project_hook_denials_window`,
+`agent_parley_project_pull_requests_excluded`,
+`agent_parley_project_merge_fraction_ratio`,
+`agent_parley_project_pull_requests_abandoned_window`,
+`agent_parley_project_pull_requests_end_unknown_window` and
+`agent_parley_project_shared_file_degree_ratio`; the summed families add up the
 rows that project reports, so a total never counts a lane the export does not
-show. The pull request families are explained in
-[Monitoring](monitoring.md).
+show. The provider families, labelled `project` and `provider`, are
+`agent_parley_provider_merge_fraction_ratio`,
+`agent_parley_provider_pull_requests_abandoned_window`,
+`agent_parley_provider_pull_requests_end_unknown_window` and
+`agent_parley_provider_shared_file_degree_ratio`. The pull request and merge
+health families are explained in [Monitoring](monitoring.md).
 `agent_parley_lane_hook_denials_by_cause_window` splits a lane's denials by
 `reason` and `tool`, so a refusal over a reserved path or an expiring offer
 reads apart from a policy refusal.
@@ -3858,6 +3887,12 @@ agent-parley unattended show
 agent-parley unattended run claude-1
 agent-parley unattended set          # remove it; operator-only again
 ```
+
+`show` is the default action. `unattended`, `verify`, `init`, `pool`,
+`approval` and `timeout` typed with no action print what `show` prints and
+exit 0, and accept the options `show` accepts, such as `--repo` and `--json`.
+Every command that changes state still requires its own action, and
+`--help` and shell completion still list every action.
 
 The policy is stored in `project.json` as
 `"integration": {"unattended": {"target": "main", "issues": ["42", "43"]}}`.

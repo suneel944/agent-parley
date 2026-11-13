@@ -95,6 +95,7 @@ COMMAND_CHARS = 300
 OPTION_LABEL = 60
 ESCALATE_AFTER = 30.0
 REPEAT_LIMIT = 2
+PROMPTED = "prompt"
 SILENT_AFTER = 5.0
 VERSION_TIMEOUT = 5.0
 RECORDED = {
@@ -930,6 +931,7 @@ class Watch:
         self._answered_at = 0.0
         self._answered_tail = b""
         self._repeats: dict[str, int] = {}
+        self._record: dict = {}
         self._decision = ""
         self._stalled: bool | None = None
         self._client = ""
@@ -980,6 +982,18 @@ class Watch:
         within the repeat limit and then escalates, rather than leaving the
         lane parked on a dialog nobody is told about.
 
+        The repeat count belongs to one prompt that keeps coming back: a quiet
+        pass whose settled screen shows no dialog clears it, so the same
+        dialog answered in separate rounds is answered every time and only an
+        answer the screen survives `REPEAT_LIMIT` times escalates. A pass that
+        reads output never clears it, because a redraw split across reads
+        shows no dialog before its last part arrives.
+
+        An unrecognized prompt is timed from the first pass that showed one,
+        not from the last change of its screen tail, so a spinner or clock
+        drawn beside it cannot hold it under the deadline forever; once it
+        escalates, further changes to that tail are not published again.
+
         Args:
             output: Bytes just read from the client, empty when the launcher
                 only woke on its own timeout.
@@ -1020,7 +1034,10 @@ class Watch:
         ):
             self._stalled = self._pending_tool()
         signature = self._describe(screen, found)
-        if signature != self._signature:
+        unread = PROMPTED + "\x00"
+        if signature.startswith(unread) and self._signature.startswith(unread):
+            self._signature = signature
+        elif signature != self._signature:
             self._retire()
             self._signature = signature
             self._since = now
@@ -1029,8 +1046,12 @@ class Watch:
                 self._release()
             return b""
         if not signature:
+            if not output:
+                self._repeats = {}
             self._release()
             return b""
+        if self._parked:
+            self._reassert()
         if self._resolved and self._decision:
             pressed = self._carry(found, held)
             if pressed:
@@ -1077,7 +1098,7 @@ class Watch:
                 )
             )
         if prompted(screen):
-            return "prompt\x00" + screen[-SIGNATURE_CHARS:]
+            return PROMPTED + "\x00" + screen[-SIGNATURE_CHARS:]
         if self._stalled:
             return "stalled\x00" + screen[-SIGNATURE_CHARS:]
         return ""
@@ -1413,6 +1434,7 @@ class Watch:
                 state["activity"] = MARKER + label
                 state["dialog"] = record
                 write_json(path, state)
+            self._record = record
             self._parked = True
             self._resolved = True
             lanes.submit(
@@ -1425,6 +1447,43 @@ class Watch:
             )
             return True
         return False
+
+    def _reassert(self) -> None:
+        """Restores the published dialog a later hook event erased.
+
+        Every hook event other than `PermissionRequest` replaces the lane's
+        activity and drops its dialog record, because a hook cannot tell a
+        dialog the watcher still sees from one that is gone. The watcher is
+        the only reader of the screen, so while it holds the lane parked it
+        writes its last record back on the pass that finds it missing. The
+        hook path is left as it is: a dialog kept there would outlive a
+        launcher that exited without releasing it, while a record restored
+        here stops being restored the moment its watcher does. A dialog the
+        hook itself recorded is left in place. The check reads the state
+        without the lock and takes it only to restore, so a parked lane
+        costs one read per pass.
+        """
+        if not self._record:
+            return
+        from agent_parley import checkpoints
+
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            if "dialog" in checkpoints.activity(self._directory, self._name):
+                return
+            with lock(
+                self._directory / f"{self._name}-checkpoint.lock", timeout=1
+            ):
+                state = checkpoints.activity(self._directory, self._name)
+                if "dialog" in state:
+                    return
+                previous = str(state.get("activity", ""))
+                if not previous.startswith(MARKER):
+                    self._record["previous"] = previous
+                state["activity"] = MARKER + str(self._record["label"])
+                state["dialog"] = self._record
+                write_json(
+                    self._directory / f"{self._name}-activity.json", state
+                )
 
     def _release(self) -> None:
         """Clears a published dialog once the screen no longer shows one.

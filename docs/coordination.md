@@ -189,7 +189,10 @@ it files no issue, offers nothing and starts no lane, so the lane keeps the
 work it holds and its scope does not grow. The result lists the open issues
 and claims the title may duplicate, matched on shared title words against the
 ledger's live claims and the open issues supervision last read from the forge.
-A repeat of the same title from the same lane returns the recorded suggestion.
+A repeat of a pending title, from the same lane or another, returns the
+recorded suggestion and adds the lane to its `lanes`. When the cached forge
+reading is missing or stale, the result says `forge_checked: false` with a
+note rather than reporting no duplicates silently.
 
 Only the operator turns a suggestion into work. `agent-parley followup list`
 shows the pending ones with their duplicates, and `agent-parley followup

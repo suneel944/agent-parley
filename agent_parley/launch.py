@@ -1227,6 +1227,13 @@ reported.
                     )
                     command.extend(["-c", f"hooks.{event}={value}"])
                 command.append(prompt + "\nUser task:\n" + task)
+            from agent_parley import children
+
+            command[1:1] = children.tier(
+                entry["adapter"],
+                participant.get("model", ""),
+                participant.get("effort", ""),
+            )
             print(
                 f"{agent} ({participant['provider']}, "
                 f"{participant['credential'] or 'default account'}): {lane}\n"
