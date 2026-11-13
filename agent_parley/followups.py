@@ -13,7 +13,16 @@ The operator reads pending suggestions through `pending` and accepts one with
 ``agent-parley followup accept ID`` or the Telegram decision button. Only
 acceptance files the forge issue, in the active milestone, and offers it to
 an idle lane through the same operator offer ``issue assign`` records.
-A suggestion nobody accepts expires after `TTL` seconds and is dropped.
+A suggestion nobody accepts expires after `TTL` seconds; it is then kept in
+the ``expired`` state, the newest `KEPT_EXPIRED` of them, so the record
+shows what lapsed and when instead of losing it. A title already pending
+is one suggestion whichever lane proposes it: a second lane gets the
+recorded suggestion back and is added to its ``lanes``.
+
+Duplicate matching reads the open forge issues from the supervisor's cache.
+When that cache is missing, damaged or older than ``FORGE_STALE``, the
+result says so with ``forge_checked`` false and a note, so an unchecked
+title never reads as one known to be new.
 
 Suggestions live in `RECORD_NAME` beside the issue ledger, under
 `LOCK_NAME`, and hold no credential. Their text is peer content: it is shown
@@ -34,9 +43,11 @@ RECORD_NAME = "followups.json"
 LOCK_NAME = "followups.lock"
 PENDING = "pending"
 ACCEPTED = "accepted"
+EXPIRED = "expired"
 TTL = 7 * 86400.0
 MAX_PENDING = 50
 KEPT_ACCEPTED = 100
+KEPT_EXPIRED = 100
 MAX_TITLE = 200
 MAX_WHY_BYTES = 2000
 MAX_PATHS = 16
@@ -46,6 +57,11 @@ FILING_SECONDS = 120.0
 NOTE = (
     "Recorded for the operator. Nothing was filed and no lane was started; "
     "keep working on what you hold."
+)
+FORGE_UNCHECKED = (
+    "Open forge issues could not be checked: the supervisor's cached "
+    "reading is missing, unreadable or stale, so duplicates list only "
+    "claims."
 )
 
 
@@ -72,26 +88,34 @@ def _read(directory: Path) -> dict:
 
 
 def _prune(record: dict, now: float) -> None:
-    """Drops expired suggestions and the oldest accepted ones past the bound.
+    """Marks lapsed suggestions expired and bounds the finished ones.
+
+    A pending suggestion past its expiry turns ``expired`` with the time
+    it was found lapsed under ``expired_at``. Only the newest
+    `KEPT_ACCEPTED` accepted and `KEPT_EXPIRED` expired suggestions stay.
 
     Args:
         record: Suggestion record, changed in place.
         now: Unix time the expiry is judged at.
     """
     kept = record["suggestions"]
-    for ident in [
-        key
-        for key, entry in kept.items()
-        if entry.get("state") == PENDING
-        and float(entry.get("expires") or 0) <= now
-    ]:
-        kept.pop(ident)
-    accepted = sorted(
-        (key for key, entry in kept.items() if entry.get("state") == ACCEPTED),
-        key=lambda key: float(kept[key].get("accepted") or 0),
-    )
-    for ident in accepted[: max(len(accepted) - KEPT_ACCEPTED, 0)]:
-        kept.pop(ident)
+    for entry in kept.values():
+        if (
+            entry.get("state") == PENDING
+            and float(entry.get("expires") or 0) <= now
+        ):
+            entry.update(state=EXPIRED, expired_at=now)
+    for state, stamp, bound in (
+        (ACCEPTED, "accepted", KEPT_ACCEPTED),
+        (EXPIRED, "expired_at", KEPT_EXPIRED),
+    ):
+        finished = sorted(
+            (float(entry.get(stamp) or 0), key)
+            for key, entry in kept.items()
+            if entry.get("state") == state
+        )
+        for _, ident in finished[: max(len(finished) - bound, 0)]:
+            kept.pop(ident)
 
 
 def _text(value: object, label: str, limit: int) -> str:
@@ -138,14 +162,15 @@ def _alike(wanted: set[str], title: str) -> bool:
     return bool(shared) and len(shared) >= min(2, len(wanted))
 
 
-def _open_titles(directory: Path) -> dict[str, str]:
+def _open_titles(directory: Path) -> dict[str, str] | None:
     """Reads the open forge issues the supervisor's cached reading lists.
 
     Args:
         directory: Private project state directory holding the cache.
 
     Returns:
-        Issue number to title; empty when the cache is missing or stale.
+        Issue number to title, or None when the cache is missing, damaged
+        or stale, so a caller can tell an unchecked forge from no match.
     """
     from agent_parley.status import FORGE_ISSUES, FORGE_STALE
 
@@ -154,9 +179,9 @@ def _open_titles(directory: Path) -> dict[str, str]:
         listed = cached["issues"]
         fresh = time.time() - float(cached.get("read_at") or 0) < FORGE_STALE
     except (OSError, ValueError, TypeError, KeyError):
-        return {}
+        return None
     if not fresh or not isinstance(listed, dict):
-        return {}
+        return None
     return {
         str(number): str(
             (item.get("title") if isinstance(item, dict) else item) or ""
@@ -168,6 +193,19 @@ def _open_titles(directory: Path) -> dict[str, str]:
 def duplicates(directory: Path, title: str) -> list[dict]:
     """Lists the open issues and claims a suggested title already describes.
 
+    Args:
+        directory: Private project state directory.
+        title: Suggested title.
+
+    Returns:
+        Each matching issue with its number, title and owner, lowest first.
+    """
+    return _matches(directory, title)[0]
+
+
+def _matches(directory: Path, title: str) -> tuple[list[dict], bool]:
+    """Matches a title against claims and open issues, saying what was read.
+
     The match is shallow on purpose: shared title words, as `recommend`
     reads them, against the claims the ledger records and the open issues
     the supervisor last read from the forge. It flags, it never refuses;
@@ -178,13 +216,17 @@ def duplicates(directory: Path, title: str) -> list[dict]:
         title: Suggested title.
 
     Returns:
-        Each matching issue with its number, title and owner, lowest first.
+        The matching issues as `duplicates` lists them, and whether the
+        open forge issues could be read, so an empty list from an
+        unchecked forge is not mistaken for a title known to be new.
     """
     from agent_parley import issues
 
+    titles = _open_titles(directory)
+    checked = titles is not None
     wanted = _terms(title)
     if not wanted:
-        return []
+        return [], checked
     try:
         ledger = issues.snapshot(directory).get("issues", {})
     except (OSError, ValueError):
@@ -194,11 +236,11 @@ def duplicates(directory: Path, title: str) -> list[dict]:
         for numbers in issues.holders({"issues": ledger}).values()
         for number in numbers
     }
-    titles = _open_titles(directory)
+    listed = titles or {}
     found = []
-    for number in sorted(owned | set(titles), key=int):
+    for number in sorted(owned | set(listed), key=int):
         record = ledger.get(number) or {}
-        named = titles.get(number) or str(record.get("title") or "")
+        named = listed.get(number) or str(record.get("title") or "")
         if _alike(wanted, named):
             found.append(
                 {
@@ -207,7 +249,7 @@ def duplicates(directory: Path, title: str) -> list[dict]:
                     "owner": str(record.get("owner") or ""),
                 }
             )
-    return found
+    return found, checked
 
 
 def suggest(
@@ -220,8 +262,10 @@ def suggest(
 ) -> dict:
     """Records one lane's suggestion for the operator, filing nothing.
 
-    The same lane suggesting the same title again while it is pending gets
-    the recorded suggestion back, so a retried call does not queue twice.
+    Any lane suggesting a title already pending, compared without case,
+    gets the recorded suggestion back, so a retried call or a second lane
+    noticing the same work does not queue it twice. ``lane`` keeps the
+    first lane; ``lanes`` lists every lane that suggested it.
 
     Args:
         directory: Private project state directory.
@@ -233,7 +277,9 @@ def suggest(
 
     Returns:
         The suggestion, ``repeated`` when it was already recorded, the
-        duplicates it matches and a note that nothing was filed.
+        duplicates it matches, ``forge_checked`` saying whether open forge
+        issues were among them, and a note that nothing was filed, which
+        says so too when the forge could not be checked.
 
     Raises:
         BridgeError: If an argument is invalid or the project already holds
@@ -255,12 +301,12 @@ def suggest(
             (
                 entry
                 for entry in waiting
-                if entry.get("lane") == lane
-                and entry.get("title", "").casefold() == named.casefold()
+                if entry.get("title", "").casefold() == named.casefold()
             ),
             None,
         )
         if same is None and len(waiting) >= MAX_PENDING:
+            write_json(directory / RECORD_NAME, record)
             raise BridgeError(
                 f"The operator already has {MAX_PENDING} suggestions to "
                 "review; mention this one in your report instead."
@@ -271,6 +317,7 @@ def suggest(
             same = {
                 "id": ident,
                 "lane": lane,
+                "lanes": [lane],
                 "title": named,
                 "why": reason,
                 "paths": listed,
@@ -285,12 +332,17 @@ def suggest(
             repeated = False
         else:
             repeated = True
+            lanes = same.setdefault("lanes", [same.get("lane", "")])
+            if lane not in lanes:
+                lanes.append(lane)
         write_json(directory / RECORD_NAME, record)
+    found, checked = _matches(directory, named)
     return {
         **same,
         "repeated": repeated,
-        "duplicates": duplicates(directory, named),
-        "note": NOTE,
+        "duplicates": found,
+        "forge_checked": checked,
+        "note": NOTE if checked else f"{NOTE} {FORGE_UNCHECKED}",
     }
 
 
@@ -323,7 +375,8 @@ def pending(directory: Path, now: float = 0.0) -> list[dict]:
 
     Returns:
         Each unexpired pending suggestion with the open issues and claims
-        it duplicates under ``duplicates``.
+        it duplicates under ``duplicates``, and ``forge_checked`` false
+        when the open forge issues could not be read for that match.
     """
     stamp = now or time.time()
     record = _read(directory)
@@ -336,10 +389,11 @@ def pending(directory: Path, now: float = 0.0) -> list[dict]:
         ),
         key=lambda entry: (float(entry.get("created") or 0), entry["id"]),
     )
-    return [
-        {**entry, "duplicates": duplicates(directory, entry["title"])}
-        for entry in waiting
-    ]
+    rows = []
+    for entry in waiting:
+        found, checked = _matches(directory, entry["title"])
+        rows.append({**entry, "duplicates": found, "forge_checked": checked})
+    return rows
 
 
 def by_decision(directory: Path, decision: str) -> str:
@@ -465,7 +519,7 @@ def accept(
         record = _read(directory)
         _prune(record, time.time())
         entry = record["suggestions"].get(ident)
-        if entry is None:
+        if entry is None or entry.get("state") == EXPIRED:
             write_json(directory / RECORD_NAME, record)
             raise BridgeError(
                 f"No pending suggestion {ident}; it was never recorded or "
@@ -635,8 +689,15 @@ def render(rows: list[dict]) -> str:
     for entry in rows:
         lines.append(f"{entry['id']}  {entry['lane']}: {entry['title']}")
         lines.append(f"    why: {entry['why']}")
+        others = [
+            name for name in entry.get("lanes") or [] if name != entry["lane"]
+        ]
+        if others:
+            lines.append(f"    also suggested by: {', '.join(others)}")
         if entry.get("paths"):
             lines.append(f"    paths: {', '.join(entry['paths'])}")
+        if entry.get("forge_checked") is False:
+            lines.append(f"    {FORGE_UNCHECKED}")
         for match in entry.get("duplicates") or []:
             held = f", held by {match['owner']}" if match["owner"] else ""
             lines.append(

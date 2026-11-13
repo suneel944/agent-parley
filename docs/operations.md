@@ -197,11 +197,22 @@ would. With no idle lane it stays unclaimed for the next lane that pulls work.
 A repeat prints the issue already filed. Filing needs the GitHub forge; a
 refusal leaves the suggestion pending. With Telegram configured, each
 suggestion also arrives as a decision with an `accept` button that takes a
-confirming tap. Unaccepted suggestions expire after seven days.
+confirming tap. Unaccepted suggestions expire after seven days; an expired one
+stays in `followups.json` in the `expired` state with `expired_at`, the newest
+100 of them, and can no longer be accepted.
+
+A title already pending is one suggestion whichever lane proposes it: a second
+lane gets the recorded one back as repeated, `lane` keeps the first lane and
+`lanes` lists every lane, which `followup list` prints as `also suggested by`.
+Open forge issues are matched from the supervisor's cached forge reading. When
+that cache is missing, unreadable or stale, the suggestion result and each
+listed suggestion carry `forge_checked: false`, and the note and `followup
+list` say open issues could not be checked, so duplicates cover claims only.
 
 `followup list --json` prints `kind: followup_list` with `suggestions`, each
-carrying `id`, `lane`, `title`, `why`, `paths`, `created`, `expires`, `state`
-and `duplicates` (`issue`, `title`, `owner`). `followup accept --json` prints
+carrying `id`, `lane`, `lanes`, `title`, `why`, `paths`, `created`, `expires`,
+`state`, `forge_checked` and `duplicates` (`issue`, `title`, `owner`).
+`followup accept --json` prints
 `kind: followup_accept` with the same fields plus `issue`, `milestone`,
 `offered_to`, `offer_id` and `repeated`.
 
