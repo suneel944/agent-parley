@@ -46,6 +46,7 @@ from agent_parley import (
     store,
     terminal,
     timeouts,
+    trials,
     unattended,
     waits,
 )
@@ -4572,6 +4573,42 @@ def symbol_notices(
     return sent
 
 
+def _trial_deadline(number: str, record: dict) -> bool:
+    """Records one notice for a running trial past its deadline.
+
+    A trial has no single owner the overdue transition could wake, offer
+    away or release, so the notice goes to every trial lane and names the
+    operator commands that end it. Nothing is ended for them.
+
+    Args:
+        number: Issue number the trial runs on.
+        record: The issue's ledger record, changed in place.
+
+    Returns:
+        True when a notice was written.
+    """
+    trial = trials.running(record)
+    deadline = trial.get("deadline")
+    if not deadline or time.time() <= deadline:
+        return False
+    identifier = f"trial:{trial['id']}:{deadline}"
+    if (record.get("deadline_notice") or {}).get("id") == identifier:
+        return False
+    record["deadline_notice"] = {
+        "id": identifier,
+        "holder": "",
+        "waiting": sorted(trial["lanes"]),
+        "created": time.time(),
+        "text": (
+            f"Trial of issue #{number} is overdue by "
+            f"{int(time.time() - deadline)}s. The operator ends it with "
+            f"trial keep {number} --lane NAME or trial cancel {number}; "
+            "every trial lane keeps working until then."
+        ),
+    }
+    return True
+
+
 def deadline_notices(directory: Path, manifest: dict) -> None:
     """Records one bounded notice for each claim that passed its budget.
 
@@ -4596,6 +4633,7 @@ def deadline_notices(directory: Path, manifest: dict) -> None:
             ):
                 record.pop("deadline_notice")
                 changed = True
+            changed = _trial_deadline(number, record) or changed
             holder = record.get("owner")
             if holder not in manifest["participants"]:
                 continue
@@ -5000,8 +5038,9 @@ def _overdue_peer(
 ) -> str | None:
     """Chooses the peer an overdue claim is offered to.
 
-    Only undelivered claims count toward a peer's cap and load, as they do
-    where the cap is enforced.
+    Only the claims `issues.counted_claims` counts, trial lanes included,
+    count toward a peer's cap and load, as they do where the cap is
+    enforced.
 
     Args:
         home: Private bridge state root.
@@ -5015,7 +5054,7 @@ def _overdue_peer(
         The fit, running peer below the project's claim cap that owns the
         fewest claims, ties broken by name, or None when no peer qualifies.
     """
-    ledger = issues.snapshot(directory)["issues"].values()
+    ledger = issues.snapshot(directory)["issues"]
     candidates = []
     for name, participant in manifest["participants"].items():
         observed = observations.get(name) or {}
@@ -5035,11 +5074,7 @@ def _overdue_peer(
             config["inactive_after"],
         )["fit"]:
             continue
-        owned = sum(
-            1
-            for record in ledger
-            if record.get("owner") == name and not issues.delivered(record)
-        )
+        owned = len(issues.counted_claims(ledger, name))
         if owned >= config["max_claims_per_lane"]:
             continue
         candidates.append((owned, name))

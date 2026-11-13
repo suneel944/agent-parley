@@ -292,10 +292,13 @@ def status_row(record: dict, offers: tuple[int, ...]) -> tuple[str, ...]:
     mail = record["mail"] or {}
     unreadable = "error" in mail
     held = ",".join(
-        f"#{claim['issue']}"
-        + ("!" if claim["overdue"] or claim["budget_exceeded"] else "")
-        + ("*" if claim.get("orphaned") else "")
-        for claim in record["claims"]
+        [
+            f"#{claim['issue']}"
+            + ("!" if claim["overdue"] or claim["budget_exceeded"] else "")
+            + ("*" if claim.get("orphaned") else "")
+            for claim in record["claims"]
+        ]
+        + [f"#{number}(trial)" for number in record.get("trials", [])]
     )
     reported = record["report_age_seconds"]
     review = record.get("review") or {}

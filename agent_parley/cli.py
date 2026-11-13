@@ -3291,6 +3291,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "trial",
             "followup",
             "mail",
             "say",
@@ -4315,6 +4316,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     delivered.add_argument("--json", action="store_true", help=JSON_HELP)
+    compared = readings.add_parser(
+        "trials",
+        help=(
+            "Aggregate ended trial outcomes per provider: lanes kept and "
+            "released, wall time to ready and client-reported tokens."
+        ),
+    )
+    compared.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        default=0.0,
+        metavar="TIME",
+        help="Count only trials that ended at or after this instant or window.",
+    )
+    compared.add_argument("--json", action="store_true", help=JSON_HELP)
     follow = commands.add_parser(
         "watch",
         help=(
@@ -5037,6 +5054,39 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         followup_parser.add_argument(
             "--json", action="store_true", help=JSON_HELP
         )
+    trying = commands.add_parser(
+        "trial",
+        help=(
+            "Run one issue side by side across provider lanes, compare them "
+            "with trial show ISSUE, keep one with trial keep ISSUE, or end "
+            "it keeping none with trial cancel ISSUE."
+        ),
+    )
+    trying.add_argument(
+        "target",
+        metavar="ISSUE|show|keep|cancel",
+        help="Issue number to start a trial of, or show, keep or cancel.",
+    )
+    trying.add_argument(
+        "issue",
+        nargs="?",
+        default="",
+        help="Issue number the show, keep or cancel reading names.",
+    )
+    trying.add_argument(
+        "--lanes",
+        default="",
+        metavar="A,B",
+        help="Comma-separated lanes to start the trial on, at least two.",
+    )
+    trying.add_argument(
+        "--lane",
+        default="",
+        metavar="NAME",
+        help="Lane whose branch trial keep keeps.",
+    )
+    trying.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    trying.add_argument("--json", action="store_true", help=JSON_HELP)
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -6678,6 +6728,12 @@ def main() -> int:
                 print(json.dumps(reading, indent=2))
             else:
                 print(metrics.describe_throughput(reading), end="")
+        elif args.command == "metrics" and args.reading == "trials":
+            reading = metrics.trials(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_trials(reading), end="")
         elif args.command == "metrics":
             from agent_parley import dashboard
 
@@ -6971,6 +7027,58 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "trial":
+            from agent_parley import trials
+
+            repo = args.repo.resolve()
+            if args.target in ("show", "keep", "cancel") and not args.issue:
+                parser.error(f"trial {args.target} needs an ISSUE.")
+            if args.target == "show":
+                compared = bridge.trial_show(repo, args.issue)
+                print(
+                    json.dumps(compared, indent=2)
+                    if args.json
+                    else trials.render(compared),
+                    end="\n" if args.json else "",
+                )
+            elif args.target == "keep":
+                if not args.lane:
+                    parser.error("trial keep needs --lane NAME.")
+                ended = bridge.trial_keep(repo, args.issue, args.lane)
+                print(
+                    json.dumps(ended, indent=2)
+                    if args.json
+                    else f"Kept {args.lane}'s branch for #{ended['issue']}; "
+                    "released "
+                    + ", ".join(
+                        sorted(
+                            name for name in ended["lanes"] if name != args.lane
+                        )
+                    )
+                    + "; no branch was deleted."
+                )
+            elif args.target == "cancel":
+                ended = bridge.trial_cancel(repo, args.issue)
+                print(
+                    json.dumps(ended, indent=2)
+                    if args.json
+                    else f"Cancelled the trial of #{ended['issue']}; released "
+                    + ", ".join(sorted(ended["lanes"]))
+                    + "; no branch was deleted."
+                )
+            else:
+                if args.issue:
+                    parser.error("trial ISSUE takes no second issue.")
+                if not args.lanes:
+                    parser.error("trial ISSUE needs --lanes A,B.")
+                begun = bridge.trial_start(repo, args.target, args.lanes)
+                print(
+                    json.dumps(begun, indent=2)
+                    if args.json
+                    else f"Trial of #{begun['issue']} started on "
+                    + ", ".join(sorted(begun["lanes"]))
+                    + f" from base {begun['base'][:12]}."
+                )
         elif args.command == "followup" and args.action == "list":
             suggested = bridge.followup_list(args.repo.resolve())
             print(

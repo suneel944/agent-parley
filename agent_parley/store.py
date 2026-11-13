@@ -22,6 +22,7 @@ from agent_parley import (
     recommend,
     retries,
     roster,
+    trials,
 )
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
@@ -3660,7 +3661,16 @@ def _review_round(home: Path, actor: dict, args: dict) -> dict:
             (
                 number
                 for number, record in ledger.get("issues", {}).items()
-                if claim and record.get("claim_id") == claim
+                if claim
+                and (
+                    record.get("claim_id") == claim
+                    or any(
+                        entry.get("claim_id") == claim
+                        for entry in trials.running(record)
+                        .get("lanes", {})
+                        .values()
+                    )
+                )
             ),
             "",
         )
@@ -4090,6 +4100,9 @@ def cochange_history(home: Path, root: str) -> list[list[str]]:
 def owned_claims(home: Path, root: str, display: str) -> set[str] | None:
     """Returns every claim identifier a lane currently owns.
 
+    A lane in a running trial holds that trial's claim for it, so its records
+    and review rounds correlate with the trial issue.
+
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
@@ -4113,10 +4126,16 @@ def owned_claims(home: Path, root: str, display: str) -> set[str] | None:
         for name, participant in manifest["participants"].items()
         if participant["display"] == display
     ]
-    return {
+    owned = {
         str(record["claim_id"])
         for record in ledger["issues"].values()
         if record.get("owner") in names and record.get("claim_id")
+    }
+    return owned | {
+        str(entry["claim_id"])
+        for record in ledger["issues"].values()
+        for lane, entry in trials.running(record).get("lanes", {}).items()
+        if lane in names and entry.get("claim_id")
     }
 
 
