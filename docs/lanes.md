@@ -229,9 +229,13 @@ mailed to the builder; the builder never reads the reviewer's transcript.
 
 The claim stays with the builder throughout. Each claim gets at most three
 rounds, one open at a time; a fourth request is refused with "open the pull
-request or ask the operator". The cap is not configurable. `issue show` and
-`participant show` print each round with its reviewer, round number and
-finding count.
+request or ask the operator". The cap is not configurable. A round left
+unanswered for two hours expires: the builder may ask again, the reviewer
+counts as idle again, late findings are refused, and the expired round does
+not count toward the cap. Returned and expired rounds are dropped from
+`reviews.json` a week after they finish. `issue show` and `participant show`
+print each round with its reviewer, round number and finding count, or
+`open` or `expired`.
 
 ## Integrating one lane
 

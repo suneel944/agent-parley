@@ -16,6 +16,13 @@ cap is fixed rather than configurable, because returning findings to the
 same builder only pays while rounds converge; past it the builder opens the
 pull request or asks the operator.
 
+An open round expires `OPEN_SECONDS` after it was requested. A reviewer that
+dies or never answers would otherwise refuse the builder's next request and
+count as busy forever. An expired round frees both lanes, refuses late
+findings, and does not count toward the cap, since it returned nothing.
+Finished rounds, returned or expired, are dropped `KEPT_SECONDS` after they
+finished, so the record stays bounded the way ``followups.json`` is.
+
 Rounds live in `RECORD_NAME` beside the issue ledger, under `LOCK_NAME`, and
 hold no credential. Request and findings text is peer content.
 """
@@ -37,6 +44,9 @@ MAX_PATHS = 15
 MAX_PATH = 300
 OPEN = "open"
 RETURNED = "returned"
+EXPIRED = "expired"
+OPEN_SECONDS = 2 * 3600.0
+KEPT_SECONDS = 7 * 24 * 3600.0
 LOCK_SECONDS = 5.0
 BULLETS = ("- ", "* ", "+ ")
 
@@ -59,6 +69,36 @@ def _read(directory: Path) -> dict:
     if not isinstance(value.get("next"), int):
         value["next"] = len(value["rounds"]) + 1
     return value
+
+
+def _expired(entry: dict, now: float) -> bool:
+    """Tells whether an open round passed its deadline.
+
+    Args:
+        entry: Recorded round.
+        now: Unix time.
+
+    Returns:
+        True when the round is open and older than `OPEN_SECONDS`.
+    """
+    requested = float(entry.get("requested") or 0.0)
+    return entry.get("state") == OPEN and now - requested > OPEN_SECONDS
+
+
+def _tidy(record: dict, now: float) -> None:
+    """Expires overdue open rounds and drops long-finished ones in place.
+
+    Args:
+        record: Round record `_read` returned.
+        now: Unix time.
+    """
+    for ident, entry in list(record["rounds"].items()):
+        if _expired(entry, now):
+            entry["state"] = EXPIRED
+            entry["returned"] = now
+        finished = float(entry.get("returned") or 0.0)
+        if entry.get("state") != OPEN and now - finished > KEPT_SECONDS:
+            del record["rounds"][ident]
 
 
 def _paths(value: object) -> list[str]:
@@ -224,12 +264,14 @@ def request(
     if len(branch) > MAX_BRANCH:
         raise BridgeError(f"The branch is longer than {MAX_BRANCH}.")
     listed = _paths(paths)
+    now = now or time.time()
     with lock(directory / LOCK_NAME, timeout=LOCK_SECONDS):
         record = _read(directory)
+        _tidy(record, now)
         held = [
             entry
             for entry in record["rounds"].values()
-            if entry.get("claim_id") == claim
+            if entry.get("claim_id") == claim and entry.get("state") != EXPIRED
         ]
         waiting = [entry for entry in held if entry.get("state") == OPEN]
         if waiting and key and waiting[0].get("key") == key:
@@ -278,7 +320,7 @@ def request(
             "paths": listed,
             "key": key,
             "state": OPEN,
-            "requested": now or time.time(),
+            "requested": now,
             "returned": 0.0,
             "findings": 0,
         }
@@ -302,20 +344,23 @@ def withdraw(directory: Path, ident: str) -> None:
             write_json(directory / RECORD_NAME, record)
 
 
-def pending(directory: Path, ident: object, reviewer: str) -> dict:
+def pending(
+    directory: Path, ident: object, reviewer: str, now: float = 0.0
+) -> dict:
     """Returns the open round a reviewer may answer.
 
     Args:
         directory: Private project state directory.
         ident: Round identifier from the recipients.
         reviewer: Lane sending the findings.
+        now: Unix time; the clock when zero.
 
     Returns:
         The open round.
 
     Raises:
-        BridgeError: If the round is unknown, already answered or offered
-            to another lane.
+        BridgeError: If the round is unknown, already answered, expired or
+            offered to another lane.
     """
     entry = _read(directory)["rounds"].get(str(ident))
     if entry is None:
@@ -323,6 +368,11 @@ def pending(directory: Path, ident: object, reviewer: str) -> dict:
     if entry.get("reviewer") != reviewer:
         raise BridgeError(
             f"Review round {ident} was offered to {entry.get('reviewer')}."
+        )
+    if entry.get("state") == EXPIRED or _expired(entry, now or time.time()):
+        raise BridgeError(
+            f"Review round {ident} expired unanswered; the builder may ask "
+            "for a new round."
         )
     if entry.get("state") != OPEN:
         raise BridgeError(f"Review round {ident} already returned findings.")
@@ -347,13 +397,15 @@ def returned(
     Raises:
         BridgeError: If the round cannot be answered by this lane.
     """
+    now = now or time.time()
     with lock(directory / LOCK_NAME, timeout=LOCK_SECONDS):
-        pending(directory, ident, reviewer)
+        pending(directory, ident, reviewer, now)
         record = _read(directory)
         entry = record["rounds"][ident]
         entry["state"] = RETURNED
-        entry["returned"] = now or time.time()
+        entry["returned"] = now
         entry["findings"] = count(findings)
+        _tidy(record, now)
         write_json(directory / RECORD_NAME, record)
     return entry
 
@@ -395,7 +447,7 @@ def lines(rows: list[dict]) -> list[str]:
         result = (
             f"{entry['findings']} findings"
             if entry.get("state") == RETURNED
-            else "open"
+            else str(entry.get("state") or OPEN)
         )
         shown.append(
             f"Review {entry['id']}: #{entry['issue']} round "
@@ -427,7 +479,8 @@ def offer_text(entry: dict, note: str) -> tuple[str, str]:
         + (f"Paths:{listed}\n\n" if listed else "")
         + "Return one findings report, at most "
         f"{REPORT_BYTES} bytes, one finding per bullet line, with "
-        f'send_message to ["{ADDRESS}", "{entry["id"]}"].'
+        f'send_message to ["{ADDRESS}", "{entry["id"]}"]. The round expires '
+        f"unanswered after {int(OPEN_SECONDS // 3600)} hours."
     )
     return subject, body
 

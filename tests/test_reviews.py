@@ -176,5 +176,42 @@ def test_no_idle_lane_records_nothing(bridge, lanes):
     assert reviews.rounds(lanes["directory"]) == []
 
 
+def direct(directory, key, now, candidates=("codex",)):
+    """Records a round for claim c1 through the module at a fixed time."""
+    return reviews.request(
+        directory,
+        builder="claude",
+        issue="7",
+        claim="c1",
+        branch="feat/7-retry",
+        paths=[],
+        candidates=list(candidates),
+        providers={"claude": "claude", "codex": "codex"},
+        key=key,
+        now=now,
+    )
+
+
+def test_an_unanswered_round_expires_and_frees_both_lanes(tmp_path):
+    first = direct(tmp_path, "ask-1", 1000.0)
+    late = 1000.0 + reviews.OPEN_SECONDS + 1
+    with pytest.raises(BridgeError, match="expired unanswered"):
+        reviews.pending(tmp_path, first["id"], "codex", now=late)
+    second = direct(tmp_path, "ask-2", late)
+    assert second["reviewer"] == "codex"
+    assert second["round"] == 1
+    states = {row["id"]: row["state"] for row in reviews.rounds(tmp_path)}
+    assert states == {first["id"]: reviews.EXPIRED, second["id"]: reviews.OPEN}
+    assert reviews.lines(reviews.rounds(tmp_path))[0].endswith("; expired")
+
+
+def test_finished_rounds_are_dropped_after_the_retention_window(tmp_path):
+    first = direct(tmp_path, "ask-1", 1000.0)
+    reviews.returned(tmp_path, first["id"], "codex", "- one", now=1100.0)
+    later = 1100.0 + reviews.KEPT_SECONDS + 1
+    second = direct(tmp_path, "ask-2", later)
+    assert [row["id"] for row in reviews.rounds(tmp_path)] == [second["id"]]
+
+
 def test_count_reads_bullets_and_numbered_lines():
     assert reviews.count("- a\n* b\n+ c\n1. d\nprose\n12. e") == 5
