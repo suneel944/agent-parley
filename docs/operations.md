@@ -2973,7 +2973,10 @@ permission rule such as `Bash(git push:*)`, and, when the lane holds a claim,
 same claim with the same command, refreshes that decision instead of opening
 a second one. While it is open the supervisor defers the lane's wakes under
 `permission denied` rather than asking it for a turn that would meet the
-same refusal; the answer reaches the lane as supervisor mail, like any other
+same refusal. The hold ends once the lane completes a later tool call, which
+shows it moved past the refused step; the decision itself stays open, and the
+same refusal again holds the lane once more. The answer reaches the lane as
+supervisor mail, like any other
 answer, and the lane or the operator carries it out. The decision is
 irreversible, so every option takes the `confirm` tap and no timeout ever
 applies a default to it. Nothing retries, rewords or works around the
