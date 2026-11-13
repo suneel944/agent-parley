@@ -1857,10 +1857,12 @@ withheld.
 
 The bundle can hold only what coordination still keeps. Each issue keeps its
 newest 50 history entries, closed pull requests are kept for 30 days, and each
-lane's report log keeps its newest 2000 records. The bundle's `horizons` field
-names each cap with its limit and unit, and marks it `exceeded` when records
-older than the oldest one kept may have fallen inside the window, so the
-bundle can be missing records there.
+lane's report log keeps its newest 2000 records that fit under 262144 bytes;
+past that size it is trimmed to half of it, so long reports leave far fewer
+than 2000. The bundle's `horizons` field names each cap with its limit and
+unit, plus the byte bound for the report log, and marks it `exceeded` when
+records older than the oldest one kept may have fallen inside the window, so
+the bundle can be missing records there.
 
 The chain proves the bundle is consistent, not who wrote it. `--sign KEY` signs
 the bundle with an existing SSH key through `ssh-keygen -Y sign` under the

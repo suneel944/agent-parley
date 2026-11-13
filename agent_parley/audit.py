@@ -317,8 +317,11 @@ def horizons(
 
     Coordination keeps a bounded history: the newest `lifecycle.MAX_HISTORY`
     entries per issue, `supervision.PULL_REQUEST_HISTORY_SECONDS` of closed
-    pull requests, and the newest `metrics.MAX_REPORT_RECORDS` records per
-    lane's report log. A cap counts as exceeded when records older than the
+    pull requests, and per lane's report log the newest
+    `metrics.MAX_REPORT_RECORDS` records that fit under
+    `metrics.MAX_REPORT_LOG_BYTES`. A report log counts as trimmed when it
+    holds the record cap or at least half the byte cap, the size a byte
+    trim leaves. A cap counts as exceeded when records older than the
     oldest one kept may have fallen inside the window, so a reader knows
     the bundle can be missing records there.
 
@@ -340,10 +343,15 @@ def horizons(
     report_records = False
     for name in manifest["participants"]:
         kept = metrics.report_records(directory, name)
-        if (
+        try:
+            size = metrics.report_path(directory, name).stat().st_size
+        except OSError:
+            size = 0
+        trimmed = (
             len(kept) >= metrics.MAX_REPORT_RECORDS
-            and float(kept[0].get("at") or 0) > since
-        ):
+            or size >= metrics.MAX_REPORT_LOG_BYTES // 2
+        )
+        if kept and trimmed and float(kept[0].get("at") or 0) > since:
             report_records = True
     window = supervision.PULL_REQUEST_HISTORY_SECONDS
     return {
@@ -360,6 +368,7 @@ def horizons(
         "report_records": {
             "limit": metrics.MAX_REPORT_RECORDS,
             "unit": "records per lane",
+            "bytes": metrics.MAX_REPORT_LOG_BYTES,
             "exceeded": report_records,
         },
     }

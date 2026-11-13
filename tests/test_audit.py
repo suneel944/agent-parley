@@ -8,7 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import audit, cli, issues, lifecycle, reviews, supervision
+from agent_parley import (
+    audit,
+    cli,
+    issues,
+    lifecycle,
+    metrics,
+    reviews,
+    supervision,
+)
 from agent_parley.cli import git
 from agent_parley.state import BridgeError, write_json
 
@@ -243,19 +251,43 @@ def test_scrub_drops_key_only_as_a_whole_name_part():
     }
 
 
-def test_a_lone_surrogate_exports_and_verifies(tmp_path):
-    records = audit.chain([("report", {"summary": "half \ud800 pair"})])
-    path = tmp_path / "audit.json"
-    path.write_text(
-        json.dumps(
-            {
-                "kind": audit.KIND,
-                "records": records,
-                "head": records[-1]["hash"],
-            }
-        )
+def test_a_lone_surrogate_exports_and_verifies(
+    bridge, repo, paired, worked, tmp_path, monkeypatch, capsys
+):
+    directory = worked["directory"]
+    ledger = issues.snapshot(directory)
+    record = ledger["issues"]["42"]
+    lifecycle.append_history(
+        record,
+        {
+            "action": "resolve",
+            "actor": "operator",
+            "at": record["history"][-1]["at"],
+            "outcome": "complete",
+            "summary": "half \ud800 pair",
+        },
     )
-    assert audit.verify(path)["head"] == records[-1]["hash"]
+    write_json(directory / "issues.json", ledger)
+    output = tmp_path / "audit.json"
+    bundle, _ = export(monkeypatch, capsys, bridge, repo, output)
+    assert "half \\ud800 pair" in json.dumps(bundle["records"])
+    status, printed = verify(monkeypatch, capsys, output)
+    assert status == 0, printed
+
+
+def test_report_log_trimmed_by_bytes_counts_as_exceeded(tmp_path):
+    directory = tmp_path / "state"
+    directory.mkdir()
+    for _ in range(100):
+        metrics.record_report(directory, "claude", {"summary": "x" * 4000})
+    kept = metrics.report_records(directory, "claude")
+    assert len(kept) < metrics.MAX_REPORT_RECORDS
+    manifest = {"participants": {"claude": {}}}
+    stated = audit.horizons(directory, manifest, 0, kept[-1]["at"])
+    assert stated["report_records"]["exceeded"] is True
+    assert stated["report_records"]["bytes"] == metrics.MAX_REPORT_LOG_BYTES
+    later = audit.horizons(directory, manifest, kept[0]["at"], kept[-1]["at"])
+    assert later["report_records"]["exceeded"] is False
 
 
 def test_bundle_states_each_retention_horizon(
