@@ -24,6 +24,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `mail` | Operator mail: steering a lane, acknowledgements, the mailbox, and recorded decisions |
 | `reports` | Ready reports, their review, the event export, the state archive and ownership history |
 | `status` | The `status`, `problems` and `doctor` readings, lane liveness and the per-lane status rows |
+| `updates` | The once-a-day newer-release check `doctor` and `status` print on standard error: PyPI's `info.version` read with a 2-second timeout, numeric release comparison, the upgrade command for the detected installer (uv tool, pipx or pip) and the `AGENT_PARLEY_NO_UPDATE_CHECK` opt-out; never called from a hook or the service poll |
 | `problems` | Every condition an operator should act on, derived from one status reading, each with a command to paste or the actor already handling it |
 | `launch` | Native launch of a lane: registration, the coordination protocol, the lane hooks and the supervised native client; with `run --issue`, the claim and the opening digest of that issue, its quoted text held to `ISSUE_BUDGET` (6000 bytes) from `forge.issue_details` |
 | `terminal` | The launcher-owned native pseudo-terminal, its private wake control socket, removal of wake sockets no launcher listens on, and the lane-first tab title |
@@ -1042,6 +1043,7 @@ Files at the state root, grouped by the module that owns them:
 | `quota` | `quotas.json` (the quota window recorded per credential profile) under `quotas.lock` |
 | `supervision`, `terminal` | `supervision.json` (global supervision settings, including the wake opt-out) |
 | `terminal` | `wake-<digest>.sock`, one control socket per project lane |
+| `updates` | `update-check.json` (when the package index was last asked and its answer, empty after a failure) |
 
 Files in `projects/<key>/`, grouped the same way:
 
