@@ -301,9 +301,8 @@ def test_doctor_names_a_recorded_opt_in_the_cli_cannot_carry(
     ]
     assert approvals["state"] == protocol.SETUP_GAP
     assert approvals["remedy"] == (
-        "the CLI cannot carry all of the recorded bridge tool approval, so "
-        f"resume these lanes in your own terminal: {paired['root']} amper, "
-        f"{paired['root']} codex"
+        "the CLI cannot carry the recorded bridge tool approval, so "
+        f"resume these lanes in your own terminal: {paired['root']} amper"
     )
 
 

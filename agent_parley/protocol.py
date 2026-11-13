@@ -145,6 +145,30 @@ def cli_rules() -> list[str]:
     return [cli_rule()]
 
 
+def copilot_rule() -> str:
+    """Returns the Copilot CLI tool allow for this bridge's own CLI.
+
+    `--allow-tool` takes the shell tool with the command it allows, so a
+    `copilot` lane runs `cli_command` without a shell permission prompt and
+    every other shell command still asks.
+
+    Returns:
+        A `shell` tool pattern spelled from the same string the prompt
+        prints.
+    """
+    return f"shell({cli_command()})"
+
+
+SHELL_ALLOW = frozenset({"claude", "copilot"})
+"""Adapters whose launch pre-approves `cli_command` as a shell command.
+
+A `claude` lane gets `cli_rule` in its permission settings and a `copilot`
+lane gets `copilot_rule` on its command line, both once the operator opts
+in. The other adapters' approvals reach the `agent_parley` MCP tools alone,
+so a notice to one of their lanes names an MCP tool where one exists.
+"""
+
+
 def manifests(root: Path) -> dict[str, Path]:
     """Locates the shipped plugin manifest of each supported client."""
     return {

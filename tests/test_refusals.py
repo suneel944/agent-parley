@@ -25,6 +25,8 @@ def rendered(node: ast.expr) -> list[str]:
             pieces = (
                 rendered(part)
                 if isinstance(part, ast.Constant)
+                else ["agent-parley"]
+                if "cli_command" in ast.unparse(part)
                 else [PLACEHOLDER]
             )
             texts = [text + piece for text in texts for piece in pieces]

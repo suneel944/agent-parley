@@ -11,7 +11,7 @@ import contextlib
 import time
 from pathlib import Path
 
-from agent_parley import BridgeError, recommend
+from agent_parley import BridgeError, protocol, recommend
 from agent_parley.reports import ReportsMixin
 
 FORGE_MARKS = "forge-assigned.json"
@@ -945,10 +945,10 @@ class ClaimsMixin(ReportsMixin):
                 f"The operator asks you to hand issue #{issue} to "
                 f"{request['to']}.",
                 f"Reason: {request['reason'] or 'none given'}",
-                f"Authorize it with: agent-parley issue accept {issue} "
-                f"--offer-id {request['id']}",
-                f"Refuse it with: agent-parley issue decline {issue} "
-                f"--offer-id {request['id']}",
+                f"Authorize it with: `{protocol.cli_command()} issue accept "
+                f"{issue} --offer-id {request['id']}`",
+                f"Refuse it with: `{protocol.cli_command()} issue decline "
+                f"{issue} --offer-id {request['id']}`",
                 "You keep the issue until you authorize the handoff, and "
                 f"{request['to']} owns it only after accepting the offer "
                 "your authorization creates.",

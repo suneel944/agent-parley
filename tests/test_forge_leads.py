@@ -388,7 +388,7 @@ def test_three_waiting_lanes_get_three_distinct_next_leads(
     for name, offer in offers.items():
         assert offer["kind"] == "continue"
         assert (
-            f"claim #{offer['lead']}, the top `issue next` candidate, with "
+            f"claim #{offer['lead']}, the top `next_issues` candidate, with "
             f"`{protocol.cli_command()} issue claim {offer['lead']}` "
             "before exploring or editing it" in offer["text"]
         )

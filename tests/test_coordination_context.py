@@ -365,8 +365,8 @@ def test_a_cli_call_the_pre_approval_cannot_match_is_refused(tmp_path, command):
     assert "alone" in text
     assert protocol.cli_command() in text
     assert "Only that plain form is pre-approved" not in text
-    assert "Only a `claude` lane gets a shell allow rule" in text
-    assert "other CLIs get no shell allow rule" in text
+    assert "Only `claude` and `copilot` lanes get a shell allow" in text
+    assert "use an agent_parley MCP tool where one covers" in text
 
 
 @pytest.mark.parametrize(

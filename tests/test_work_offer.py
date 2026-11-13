@@ -2058,7 +2058,7 @@ def test_a_waiting_lane_answers_peer_mail_before_new_work():
 
 def test_a_waiting_lane_is_pointed_at_the_top_next_candidate():
     text = waiting_offer(WAITING, {**NO_LEADS, "next": "7"})["text"]
-    assert "claim #7, the top `issue next` candidate" in text
+    assert "claim #7, the top `next_issues` candidate" in text
     assert f"`{protocol.cli_command()} issue claim 7`" in text
     assert "agent-parley issue" not in text
     assert "retire" not in text
@@ -2154,7 +2154,7 @@ def test_a_capped_lane_is_told_its_cap_instead_of_a_claim():
     text = waiting_offer(WAITING, {**NO_LEADS, "capped": ["2", "3"]})["text"]
     assert "You hold 2 claims counted against max_claims_per_lane" in text
     assert "(#2, #3)" in text
-    assert "agent-parley issue offer" in text
+    assert f"`{protocol.cli_command()} issue offer`" in text
     assert "retire" not in text
     assert "issue claim" not in text
 

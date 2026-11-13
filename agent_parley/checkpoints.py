@@ -2259,11 +2259,12 @@ def hazard(
         return Reason.CHAINED_CLI, (
             f"Run each Agent Parley CLI command alone, as `{command} ARGS` "
             "from your worktree: no variable, `cd`, `;`, `&&`, `|`, "
-            "redirect or second command in the same call. Only a `claude` "
-            "lane gets a shell allow rule, once the operator opts in, and it "
-            "matches that plain form alone, so this call would wait on a "
-            "permission prompt; other CLIs get no shell allow rule and "
-            "prompt for either form. Change directory or filter output in a "
+            "redirect or second command in the same call. Only `claude` and "
+            "`copilot` lanes get a shell allow for it, once the operator "
+            "opts in, and it matches that plain form alone, so this call "
+            "would wait on a permission prompt; other CLIs get none and "
+            "prompt for either form, so use an agent_parley MCP tool where "
+            "one covers the step. Change directory or filter output in a "
             "separate call."
         )
     if exempt(payload):

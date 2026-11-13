@@ -272,14 +272,21 @@ adapter by name, so the opt-in remedy a warning or `doctor` names offers
 
 Hook notices tell a lane to run the bridge CLI in its pre-approved form,
 `python -P -m agent_parley.cli`, under the interpreter that installed the
-bridge. Only a `claude` lane gets a shell allow rule for that form, the
-`Bash(... -m agent_parley.cli *)` entry in `permissions.allow`. The other
-adapters' approvals above reach the `agent_parley` MCP tools alone; this
-repository confirms no shell allow format for them, so the launch passes
-none. A recorded opt-in on such a lane is reported on standard error at
-launch and under `approvals` in `doctor`: a resume may stop at a shell
-permission prompt when the lane runs the bridge CLI, and the remedy is to
-answer it in your own terminal with `agent-parley run NAME --resume`.
+bridge. With the opt-in recorded, two adapters also pre-approve that form:
+
+| Adapter | Shell allow for the bridge CLI |
+| --- | --- |
+| `claude` | `Bash(... -m agent_parley.cli *)` in `permissions.allow` |
+| `copilot` | `--allow-tool 'shell(... -m agent_parley.cli)'` |
+
+On `codex`, `gemini` and `opencode` the approval reaches the `agent_parley`
+MCP tools alone, so notices name an MCP tool where one covers the step, such
+as `next_issues` for the ranked shortlist. Issue transitions and `status`
+have no MCP tool, so a notice still names the CLI for them, and a lane on
+these adapters may stop at a shell permission prompt when it runs one. The
+launch names that on standard error; `doctor` reads such a lane as approved,
+because no setup the operator records can close it. Answer the prompt in
+your own terminal with `agent-parley run NAME --resume`.
 
 Each preset names one configuration-home variable. A credential profile's
 `--config-home` is applied to that variable for the launch, which is what makes

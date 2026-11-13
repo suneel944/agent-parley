@@ -18,6 +18,7 @@ from agent_parley import (
     issues,
     lanes,
     process,
+    protocol,
     roster,
     server,
     state,
@@ -1586,15 +1587,29 @@ def test_a_recorded_opt_in_an_adapter_cannot_carry_is_named(bridge, adapter):
     assert not supervision.opt_in_unsupported(bridge.home, manifest, "lane")
     manifest["supervision"] = {dialogs.PRE_APPROVE: True}
     warning = supervision.opt_in_unsupported(bridge.home, manifest, "lane")
-    if adapter == "claude":
+    if roster.APPROVAL[adapter] is not None:
         assert warning == ""
     else:
         assert warning.startswith(f"lane is a {adapter} lane with a bridge")
         assert "agent-parley run lane --resume" in warning
-    shell = "no shell allow rule for this bridge's CLI" in warning
-    assert shell is (
-        adapter != "claude" and roster.APPROVAL[adapter] is not None
-    )
+
+
+@pytest.mark.parametrize("adapter", roster.ADAPTERS)
+def test_a_shell_gap_is_named_only_where_no_cli_allow_reaches_the_lane(
+    bridge, adapter
+):
+    manifest = {"participants": {"lane": {"provider": adapter}}}
+    assert not supervision.opt_in_shell_gap(bridge.home, manifest, "lane")
+    manifest["supervision"] = {dialogs.PRE_APPROVE: True}
+    gap = supervision.opt_in_shell_gap(bridge.home, manifest, "lane")
+    carried = roster.APPROVAL[adapter] is not None
+    allowed = adapter in protocol.SHELL_ALLOW
+    assert bool(gap) is (carried and not allowed)
+    if gap:
+        assert gap.startswith(f"lane is a {adapter} lane with a bridge")
+        assert "name an MCP tool where one exists" in gap
+        assert "agent-parley run lane --resume" in gap
+    assert allowed is (adapter in {"claude", "copilot"})
 
 
 @pytest.mark.parametrize("adapter", roster.ADAPTERS)
@@ -1632,11 +1647,10 @@ def test_a_codex_release_without_the_server_approval_is_named(
     warning = supervision.opt_in_unsupported(
         bridge.home, manifest, "lane", version
     )
-    assert warning
+    assert bool(warning) is named
     assert (
         "predates the per-server tool approval codex 0.153.0" in warning
     ) is named
-    assert ("no shell allow rule" in warning) is not named
 
 
 def test_operator_stop_holds_until_the_next_launch(

@@ -381,7 +381,7 @@ def test_an_opted_in_gemini_lane_trusts_only_the_bridge_server(
     assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
     err = capsys.readouterr().err
     assert "no bridge tool approval is recorded" not in err
-    assert "the launch gives gemini no shell allow rule" in err
+    assert "gemini takes no shell allow rule" in err
     servers = json.loads(lane["overlay"].read_text())["mcpServers"]
     assert servers["agent_parley"]["trust"] is True
     assert servers["docs"] == {"command": "docs-mcp"}

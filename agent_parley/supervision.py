@@ -212,10 +212,12 @@ OPT_IN_UNSUPPORTED = (
 )
 OPT_IN_SHELL_GAP = (
     "{name} is a {adapter} lane with a bridge tool approval recorded, which "
-    "reaches only its agent_parley MCP tools: the launch gives {adapter} no "
-    "shell allow rule for this bridge's CLI, so a resume may stop at a "
-    "shell permission prompt when the lane runs it; answer it in your own "
-    "terminal with `agent-parley run {name} --resume`."
+    "reaches only its agent_parley MCP tools: {adapter} takes no shell allow "
+    "rule the launch could pass for this bridge's CLI, so its notices name "
+    "an MCP tool where one exists, and a resume may stop at a shell "
+    "permission prompt when the lane runs a bridge command no MCP tool "
+    "covers; answer it in your own terminal with "
+    "`agent-parley run {name} --resume`."
 )
 WORKING = "working"
 WAITING = "waiting"
@@ -3133,7 +3135,7 @@ def _continue_text(
     if leads.get("next"):
         number = leads["next"]
         steps.append(
-            f"claim #{number}, the top `issue next` candidate, with "
+            f"claim #{number}, the top `next_issues` candidate, with "
             f"`{protocol.cli_command()} issue claim {number}` before "
             "exploring or editing it"
         )
@@ -3150,7 +3152,7 @@ def _continue_text(
             f" You hold {len(counted)} claims counted against "
             f"max_claims_per_lane ({named}), so no new claim can be taken: "
             "release a claim whose work already merged, or offer one with "
-            "agent-parley issue offer; otherwise end the turn."
+            f"`{protocol.cli_command()} issue offer`; otherwise end the turn."
         )
     if steps:
         listed = "; then ".join(steps)
@@ -3175,8 +3177,8 @@ def _continue_text(
         )
     return (
         f"No held claim can move now.{said} Nothing else needs this lane: "
-        "no peer mail asks for an answer, agent-parley issue next has no "
-        "candidate and no peer claim is stalled. Retire with the retire MCP "
+        "no peer mail asks for an answer, the `next_issues` MCP tool has "
+        "no candidate and no peer claim is stalled. Retire with the retire MCP "
         "tool, per the coordinate skill, instead of answering with a status "
         "line."
     )
@@ -3910,10 +3912,7 @@ def opt_in_unsupported(
     An adapter `roster.APPROVAL` gives no way to carry the opt-in, and a
     `codex` client older than `roster.CODEX_APPROVAL_RELEASE`, would start
     without it, so the operator's recorded choice would change nothing.
-    Only a `claude` lane also gets a shell allow rule for this bridge's
-    CLI, so on any other adapter the approval reaches the MCP tools alone
-    and a resume may still stop at a shell prompt. This names either
-    limitation instead of leaving it silent.
+    This names that limitation instead of leaving it silent.
 
     Args:
         home: Private bridge state root.
@@ -3924,9 +3923,8 @@ def opt_in_unsupported(
             release unjudged.
 
     Returns:
-        `OPT_IN_UNSUPPORTED` or `OPT_IN_SHELL_GAP` filled in for the lane,
-        or an empty string when no approval is recorded or its adapter
-        carries all of it.
+        `OPT_IN_UNSUPPORTED` filled in for the lane, or an empty
+        string when no approval is recorded or its adapter carries it.
     """
     participant = (manifest.get("participants") or {}).get(name) or {}
     if not dialogs.pre_approved(manifest, name):
@@ -3949,11 +3947,44 @@ def opt_in_unsupported(
             f"codex {version or 'of unknown release'} predates the "
             f"per-server tool approval codex {release} reads"
         )
-    elif adapter != "claude":
-        return OPT_IN_SHELL_GAP.format(name=name, adapter=adapter)
     else:
         return ""
     return OPT_IN_UNSUPPORTED.format(name=name, adapter=adapter, limit=limit)
+
+
+def opt_in_shell_gap(home: Path, manifest: dict, name: str) -> str:
+    """Explains why a recorded approval leaves a lane's shell unapproved.
+
+    A `claude` or `copilot` lane gets a shell allow for `protocol.cli_command`
+    with its bridge tool approval, as `protocol.SHELL_ALLOW` records. Any
+    other adapter that carries the approval reaches the MCP tools alone, so
+    its notices name an MCP tool where one exists and a bridge command no
+    tool covers may still stop at a shell prompt. The gap is the adapter's,
+    not a setup the operator can complete, so it is reported at launch
+    rather than as a setup gap.
+
+    Args:
+        home: Private bridge state root.
+        manifest: Project manifest as the roster reports it.
+        name: Participant that owns the lane.
+
+    Returns:
+        `OPT_IN_SHELL_GAP` filled in for the lane, or an empty string when
+        no approval is recorded, its adapter carries none or its adapter
+        also allows the bridge's CLI.
+    """
+    participant = (manifest.get("participants") or {}).get(name) or {}
+    if not dialogs.pre_approved(manifest, name):
+        return ""
+    try:
+        adapter = roster.provider(home, participant.get("provider", name))[
+            "adapter"
+        ]
+    except BridgeError:
+        return ""
+    if roster.APPROVAL.get(adapter) is None or adapter in protocol.SHELL_ALLOW:
+        return ""
+    return OPT_IN_SHELL_GAP.format(name=name, adapter=adapter)
 
 
 def opt_in_remedy(adapter: str) -> str:
@@ -5928,7 +5959,7 @@ def orphan_remedy(issue: str, root: str, peer: bool) -> str:
         choice of starting a lane that takes the claim or releasing it,
         since a remedy naming a lane that does not exist moves nothing.
     """
-    take = f"agent-parley issue claim {issue} --take-orphaned"
+    take = f"`{protocol.cli_command()} issue claim {issue} --take-orphaned`"
     if peer:
         return f"a peer lane runs {take}"
     repo = f"--repo {shlex.quote(str(root))}"
@@ -6005,7 +6036,7 @@ def orphan_decision(
         return
     root = manifest["root"]
     listed = ", ".join(f"#{number}" for number in numbers)
-    take = "agent-parley issue claim NUMBER --take-orphaned"
+    take = f"{protocol.cli_command()} issue claim NUMBER --take-orphaned"
     peer = _overdue_peer(home, directory, manifest, config, {}, name)
     choice = (
         f"{peer} is live and fits: agent-parley say {peer} "

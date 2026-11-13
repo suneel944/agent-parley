@@ -1,13 +1,16 @@
 """Checks that hook notices inject only what the lane was not yet given."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from agent_parley import (
     checkpoints,
+    convergence,
     issues,
+    merges,
     protocol,
     recommend,
     store,
@@ -204,24 +207,49 @@ def test_a_replayed_night_injects_under_half_of_a_full_resend(bridge, lanes):
         assert checkpoints.item_digest(entry) in given, entry
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        checkpoints.FULL_STATE,
-        checkpoints.OUTAGE_CHECK,
-        checkpoints.ISSUE_STATE,
-        supervision._pull_text(["7"], []),
-        supervision._rebalance_text(["7"], ["codex"]),
-        supervision._split_text("7", 3, ["codex"]),
-        recommend.render(
-            {"candidates": [{"issue": "7", "title": "", "reasons": ["free"]}]}
-        ),
-    ],
-)
-def test_every_command_a_notice_names_is_the_pre_approved_form(text):
-    command = protocol.cli_command()
-    rule = protocol.cli_rule()
-    assert rule == f"Bash({command} *)"
-    assert f"`{command} " in text
-    assert "agent-parley issue" not in text
-    assert "agent-parley status" not in text
+CONVERGENCE = {
+    "issue": "7",
+    "stage": "escalate",
+    "entry": {
+        "failures": 3,
+        "signature": "abc",
+        "repeats": 3,
+        "milestone": {"commit": ""},
+    },
+}
+LANE_FACING = {
+    "full state": lambda: checkpoints.FULL_STATE,
+    "outage": lambda: checkpoints.OUTAGE_CHECK,
+    "issue state": lambda: checkpoints.ISSUE_STATE,
+    "pull": lambda: supervision._pull_text(["7"], ["codex"]),
+    "rebalance": lambda: supervision._rebalance_text(["7"], ["codex"]),
+    "split": lambda: supervision._split_text("7", 3, ["codex"]),
+    "continue": lambda: supervision._continue_text(
+        {"issues": {}},
+        [],
+        [],
+        {"next": "7", "stalled": {"issue": "8", "owner": "a"}},
+    ),
+    "capped": lambda: supervision._continue_text(
+        {"issues": {}}, [], [], {"capped": ["9"]}
+    ),
+    "retire": lambda: supervision._continue_text({"issues": {}}, [], [], {}),
+    "orphan remedy": lambda: supervision.orphan_remedy("7", "/r", True),
+    "convergence": lambda: convergence.message(CONVERGENCE)[1],
+    "dependency": lambda: merges.dependency_refusal(
+        {"issues": {"7": {"blocked_by": ["8"]}, "8": {"owner": "a"}}},
+        "7",
+        set(),
+    ),
+    "recommend": lambda: recommend.render(
+        {"candidates": [{"issue": "7", "title": "", "reasons": ["free"]}]}
+    ),
+}
+
+
+@pytest.mark.parametrize("builder", LANE_FACING.values(), ids=LANE_FACING)
+def test_a_lane_facing_notice_names_no_bare_bridge_command(builder):
+    text = builder()
+    assert text
+    assert not re.search(r"(?<![\w/.-])agent-parley (issue|status)\b", text)
+    assert protocol.cli_command() in text or "next_issues" in text

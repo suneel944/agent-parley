@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, issues, lifecycle, plan, retries
+from agent_parley import cli, issues, lifecycle, plan, protocol, retries
 from agent_parley.cli import git
 from agent_parley.state import BridgeError
 
@@ -225,14 +225,15 @@ def test_unowned_selection_names_its_holder_and_the_next_command(tmp_path):
     assert str(held.value) == (
         "Issue #9 is not owned by codex; claude owns it. codex owns #11."
     )
-    assert held.value.next_command == "agent-parley issue request 9"
+    command = protocol.cli_command()
+    assert held.value.next_command == f"{command} issue request 9"
 
     with pytest.raises(BridgeError) as free:
         issues.exact_claim(tmp_path, "codex", "12")
     assert str(free.value) == (
         "Issue #12 is not owned by codex; it is unclaimed. codex owns #11."
     )
-    assert free.value.next_command == "agent-parley issue claim 12"
+    assert free.value.next_command == f"{command} issue claim 12"
 
 
 def test_old_generation_and_closed_pull_request_cannot_complete_new_claim(

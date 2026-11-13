@@ -915,9 +915,12 @@ class StatusMixin(BridgeCore):
             not. The `approvals` component names each lane
             `supervision.opt_in_missing` reports as a setup gap, and each
             lane whose recorded opt-in `supervision.opt_in_unsupported` says
-            its CLI cannot carry in full, each with the opt-in remedy its
-            adapter accepts; it is the operator's choice, so it leaves
-            the set consistent. The
+            its CLI cannot carry, each with the opt-in remedy its adapter
+            accepts; it is the operator's choice, so it leaves the set
+            consistent. A recorded opt-in its adapter carries reads as
+            approved even where `supervision.opt_in_shell_gap` names a
+            bridge command no MCP tool covers, because no operator setup
+            closes that adapter's gap; the launch names it instead. The
             `dialogs` component names each lane `dialogs.drift` reports,
             a client newer than its recorded dialog matchers or a dialog
             none of them read, as a matcher drift that also leaves the set
@@ -1130,8 +1133,8 @@ class StatusMixin(BridgeCore):
         ]
         if unsupported:
             remedies.append(
-                "the CLI cannot carry all of the recorded bridge tool "
-                "approval, so resume these lanes in your own terminal: "
+                "the CLI cannot carry the recorded bridge tool approval, so "
+                "resume these lanes in your own terminal: "
                 + ", ".join(unsupported)
             )
         components.append(
