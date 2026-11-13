@@ -18,6 +18,7 @@ from agent_parley import (
     budgets,
     collisions,
     decisions,
+    forecast,
     lanes,
     metrics,
     plan,
@@ -573,6 +574,9 @@ def _row(
         "base_advance_paths": advanced,
         "base_advance": supervision.base_advance_marker(advanced, told),
         "base_advance_told_at": told,
+        "merge_conflict": forecast.marker(
+            forecast.involving(context.get("merge_forecast") or {}, agent)
+        ),
         "event_age": (
             tables.age(time.time() - events["last_ts"])
             if events["last_ts"]
@@ -871,6 +875,7 @@ def collect(
             "inactive_after": supervised["inactive_after"],
             "operator_edits": edits if operator_edits else {},
             "base_advances": advances,
+            "merge_forecast": forecast.read(path.parent),
             "context_full_percent": supervised["context_full_percent"],
             "diffstats": (
                 _cached(
@@ -1044,7 +1049,8 @@ def notes(row: dict) -> list[str]:
 
     Returns:
         The branch drift, rejected call, stall, operator edit, base
-        advance, orphan, budget, stale plugin, fitness, work offer, failed
+        advance, predicted merge conflict, orphan, budget, stale plugin,
+        fitness, work offer, failed
         review,
         escalated dispatch and blueprint run markers the lane holds, in
         that order. The note
@@ -1065,6 +1071,7 @@ def notes(row: dict) -> list[str]:
         row["stall"],
         row["operator_edit"],
         row.get("base_advance", ""),
+        row.get("merge_conflict", ""),
         row.get("orphan", ""),
         row.get("budget_marker", ""),
         f"plugin {row['plugin_version']} stale; agent-parley run "

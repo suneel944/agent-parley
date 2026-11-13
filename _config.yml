@@ -41,6 +41,13 @@ defaults:
         Start, steer, hold, integrate and review parallel coding agent lanes,
         each working in its own Git worktree.
   - scope:
+      path: docs/merge-forecast.md
+    values:
+      title: Merge forecast
+      description: >-
+        Predict merge conflicts between parallel coding agent lanes with git
+        merge-tree and plan a landing order that avoids them.
+  - scope:
       path: docs/coordination.md
     values:
       title: Coordination
