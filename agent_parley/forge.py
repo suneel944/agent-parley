@@ -1090,33 +1090,39 @@ def _title_of(output: str | None) -> str | None:
     return title[:MAX_TITLE] if isinstance(title, str) else None
 
 
-def issue_body(repo: Path, number: str) -> str | None:
-    """Returns an issue's Markdown body on GitHub, when one is reachable.
+def issue_text(repo: Path, number: str) -> tuple[str | None, str | None]:
+    """Returns an issue's title and Markdown body in one forge reading.
 
-    The read is best effort and read only, like `issue_title`, and only a
-    claim makes it, to find the issue's acceptance criteria. Beads and the
-    null forge report absence, as does any failure of the client.
+    A claim makes this read instead of `issue_title`, so finding the
+    issue's acceptance criteria costs no client call beyond the title read.
+    On GitHub one ``gh issue view --json title,body`` answers both; Beads
+    and the null forge give the `issue_title` answer and no body. The read
+    is best effort and read only: any failure of the client reports
+    absence of both.
 
     Args:
         repo: Repository or assigned worktree that selects the forge project.
         number: Bare repository issue number.
 
     Returns:
-        The body, empty when the issue has none, or None when no GitHub
-        project answers with a usable reading.
+        The title as `issue_title` clips it, and the body, empty when the
+        issue has none; either is None when no usable reading answers.
     """
-    project = _reachable(repo) if _implementation(repo) == "github" else None
-    if project is None or not number.isdigit():
-        return None
+    if _implementation(repo) != "github":
+        return issue_title(repo, number), None
+    project = _reachable(repo)
+    if project is None:
+        return None, None
     output = _run(
-        ["gh", "issue", "view", number, "--repo", project, "--json", "body"],
+        ["gh", "issue", "view", number, "--repo", project]
+        + ["--json", "title,body"],
         15,
     )
     try:
         body = json.loads(output or "")["body"] or ""
     except (ValueError, TypeError, KeyError):
-        return None
-    return body if isinstance(body, str) else None
+        body = None
+    return _title_of(output), body if isinstance(body, str) else None
 
 
 def _beads_title(number: str) -> str | None:

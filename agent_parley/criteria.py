@@ -4,7 +4,8 @@ A claim reads the issue body once and keeps the list items of its
 ``Boundaries and acceptance criteria`` or ``Expected and actual behavior``
 section, the two headings the repository's issue templates write. Nothing
 else in the body is parsed. The list is stored on the issue's ledger record,
-delivered to the lane as a numbered list apart from the quoted issue text,
+delivered to the lane as a numbered list inside the quoted issue text, since
+it is issue-author text, with the evidence instruction outside the quote,
 and matched against the evidence lines of the lane's ready report and of the
 operator's ``issue resolve``. Evidence is one line per criterion, written
 ``N: <evidence>``, where the evidence is a command and its result, a test
@@ -27,6 +28,7 @@ HEADINGS = (
 MAX_CRITERIA = 30
 MAX_TEXT = 300
 HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.*?)\s*#*\s*$")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 ITEM = re.compile(r"^ ?(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(\S.*?)\s*$")
 EVIDENCE = re.compile(r"^\s*(\d+)(?::\s*|[.)]\s+)(\S.*?)\s*$")
 FORMAT = "N: <command and its result, test name, or why it does not apply>"
@@ -37,8 +39,11 @@ def parse(body: str) -> list[str]:
 
     Each top-level bullet or numbered item under either template heading is
     one criterion, in order; the section ends at the next heading. Prose,
-    nested items and continuation lines are not criteria. At most
-    `MAX_CRITERIA` items are kept, each cut to `MAX_TEXT` characters.
+    nested items and continuation lines are not criteria. Lines inside a
+    fenced code block (```` ``` ```` or ``~~~``) are neither headings nor
+    criteria, so a shell comment such as ``# run tests`` in a fence leaves
+    the section open. At most `MAX_CRITERIA` items are kept, each cut to
+    `MAX_TEXT` characters.
 
     Args:
         body: Markdown body of one issue.
@@ -49,7 +54,17 @@ def parse(body: str) -> list[str]:
     """
     found: list[str] = []
     inside = False
+    fence = ""
     for line in body.splitlines():
+        if marker := FENCE.match(line):
+            opened = marker.group(1)
+            if not fence:
+                fence = opened
+            elif opened.startswith(fence) and not line.strip(f" {fence[0]}"):
+                fence = ""
+            continue
+        if fence:
+            continue
         if heading := HEADING.match(line):
             inside = heading.group(1).rstrip(":").lower() in HEADINGS
         elif inside and (item := ITEM.match(line)):
@@ -115,27 +130,54 @@ def forge_outcome(evidence: dict) -> str:
 
 
 def dispatch_lines(criteria: list[str] | None, number: str) -> list[str]:
-    """Builds the dispatch lines that carry an issue's acceptance criteria.
+    """Builds the launcher's instruction about an issue's acceptance criteria.
+
+    The line is launcher text and sits outside the quoted issue text; the
+    criteria themselves are issue-author text and go inside the quote
+    (`quoted_lines`).
 
     Args:
-        criteria: Criteria recorded on the claim; empty or None when the
-            issue states none or the forge could not be read.
+        criteria: Criteria recorded on the claim; empty when the issue
+            states none, None when the forge could not read its body.
         number: Bare issue number.
 
     Returns:
-        The numbered criteria under one line saying how the ready report
-        proves them, or one line asking the lane to state its own.
+        One line saying how the ready report proves the numbered criteria,
+        or asking the lane to state its own and saying why.
+    """
+    own = (
+        "list the criteria you will prove, with the evidence for each, in "
+        "your ready report's --evidence."
+    )
+    if criteria is None:
+        return [
+            f"The forge issue body of #{number} could not be read, so its "
+            "acceptance criteria are unknown; read the issue yourself and "
+            + own
+        ]
+    if not criteria:
+        return [f"Issue #{number} states no acceptance criteria; {own}"]
+    return [
+        "The quoted issue text below ends with the issue's acceptance "
+        "criteria, numbered. The ready report "
+        f"(`{protocol.cli_command()} report --state ready`) needs one "
+        f"--evidence line per criterion, written `{FORMAT}`."
+    ]
+
+
+def quoted_lines(criteria: list[str] | None) -> list[str]:
+    """Lists the acceptance criteria for the quoted part of a dispatch.
+
+    Args:
+        criteria: Criteria recorded on the claim, or None.
+
+    Returns:
+        A heading and the numbered criteria, or no lines without criteria.
     """
     if not criteria:
-        return [
-            f"Issue #{number} states no acceptance criteria; list the "
-            "criteria you will prove, with the evidence for each, in your "
-            "ready report's --evidence."
-        ]
+        return []
     return [
-        "Acceptance criteria quoted from the issue, numbered. The ready "
-        f"report (`{protocol.cli_command()} report --state ready`) needs one "
-        f"--evidence line per criterion, written `{FORMAT}`:",
+        "Acceptance criteria:",
         *(f"{index}. {text}" for index, text in enumerate(criteria, 1)),
     ]
 

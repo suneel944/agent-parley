@@ -47,8 +47,7 @@ THREE = [
 
 def stated(monkeypatch, body):
     """Makes the forge return one fixed issue body at claim time."""
-    monkeypatch.setattr(forge, "issue_body", lambda repo, number: body)
-    monkeypatch.setattr(forge, "issue_title", lambda *args: None)
+    monkeypatch.setattr(forge, "issue_text", lambda repo, number: (None, body))
 
 
 def record(lane, number="1"):
@@ -88,22 +87,70 @@ def test_evidence_lines_match_by_number_and_a_gap_is_named():
     assert "1. The parser" not in str(refused.value)
 
 
-def test_the_dispatch_numbers_the_criteria_apart_from_the_quote():
+def test_one_client_call_reads_both_title_and_body(monkeypatch):
+    calls = []
+
+    def answer(args, timeout):
+        calls.append(args)
+        return '{"title": "T", "body": "B"}'
+
+    monkeypatch.setattr(forge, "_implementation", lambda repo: "github")
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "o/r")
+    monkeypatch.setattr(forge, "_run", answer)
+    assert forge.issue_text(Path("."), "7") == ("T", "B")
+    assert len(calls) == 1
+    assert calls[0][-2:] == ["--json", "title,body"]
+    monkeypatch.setattr(forge, "_run", lambda args, timeout: None)
+    assert forge.issue_text(Path("."), "7") == (None, None)
+
+
+def test_a_fenced_heading_neither_ends_the_section_nor_is_a_criterion():
+    body = (
+        "### Boundaries and acceptance criteria\n\n"
+        "- First.\n"
+        "```sh\n# run tests\n- not a criterion\n```\n"
+        "~~~\n## Still fenced\n~~~\n"
+        "- Second.\n\n"
+        "### Alternatives considered\n\n- Not one.\n"
+    )
+    assert criteria.parse(body) == ["First.", "Second."]
+
+
+def test_the_dispatch_quotes_the_criteria_and_instructs_outside_the_quote():
     task = launch.issue_task(
         "7",
         {"title": "Criteria", "body": FEATURE, "comments": [], "linked": {}},
         {"verify": ["make", "check"]},
         THREE,
     )
-    numbered = task.index("1. The parser reads both headings.")
-    assert numbered < task.index(launch.QUOTE_START)
-    assert "3. A report missing a line is refused." in task
-    assert f"{protocol.cli_command()} report --state ready" in task
+    start, end = task.index(launch.QUOTE_START), task.index(launch.QUOTE_END)
+    numbered = task.index("\n1. The parser reads both headings.")
+    assert start < numbered < end
+    assert start < task.index("3. A report missing a line is refused.") < end
+    instruction = task.index(f"{protocol.cli_command()} report --state ready")
+    assert instruction < start
+    assert task.index(criteria.FORMAT) < start
+    assert task.count(criteria.FORMAT) == 1
+
+
+def test_criteria_without_a_forge_reading_still_sit_inside_a_quote():
+    task = launch.issue_task("7", None, {"verify": []}, THREE)
+    start, end = task.index(launch.QUOTE_START), task.index(launch.QUOTE_END)
+    assert start < task.index("1. The parser reads both headings.") < end
+    assert task.index(criteria.FORMAT) < start
 
 
 def test_an_issue_without_criteria_asks_the_lane_to_state_its_own():
     task = launch.issue_task("7", None, {"verify": []}, [])
     assert "Issue #7 states no acceptance criteria" in task
+    assert "criteria you will prove" in task
+    assert launch.QUOTE_START not in task
+
+
+def test_an_unread_issue_body_is_named_apart_from_no_criteria():
+    task = launch.issue_task("7", None, {"verify": []}, None)
+    assert "forge issue body of #7 could not be read" in task
+    assert "states no acceptance criteria" not in task
     assert "criteria you will prove" in task
 
 

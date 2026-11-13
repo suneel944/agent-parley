@@ -261,10 +261,10 @@ class ClaimsMixin(ReportsMixin):
                 },
             )
         forge.select(repo, data)
-        title = (
-            forge.issue_title(repo, parse_issue(number))
+        title, body = (
+            forge.issue_text(repo, parse_issue(number))
             if action == "claim"
-            else None
+            else (None, None)
         )
         closed = (
             forge.issue_completion(repo, parse_issue(number))
@@ -276,11 +276,6 @@ class ClaimsMixin(ReportsMixin):
                 f"Issue #{parse_issue(number)} is closed on the forge; "
                 "claim an open issue instead."
             )
-        body = (
-            forge.issue_body(repo, parse_issue(number))
-            if action == "claim"
-            else None
-        )
         carried = (
             self._carry(repo, directory, data, agent, to or "", remaining)
             if action == "offer"
