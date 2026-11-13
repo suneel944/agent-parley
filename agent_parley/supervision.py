@@ -209,7 +209,7 @@ WAITING = "waiting"
 TOOL_TIMEOUT = 600
 AVAILABILITY = {
     WORKING: ACTIVE,
-    WAITING: ACTIVE,
+    WAITING: WAITING,
     IDLE: IDLE,
     STOPPED: STOPPED,
     UNKNOWN: UNKNOWN,
@@ -700,9 +700,10 @@ def presence(directory: Path, name: str, inactive_after: float = 300) -> dict:
     Collapsing them told peers and operators that a healthy lane was gone.
 
     Availability is the coarse reading `lane_state` was derived into, not a
-    second derivation: a lane working or waiting on a prompt is available,
-    a lane whose evidence has gone stale is idle, and only a lane with no
-    session process is stopped.
+    second derivation: a working lane is available, a lane parked on a
+    prompt or dialog reads `WAITING` because it cannot take a turn until
+    somebody answers it, a lane whose evidence has gone stale is idle, and
+    only a lane with no session process is stopped.
 
     Args:
         directory: Private project state directory.
@@ -4732,7 +4733,9 @@ def holder_held(
     that report was bound to the same way, also after its declared wait
     ends, because the report timer alone says nothing about a process still
     writing its output. It holds only that claim, so a live process never
-    protects another claim its lane does not work on.
+    protects another claim its lane does not work on. A lane blocked on
+    exhausted capacity is held only while `_capacity_parked` says the
+    exhaustion still stands, because its record outlives the reset.
 
     Args:
         home: Private bridge state root.
@@ -4748,12 +4751,36 @@ def holder_held(
     if held := denials.waiting(directory, name):
         return f"blocked: {denials.CAUSE} ({held['id']})"
     lane = condition(home, root, name) or {}
-    if lane.get("state") == lanes.BLOCKED:
+    if lane.get("state") == lanes.BLOCKED and (
+        lane.get("cause") != lanes.CAPACITY or _capacity_parked(directory, name)
+    ):
         return f"blocked: {lane.get('cause', '')}"
     wait = published_wait(directory, name)
     if wait and float(wait["until"]) > time.time():
         return f"waiting on {wait['reason']}"
     return live_work(directory, name, issue)
+
+
+def _capacity_parked(directory: Path, name: str) -> bool:
+    """Reports whether a lane's own exhausted capacity still stands.
+
+    Args:
+        directory: Private project state directory.
+        name: Participant that owns the lane.
+
+    Returns:
+        True while no capacity observation is recorded, which is no
+        evidence the block cleared, or while the observation is exhausted
+        with a reset still ahead or with no reset named, which only a probe
+        can clear.
+    """
+    observation = published_capacity(directory, name)
+    if observation["state"] == "unknown":
+        return True
+    if observation["state"] != "exhausted":
+        return False
+    reset_at = observation.get("reset_at")
+    return not _instant(reset_at) or float(reset_at) > time.time()
 
 
 def wake_attempt(
@@ -10379,7 +10406,12 @@ def _wake_block(
     launch that never reported a native hook within its start deadline. The
     evidence that answers it, a hook or the dialog watcher seeing the dialog
     close, moves the record and clears the cause here with no change of its
-    own, and a wake never types into a dialog. The launcher still refuses a
+    own, and a wake never types into a dialog. A block on exhausted capacity
+    is the exception: its record names the usage-limit dialog, which draws
+    nothing once the limit resets, so once a capacity observation is
+    recorded only that observation above defers it, and the attempt after
+    the reset or the due probe is what clears it. The launcher still
+    refuses a
     lane that is genuinely busy, and a busy refusal spends no budget. A lane
     recorded stopped or dead with no session to resume is blocked only once
     its first attempt has already recorded that, so the refusal is reported
@@ -10435,7 +10467,9 @@ def _wake_block(
     if held := denials.waiting(directory, name):
         return f"blocked: {denials.CAUSE} ({held['id']})", 0.0
     lane = observed.get("record") or {}
-    if lane.get("state") == lanes.BLOCKED:
+    if lane.get("state") == lanes.BLOCKED and (
+        lane.get("cause") != lanes.CAPACITY or observation["state"] == "unknown"
+    ):
         return f"blocked: {lane['cause']}", 0.0
     wait = published_wait(directory, name)
     if (
