@@ -3955,8 +3955,9 @@ def opt_in_unsupported(
 def opt_in_shell_gap(home: Path, manifest: dict, name: str) -> str:
     """Explains why a recorded approval leaves a lane's shell unapproved.
 
-    A `claude` or `copilot` lane gets a shell allow for `protocol.cli_command`
-    with its bridge tool approval, as `protocol.SHELL_ALLOW` records. Any
+    A `claude`, `copilot`, `gemini` or `opencode` lane gets a shell allow
+    for `protocol.cli_command` with its bridge tool approval, as
+    `protocol.SHELL_ALLOW` records. Any
     other adapter that carries the approval reaches the MCP tools alone, so
     its notices name an MCP tool where one exists and a bridge command no
     tool covers may still stop at a shell prompt. The gap is the adapter's,
@@ -5848,6 +5849,30 @@ def _bounce_text(share: dict) -> str:
     )
 
 
+def _dead_mail_text(why: str, listed: str) -> str:
+    """Writes the notice that returns a silent lane's mail to its sender.
+
+    The command it names is spelled with `protocol.cli_command`, the form a
+    lane's launch pre-approves, so the sender can read the roster without a
+    shell permission prompt.
+
+    Args:
+        why: Clause saying why the lane will not read its mail.
+        listed: One line per returned message, already bounded.
+
+    Returns:
+        The mail body naming the returned messages and what the sender may
+        do next.
+    """
+    return (
+        f"{why}, so it will not read these messages:\n{listed}\n"
+        "They are returned to you. Send what still needs an answer to a "
+        "lane that reads as fit with "
+        f"`{protocol.cli_command()} participant status`, or hold the work "
+        "yourself."
+    )
+
+
 def dead_mail(home: Path, directory: Path, manifest: dict) -> None:
     """Returns mail a dead lane will not read to the lanes that sent it.
 
@@ -5938,12 +5963,7 @@ def _return_mail(
             more = len(returned) - DEAD_MAIL_LISTED
             if more > 0:
                 listed += f"\n- and {more} more"
-            body = (
-                f"{why}, so it will not read these messages:\n{listed}\n"
-                "They are returned to you. Send what still needs an "
-                "answer to a lane that reads as fit with agent-parley "
-                "participant status, or hold the work yourself."
-            )
+            body = _dead_mail_text(why, listed)
             with contextlib.suppress(BridgeError):
                 store.speak(
                     home,

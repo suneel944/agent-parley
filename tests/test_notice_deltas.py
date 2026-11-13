@@ -253,6 +253,10 @@ LANE_FACING = {
             "blocked": [{"recipient": "codex", "reason": "has no session"}],
         }
     ),
+    "dead mail": lambda: supervision._dead_mail_text(
+        "codex has been dead for 9s and no wake revived it",
+        "- message 3 (review)",
+    ),
     "child brief": lambda: children.brief("claude", "b-c1", ["src"], "go"),
 }
 

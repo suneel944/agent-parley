@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import dialogs, gemini, hook, roster, store
+from agent_parley import dialogs, gemini, hook, protocol, roster, store
 from agent_parley.state import BridgeError, write_json
 
 STUB = (
@@ -368,6 +368,7 @@ def test_an_opted_in_gemini_lane_trusts_only_the_bridge_server(
     lane, bridge, repo, capsys
 ):
     assert "trust" not in lane["settings"]["mcpServers"]["agent_parley"]
+    assert "tools" not in lane["settings"]
     capsys.readouterr()
     assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
     assert "helper is a gemini lane" in capsys.readouterr().err
@@ -376,12 +377,45 @@ def test_an_opted_in_gemini_lane_trusts_only_the_bridge_server(
     manifest.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
     write_json(path, manifest)
     lane["native"].write_text(
-        json.dumps({"mcpServers": {"docs": {"command": "docs-mcp"}}})
+        json.dumps(
+            {
+                "mcpServers": {"docs": {"command": "docs-mcp"}},
+                "tools": {
+                    "allowed": ["run_shell_command(git)"],
+                    "sandbox": True,
+                },
+            }
+        )
     )
     assert bridge.launch("helper", repo, "Coordinate", "gemini") == 0
     err = capsys.readouterr().err
     assert "no bridge tool approval is recorded" not in err
-    assert "gemini takes no shell allow rule" in err
-    servers = json.loads(lane["overlay"].read_text())["mcpServers"]
+    assert "takes no shell allow rule" not in err
+    settings = json.loads(lane["overlay"].read_text())
+    servers = settings["mcpServers"]
     assert servers["agent_parley"]["trust"] is True
     assert servers["docs"] == {"command": "docs-mcp"}
+    assert settings["tools"] == {
+        "allowed": [
+            "run_shell_command(git)",
+            f"run_shell_command({protocol.cli_command()})",
+        ],
+        "sandbox": True,
+    }
+    assert protocol.gemini_rule() == (
+        f"run_shell_command({protocol.cli_command()})"
+    )
+
+
+def test_an_opt_in_over_a_non_array_allowed_list_is_refused(bridge, tmp_path):
+    native = tmp_path / "system.json"
+    write_json(native, {"tools": {"allowed": "run_shell_command(git)"}})
+    with pytest.raises(BridgeError, match="tools.allowed"):
+        gemini.configure(
+            tmp_path,
+            "lane",
+            "http://127.0.0.1/mcp/",
+            bridge.hooks("lane", tmp_path),
+            str(native),
+            trusted=True,
+        )

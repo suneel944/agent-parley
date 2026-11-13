@@ -1609,7 +1609,7 @@ def test_a_shell_gap_is_named_only_where_no_cli_allow_reaches_the_lane(
         assert gap.startswith(f"lane is a {adapter} lane with a bridge")
         assert "name an MCP tool where one exists" in gap
         assert "agent-parley run lane --resume" in gap
-    assert allowed is (adapter in {"claude", "copilot"})
+    assert allowed is (adapter in {"claude", "copilot", "gemini", "opencode"})
 
 
 @pytest.mark.parametrize("adapter", roster.ADAPTERS)

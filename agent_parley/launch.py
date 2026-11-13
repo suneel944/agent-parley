@@ -755,10 +755,12 @@ reported.
         release predates one, is named on standard error through
         `supervision.opt_in_unsupported` instead of being dropped silently.
         With the opt-in, a `claude` lane's settings also allow
-        `protocol.cli_rule` and a `copilot` lane's command line also allows
-        `protocol.copilot_rule`, so the bridge CLI a notice names runs
-        without a shell prompt; any other adapter that carries the opt-in
-        is named through `supervision.opt_in_shell_gap`. A lane without
+        `protocol.cli_rule`, a `copilot` lane's command line also allows
+        `protocol.copilot_rule`, and the `gemini` and `opencode` overlays
+        also carry `protocol.gemini_rule` and `protocol.opencode_rule`, so
+        the bridge CLI a notice names runs without a shell prompt; any
+        other adapter that carries the opt-in is named through
+        `supervision.opt_in_shell_gap`. A lane without
         that opt-in that the service could resume is named on standard
         error, because the service withholds its resume rather than start
         a session nobody can answer. A client whose adapter

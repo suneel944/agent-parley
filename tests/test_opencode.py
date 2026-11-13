@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_parley import cli, opencode, roster, store
+from agent_parley import cli, opencode, protocol, roster, store
 from agent_parley.state import BridgeError, write_json
 
 STUB = (
@@ -369,13 +369,54 @@ def test_an_opted_in_overlay_allows_only_the_bridge_tools(
     )
     settings = json.loads((trusted / "opencode.json").read_text())
     assert settings["permission"] == {
-        "bash": "ask",
+        "bash": {"*": "ask", f"{protocol.cli_command()} *": "allow"},
         "edit": "deny",
         "agent_parley_*": "allow",
     }
     assert json.loads((account / "opencode.json").read_text()) == {
         "permission": {"bash": "ask", "edit": "deny"}
     }
+
+
+def test_an_opted_in_overlay_adds_the_cli_rule_last_to_a_bash_map(
+    bridge, tmp_path, account
+):
+    rule = f"{protocol.cli_command()} *"
+    write_json(
+        account / "opencode.json",
+        {"permission": {"bash": {rule: "deny", "git status *": "allow"}}},
+    )
+    trusted = opencode.configure(
+        tmp_path,
+        "lane",
+        "http://127.0.0.1/mcp/",
+        bridge.hooks("lane", tmp_path),
+        str(account),
+        trusted=True,
+    )
+    shell = json.loads((trusted / "opencode.json").read_text())["permission"][
+        "bash"
+    ]
+    assert list(shell.items()) == [
+        ("git status *", "allow"),
+        (rule, "allow"),
+    ]
+    assert protocol.opencode_rule() == rule
+
+
+def test_an_opt_in_over_a_non_object_bash_permission_is_refused(
+    bridge, tmp_path, account
+):
+    write_json(account / "opencode.json", {"permission": {"bash": ["ask"]}})
+    with pytest.raises(BridgeError, match="permission.bash"):
+        opencode.configure(
+            tmp_path,
+            "lane",
+            "http://127.0.0.1/mcp/",
+            bridge.hooks("lane", tmp_path),
+            str(account),
+            trusted=True,
+        )
 
 
 def test_an_opt_in_over_a_non_object_permission_is_refused(
