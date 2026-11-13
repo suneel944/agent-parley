@@ -159,7 +159,8 @@ def outcomes(directory: Path, since: float = 0.0) -> list[dict]:
         since: Unix time floor; older outcomes are omitted.
 
     Returns:
-        Outcomes oldest first; a damaged line is skipped.
+        Outcomes oldest first, each ``at`` a float; a damaged line, or one
+        whose ``at`` is not a number, is skipped.
     """
     try:
         text = (directory / RECORD_NAME).read_text(errors="ignore")
@@ -169,15 +170,15 @@ def outcomes(directory: Path, since: float = 0.0) -> list[dict]:
     for line in text.splitlines():
         try:
             entry = json.loads(line)
-        except ValueError:
+            at = float(entry.get("at") or 0)
+        except (AttributeError, TypeError, ValueError):
             continue
         if (
-            isinstance(entry, dict)
-            and entry.get("kind") in KINDS
+            entry.get("kind") in KINDS
             and isinstance(entry.get("findings"), int)
-            and float(entry.get("at") or 0) >= since
+            and at >= since
         ):
-            rows.append(entry)
+            rows.append({**entry, "at": at})
     return rows
 
 
@@ -270,8 +271,8 @@ def describe(result: dict) -> str:
         result: Result of `reading`.
 
     Returns:
-        A label table and a provider and model table, or one line stating
-        that no outcome was recorded in the window.
+        A label table and a provider and model table, or the header line
+        and one line stating that no outcome was recorded in the window.
     """
     days = (result["until"] - result["since"]) / 86400.0
     lines = [
@@ -300,6 +301,7 @@ def reason(
     names: list[str],
     window: float = WINDOW,
     now: float = 0.0,
+    rows: list[dict] | None = None,
 ) -> str:
     """States the find rate of an issue's labels for ``issue next``.
 
@@ -308,6 +310,9 @@ def reason(
         names: The issue's labels.
         window: Seconds counted back from `now`.
         now: Unix time the window ends; the clock when zero.
+        rows: Outcomes already read by `outcomes` for this window, so a
+            caller stating reasons for many issues reads the log once; None
+            reads them here.
 
     Returns:
         One reason naming each label with at least `MIN_OUTCOMES` outcomes
@@ -315,8 +320,10 @@ def reason(
     """
     if not names:
         return ""
-    ends = now or time.time()
-    summaries = grouped(outcomes(directory, ends - window))["labels"]
+    if rows is None:
+        ends = now or time.time()
+        rows = outcomes(directory, ends - window)
+    summaries = grouped(rows)["labels"]
     said = [
         f"{name} {summary['rate']:.0%} of {summary['outcomes']}"
         for name in sorted(set(names))

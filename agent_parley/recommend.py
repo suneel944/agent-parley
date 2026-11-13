@@ -16,6 +16,7 @@ below the issues nobody was pointed at.
 """
 
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -414,7 +415,8 @@ def shortlist(
     A candidate whose cached forge labels have enough recorded review and
     child-report outcomes gets one more reason, their find rate, read from
     `verification.reason`, so a lane can judge whether a review round is
-    worth asking for. It changes no position and schedules nothing.
+    worth asking for. The outcome log is read once per shortlist, not once
+    per candidate. It changes no position and schedules nothing.
 
     The recorded plan is read through a deferred import, because the hook path
     imports this module through the store and must not pay for a TOML parser
@@ -463,9 +465,16 @@ def shortlist(
         sharing(state, looked, commits, repo, overlap, lane),
         lane,
     )
+    found = (
+        verification.outcomes(directory, time.time() - verification.WINDOW)
+        if candidates
+        else []
+    )
     for record in candidates:
         said = verification.reason(
-            directory, verification.labels(directory, record["issue"])
+            directory,
+            verification.labels(directory, record["issue"]),
+            rows=found,
         )
         if said:
             record["reasons"].append(said)

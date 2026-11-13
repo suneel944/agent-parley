@@ -74,8 +74,10 @@ def run(bridge, monkeypatch, capsys, *arguments):
 
 def test_an_empty_store_prints_no_outcome(bridge, monkeypatch, capsys):
     shown = run(bridge, monkeypatch, capsys, "metrics", "verification")
-    assert "Verification outcomes over 30d: 0" in shown
-    assert "No review round or child report recorded." in shown
+    assert shown.splitlines() == [
+        "Verification outcomes over 30d: 0 (rate shown from 5 outcomes)",
+        "No review round or child report recorded.",
+    ]
     found = json.loads(
         run(bridge, monkeypatch, capsys, "metrics", "verification", "--json")
     )
@@ -232,8 +234,8 @@ def test_a_relayed_child_report_records_its_outcome(project, monkeypatch):
     report = {
         "state": "ready",
         "commit": "abc",
-        "summary": "Checked the parser.",
-        "remaining": "1. empty input crashes\n2. no error text",
+        "summary": "Checked the parser.\n- empty input crashes\n- no error",
+        "remaining": "1. add a fuzz test\n2. update the docs\n3. release",
     }
     assert children.deliver(
         pathlib.Path("unused"), directory, "claude-c1", report
@@ -244,6 +246,77 @@ def test_a_relayed_child_report_records_its_outcome(project, monkeypatch):
     assert row["labels"] == ["cli"]
     assert (row["provider"], row["model"]) == ("claude", "haiku")
     assert row["findings"] == 2
+
+
+def test_an_unreadable_ledger_still_relays_the_child_report(
+    project, monkeypatch
+):
+    directory = project["directory"]
+    manifest = roster.read(directory)
+    manifest["participants"]["claude-c1"] = {
+        "provider": "claude",
+        "display": "claude-c1",
+        "parent": "claude",
+        "branch": "feat/7-child",
+    }
+    write_json(directory / "project.json", manifest)
+    monkeypatch.setattr(store, "speak", lambda *args, **kwargs: {"id": "m1"})
+
+    def broken(*args, **kwargs):
+        raise ValueError("damaged ledger")
+
+    monkeypatch.setattr(issues, "snapshot", broken)
+    report = {"state": "ready", "commit": "abc", "summary": "- one finding"}
+    assert children.deliver(
+        pathlib.Path("unused"), directory, "claude-c1", report
+    )
+    [row] = verification.outcomes(directory)
+    assert row["issue"] == ""
+    assert row["findings"] == 1
+    entry = roster.read(directory)["participants"]["claude-c1"]
+    assert entry["result"]["outcome"] == "ready"
+
+
+def test_a_malformed_line_is_skipped(bridge, project, monkeypatch, capsys):
+    directory = project["directory"]
+    now = time.time()
+    outcome(directory, "codex", "7", 1, now)
+    valid = {"kind": verification.REVIEW, "findings": 1}
+    with (directory / verification.RECORD_NAME).open("a") as stream:
+        for at in ("x", [1], {"t": 1}):
+            stream.write(json.dumps({**valid, "at": at}) + "\n")
+        stream.write('[1, 2]\n"text"\nnot json\n')
+    [row] = verification.outcomes(directory)
+    assert row["lane"] == "codex"
+    assert verification.reading(bridge.home, now=now + 1)["outcomes"] == 1
+    shown = run(bridge, monkeypatch, capsys, "metrics", "verification")
+    assert "Verification outcomes over 30d: 1" in shown
+    assert verification.reason(directory, ["bug"], now=now + 1) == ""
+
+
+def test_issue_next_reads_the_outcome_log_once(project, repo, monkeypatch):
+    directory = project["directory"]
+    cache(directory, {"9": ["bug"], "10": ["bug"], "11": ["docs"]})
+    now = time.time()
+    for findings in (1, 1, 0, 0, 0):
+        outcome(directory, "codex", "9", findings, now)
+    reads = []
+    original = verification.outcomes
+
+    def spy(*args, **kwargs):
+        reads.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(verification, "outcomes", spy)
+    result = recommend.shortlist(
+        directory, project["root"], repo, "claude", {}, lambda a, b: False
+    )
+    reasons = {
+        record["issue"]: record["reasons"] for record in result["candidates"]
+    }
+    assert {"9", "10", "11"} <= set(reasons)
+    assert "verification find rate bug 40% of 5" in reasons["10"]
+    assert len(reads) == 1
 
 
 def test_the_reading_reads_no_transcript(bridge, project, monkeypatch):

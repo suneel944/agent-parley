@@ -723,7 +723,8 @@ Every review round whose findings come back and every child result relayed
 to its parent records one outcome in the project's `verification.jsonl`:
 clean, or findings with a count. The count is the one already taken from the
 capped report text, one finding per bulleted or numbered line; for a child it
-covers the report's summary and remaining work. No transcript is read. Each
+covers the report's summary only, because its remaining work lists what the
+child left undone rather than what it found. No transcript is read. Each
 outcome carries the issue's labels, copied from the cached forge reading when
 it is recorded, and the provider and model of the lane that verified: the
 reviewer of a round, or the child.
@@ -734,8 +735,9 @@ for issues that had none, and one row per `provider/model`, with `default` for
 a lane on its provider's default model. Each row counts the outcomes, those
 that found anything, and their findings. The find rate, the share of outcomes
 that found anything, is printed only for a group with at least five outcomes;
-smaller groups show `-`, and `--json` carries `null`. An empty store prints one
-line saying nothing was recorded.
+smaller groups show `-`, and `--json` carries `null`. An empty store prints two
+lines: the header with a count of 0, then `No review round or child report
+recorded.`
 
 `issue next` adds one reason to a candidate whose labels reach five outcomes
 in its project over the last 30 days, such as `verification find rate bug 40%
