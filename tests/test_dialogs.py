@@ -468,6 +468,35 @@ def test_an_unknown_prompt_escalates_only_after_the_deadline(tmp_path):
     assert watch.holding is True
 
 
+def test_an_unknown_prompt_beside_a_ticking_clock_still_escalates(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    for tick in range(5):
+        drawn = UNKNOWN_PROMPT.replace("\x1b[H", f"\x1b[H  {tick}s  ")
+        assert watch.advance(drawn.encode(), tick * 0.4) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["dialog"]["name"] == "unknown"
+    assert state["dialog"]["escalated"] is True
+    assert watch.holding is True
+
+
+def test_a_hook_event_does_not_erase_a_parked_dialog(tmp_path):
+    watch = dialogs.Watch(tmp_path, "lane", deadline=1.0)
+    watch.advance(UNKNOWN_PROMPT.encode(), 0.0)
+    watch.advance(b"", 1.5)
+    assert watch.holding is True
+    write_json(
+        tmp_path / "lane-activity.json",
+        {"activity": "working", "event": "PostToolUse"},
+    )
+
+    assert watch.advance(b"", 2.0) == b""
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert state["activity"] == "dialog: an unrecognized native prompt"
+    assert state["dialog"]["name"] == "unknown"
+    assert state["dialog"]["previous"] == "working"
+    assert state["event"] == "PostToolUse"
+
+
 def test_the_usage_limit_dialog_records_exhausted_capacity(tmp_path):
     write_json(tmp_path / "lane-activity.json", {"activity": "working"})
     watch = dialogs.Watch(tmp_path, "lane")
@@ -507,6 +536,21 @@ def test_an_answer_that_never_dismisses_the_dialog_escalates(tmp_path):
     assert watch.advance(b"", 101.0) == b""
     state = json.loads((tmp_path / "lane-activity.json").read_text())
     assert state["dialog"]["escalated"] is True
+
+
+def test_a_dialog_answered_in_separate_rounds_is_answered_every_time(
+    tmp_path,
+):
+    watch = dialogs.Watch(tmp_path, "lane", {"hook-review": "review hooks"})
+    for round_number in range(dialogs.REPEAT_LIMIT + 2):
+        start = round_number * 10.0
+        watch.advance(HOOK_REVIEW.encode(), start)
+        assert watch.advance(b"", start + 1) == b"1\r"
+        watch.advance((WORKING * 200).encode(), start + 2)
+        watch.advance(b"", start + 3)
+        assert watch.holding is False
+    state = json.loads((tmp_path / "lane-activity.json").read_text())
+    assert "dialog" not in state
 
 
 def test_the_launcher_answers_a_configured_dialog_and_refuses_wakes():
