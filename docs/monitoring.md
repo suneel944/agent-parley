@@ -481,6 +481,37 @@ minutes between polls, a stopped service, is charged to nothing. `status
 time a lane's total crosses a whole minute an `accounting` event is added to
 its lane history.
 
+## Stagnation: more mail than progress
+
+Lanes that talk instead of working keep sending mail while their commits stop.
+`status` and `top` compare each project's last hour with the hour before it.
+Mail is the messages each lane sent. Progress is the commits its branch adds
+past the project base, timed by author time so a rebase or amend does not
+read as new work; the reservations and reservation requests it made; the
+reports it filed; and the handoffs it offered, accepted or assigned. A
+declined, cancelled, refused or unassigned handoff is not progress. Only
+recorded events are counted; no message or commit text is read. A project with
+no progress counts as one event, so the ratio is never infinite. Each source
+is read once for both hours, and `top` reuses a reading for 60 seconds
+(`dashboard.STAGNATION_TTL`) rather than on every refresh.
+
+When mail per progress event reaches 10 and progress did not rise over the
+earlier hour, `status` prints one line at the top of the project and `top`
+prints it under its first summary line:
+
+```text
+Stagnation: last 60 min, 12 mail per 0 progress events (ratio 12, threshold 10; previous 60 min 0 events); most mail per progress: lane-1 2/0, lane-2 2/0, lane-3 2/0. Nothing was sent to lanes.
+```
+
+The line names at most the three lanes with the highest ratio, as mail/progress.
+The window and the threshold are fixed in code with their rationale
+(`stagnation.WINDOW`, `stagnation.THRESHOLD`), so every project is read the
+same way. The signal is for the operator only: nothing is sent to any lane. A
+retired lane is not counted. `status --json` carries the reading per project
+under `stagnation`. `metrics throughput` reports `mail_sent`, `progress` and
+`mail_ratio` per lane and in the project totals, over its own `--since`
+window, and its table ends each project with a `Lane mail:` line.
+
 ## `problems`
 
 One screen says what needs you now. `agent-parley problems` lists, longest-held

@@ -38,6 +38,7 @@ from agent_parley import (
     process,
     records,
     roster,
+    stagnation,
     store,
 )
 from agent_parley.state import (
@@ -1283,6 +1284,7 @@ def _lane_throughput(
     answered = context["decisions"].get(name, 0)
     queued = _report_waits(directory, name, since)
     tokens = native_tokens(home, participant, since, now)
+    activity = context["activity"].get(name, {"mail_sent": 0, "progress": 0})
     return {
         "provider": str(participant.get("provider", "")),
         "merged_issues": len(
@@ -1312,6 +1314,9 @@ def _lane_throughput(
         "merge_wait_hours": round(
             sum(wait["seconds"] for wait in queued) / HOUR, 2
         ),
+        "mail_sent": activity["mail_sent"],
+        "progress": activity["progress"],
+        "mail_ratio": stagnation.ratio(**activity),
     }
 
 
@@ -1353,6 +1358,7 @@ def _project_throughput(
         "mail": mail,
         "decisions": answered,
         "merges": merges,
+        "activity": stagnation.counts(db, directory, manifest, ledger, window),
     }
     measured = {
         name: _lane_throughput(home, directory, manifest, name, window, context)
@@ -1378,6 +1384,9 @@ def _project_throughput(
     )
     totals["history_complete"] = all(
         counts["history_complete"] for counts in measured.values()
+    )
+    totals["mail_ratio"] = stagnation.ratio(
+        totals.get("mail_sent", 0), totals.get("progress", 0)
     )
     return {"root": manifest["root"], "lanes": measured, "totals": totals}
 
@@ -1497,6 +1506,11 @@ def describe_throughput(reading: dict) -> str:
             f"{totals['unattributed_starts']} lane starts unattributed; "
             f"{totals['merge_waits']} merge-queue waits, "
             f"{totals['merge_waits_pending']} pending"
+        )
+        lines.append(
+            f"Lane mail: {totals.get('mail_sent', 0)} sent per "
+            f"{totals.get('progress', 0)} progress events, ratio "
+            f"{totals['mail_ratio']:g}"
         )
         partial = sorted(
             name
