@@ -153,7 +153,11 @@ class ClaimsMixin(ReportsMixin):
         title. That lookup is optional context: an unavailable forge resolves
         to no title and never blocks or fails the claim. The same forge
         refuses a claim on an issue it reports closed, since that work is
-        already over; a forge that cannot be read allows the claim.
+        already over; a forge that cannot be read allows the claim. The claim
+        also reads the issue body and records the acceptance criteria its
+        template section lists as ``criteria`` (`criteria.parse`), which a
+        ready report must then prove one by one; an unreadable body leaves
+        any list recorded earlier.
 
         A completed claim or release is then mirrored onto the host forge as
         an assignment, so the issue reads as worked outside Agent Parley. The
@@ -205,6 +209,7 @@ class ClaimsMixin(ReportsMixin):
         Raises:
             BridgeError: If lane, ownership, or transition checks fail.
         """
+        from agent_parley import criteria as acceptance
         from agent_parley.cli import (
             attachments,
             budgets,
@@ -256,10 +261,10 @@ class ClaimsMixin(ReportsMixin):
                 },
             )
         forge.select(repo, data)
-        title = (
-            forge.issue_title(repo, parse_issue(number))
+        title, body = (
+            forge.issue_text(repo, parse_issue(number))
             if action == "claim"
-            else None
+            else (None, None)
         )
         closed = (
             forge.issue_completion(repo, parse_issue(number))
@@ -319,6 +324,7 @@ class ClaimsMixin(ReportsMixin):
                     if action in ("claim", "accept")
                     else None
                 ),
+                criteria=None if body is None else acceptance.parse(body),
             )
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
@@ -910,6 +916,7 @@ class ClaimsMixin(ReportsMixin):
         *,
         reason: str = "",
         release: bool = False,
+        proof: str = "",
     ) -> dict:
         """Ends a claim whose holder never filed the completion it landed.
 
@@ -930,6 +937,12 @@ class ClaimsMixin(ReportsMixin):
         Peers gain nothing here. The escalation goes to the operator, and no
         lane is given any power over another lane's claim.
 
+        When the claim recorded acceptance criteria, `proof` may give one
+        evidence line per criterion, written ``N: <evidence>``; a proof that
+        misses one is refused, naming it. Without a proof the holder's ready
+        report evidence stands, and a claim with none records the forge
+        outcome as the evidence of every criterion (`lifecycle.resolve`).
+
         Args:
             repo: Any checkout of the target repository.
             number: Repository issue number being resolved.
@@ -937,18 +950,22 @@ class ClaimsMixin(ReportsMixin):
             release: Whether to return the work to the queue instead of
                 recording it complete. It is required for a pull request that
                 was closed without merging, because nothing was integrated.
+            proof: Evidence lines for the claim's acceptance criteria, one
+                per line, or empty.
 
         Returns:
             The issue, the outcome recorded, the lane the claim was held by,
-            the forge evidence that justified it and the resulting execution
-            state.
+            the forge evidence that justified it, the resulting execution
+            state, and the acceptance criteria with their evidence lines.
 
         Raises:
             BridgeError: If the issue is unheld, no merged or closed pull
                 request names the current claim, the evidence is closed and
-                unmerged without `release`, or the claim carries no
-                unresolved-completion escalation.
+                unmerged without `release`, the claim carries no
+                unresolved-completion escalation, or `proof` is given for a
+                claim without criteria or misses one of them.
         """
+        from agent_parley import criteria as acceptance
         from agent_parley.cli import (
             budgets,
             forge,
@@ -974,6 +991,13 @@ class ClaimsMixin(ReportsMixin):
                 f"reminders unanswered. {holder} can end the claim with "
                 f"issue release {issue}."
             )
+        stated = record.get("criteria") or []
+        if proof.strip() and not stated:
+            raise BridgeError(
+                f"Issue #{issue} recorded no acceptance criteria, so it takes "
+                "no --evidence."
+            )
+        proven = acceptance.matched(stated, proof) if proof.strip() else None
         participant = data["participants"].get(holder) or {}
         forge.select(repo, data)
         closing = forge.issue_completion(Path(data["root"]), issue)
@@ -1016,6 +1040,7 @@ class ClaimsMixin(ReportsMixin):
             actor=roster.OPERATOR,
             reason=reason,
             usage=budgets.claim_reading(self.home, directory, data, holder),
+            criteria_evidence=proven,
         )
         if release:
             forge_unclaim(Path(data["root"]), directory, issue)
@@ -1026,6 +1051,11 @@ class ClaimsMixin(ReportsMixin):
             "owner": resolved["owner"],
             "state": lifecycle.state(resolved)["state"],
             "evidence": resolved["resolution"]["evidence"],
+            "criteria": resolved.get("criteria") or [],
+            "criteria_evidence": lifecycle.state(resolved).get(
+                "criteria_evidence"
+            )
+            or [],
         }
 
     def _request_notice(
