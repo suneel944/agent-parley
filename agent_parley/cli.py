@@ -1600,12 +1600,17 @@ def selection_plan(
     return "\n".join(lines)
 
 
-def confirmed(proposal: str, assume_yes: bool) -> bool:
+def confirmed(
+    proposal: str,
+    assume_yes: bool,
+    question: str = "Proceed with these lanes?",
+) -> bool:
     """Prints one plan and asks once for the whole selected set.
 
     Args:
         proposal: The plan the operator reads before answering.
         assume_yes: Whether `--yes` already confirmed the whole set.
+        question: What the prompt asks, naming everything the plan changes.
 
     Returns:
         Whether the operator confirmed. A closed or empty answer declines.
@@ -1614,7 +1619,7 @@ def confirmed(proposal: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
     try:
-        answer = input("Proceed with these lanes? [y/N]: ")
+        answer = input(f"{question} [y/N]: ")
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes")
@@ -1721,6 +1726,150 @@ def retired_ready(bridge: Bridge, repo: Path, assume_yes: bool) -> int:
         lambda name: retired_lane(bridge, repo, name, assume_yes),
         assume_yes=True,
     )
+
+
+def remedy_label(row: dict) -> str:
+    """Names one remedy `problems --apply` lists.
+
+    Args:
+        row: A row `problems.remedies` returned.
+
+    Returns:
+        What the remedy does and to which lane or project.
+    """
+    if row["action"]["kind"] == problems.RETIRE_ACTION:
+        return f"retire {row['participant']} in {row['project']}"
+    return f"collect the state of {row['project']}"
+
+
+def applied_remedy(bridge: Bridge, row: dict) -> str:
+    """Runs one safe remedy through the command that owns it.
+
+    A retirement takes `Bridge.retire` without discarding any ignored file,
+    so it still refuses a lane that is busy, has a running session or
+    holds uncommitted changes when the apply reaches it. A collection takes
+    `supervision.forget`, which keeps the recovery checkpoints.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        row: A row `problems.remedies` classed safe.
+
+    Returns:
+        The account the remedy produced.
+
+    Raises:
+        BridgeError: If the owning command refuses the remedy.
+    """
+    if row["action"]["kind"] == problems.RETIRE_ACTION:
+        return bridge.retire(Path(row["project"]), row["participant"])
+    removed = supervision.forget(bridge.home, row["project"], apply=True)
+    return " ".join(supervision.forgotten_lines(removed))
+
+
+def session_returned(bridge: Bridge, row: dict) -> bool:
+    """Tells whether a retirement's lane may have a session again.
+
+    The listing read the session process before the prompt, and the
+    operator may answer much later. A native session started in the
+    worktree since then holds no session lock, so the process is read once
+    more right before the retirement, which runs only while it is known to
+    be gone.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        row: A row `problems.remedies` classed safe.
+
+    Returns:
+        True when the row retires a lane whose session process is now alive
+        or unreadable; False for a gone process or a collection.
+
+    Raises:
+        BridgeError: If the row's project is no longer registered.
+    """
+    if row["action"]["kind"] != problems.RETIRE_ACTION:
+        return False
+    directory = bridge.project(Path(row["project"]), create=False)[1]
+    reading = supervision.presence(directory, row["participant"])
+    return reading["process_alive"] is not False
+
+
+def applied_remedies(bridge: Bridge, rows: list[dict], assume_yes: bool) -> int:
+    """Runs every remedy `problems` classes safe, after one confirmation.
+
+    The plan names each safe remedy and each skipped one with its reason,
+    and one question covers the whole safe set, naming the lanes it retires
+    and the projects whose state it collects. A remedy that refuses or
+    fails is reported beside its label while the rest are still run. A
+    retirement whose session process `session_returned` finds again is
+    reported skipped, not failed.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        rows: Rows `problems.derive` produced.
+        assume_yes: Whether `--yes` already confirmed the safe set.
+
+    Returns:
+        0 when every safe remedy ran or none was safe; 1 when the operator
+        declined or left the question unanswered, or any remedy failed.
+    """
+    found = problems.remedies(bridge.home, rows)
+    safe = [row for row in found if row["action"]["safe"]]
+    skipped = [row for row in found if not row["action"]["safe"]]
+    plan = ["", f"Plan: run {len(safe)} safe remedy(s)."]
+    plan += [f"- {remedy_label(row)}" for row in safe]
+    if skipped:
+        plan.append(f"Skipped {len(skipped)}, each with its reason:")
+        plan += [
+            f"- {remedy_label(row)}: {row['action']['reason']}"
+            for row in skipped
+        ]
+    if not safe:
+        plan.append("No safe remedy to run, so nothing was done.")
+        print("\n".join(plan))
+        return 0
+    retiring = sum(
+        row["action"]["kind"] == problems.RETIRE_ACTION for row in safe
+    )
+    changes = []
+    if retiring:
+        changes.append(f"retiring {retiring} lane(s)")
+    if len(safe) > retiring:
+        changes.append(
+            f"collecting the state of {len(safe) - retiring} project(s)"
+        )
+    question = f"Proceed with {' and '.join(changes)}?"
+    if not confirmed("\n".join(plan), assume_yes, question):
+        print("Declined: nothing was done.")
+        return 1
+    failed = []
+    late = []
+    for row in safe:
+        label = remedy_label(row)
+        try:
+            if session_returned(bridge, row):
+                print(
+                    f"- {label}: skipped. Its session process may be "
+                    "running again, so the lane is kept."
+                )
+                late.append(label)
+                continue
+            print(f"- {label}: {applied_remedy(bridge, row)}")
+        except (
+            BridgeError,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+        ) as failure:
+            print(f"- {label}: failed. {failure}")
+            failed.append(label)
+    ran = len(safe) - len(failed) - len(late)
+    tally = f"Ran {ran} of {len(safe)} safe remedy(s)"
+    if late:
+        tally += f". Skipped: {'; '.join(late)}"
+    if failed:
+        tally += f". Failed: {'; '.join(failed)}"
+    print(f"{tally}.")
+    return 1 if failed else 0
 
 
 def bulk_lanes(
@@ -5104,6 +5253,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "that are older than it, which one line otherwise counts."
         ),
     )
+    triaging.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "After the list, run every remedy classed safe (retiring a lane "
+            "ready to retire whose worktree is clean, collecting a project "
+            "whose root is gone) after one question; remedies that could "
+            "drop work are listed and skipped with the reason. Exit 1 if "
+            "any remedy failed."
+        ),
+    )
+    triaging.add_argument(
+        "--yes",
+        action="store_true",
+        help="With --apply, run the safe remedies without asking.",
+    )
     triage = triaging.add_subparsers(dest="action")
     acking = triage.add_parser(
         "ack",
@@ -7097,12 +7262,18 @@ def main() -> int:
                 + "."
             )
         elif args.command == "problems":
+            if args.yes and not args.apply:
+                parser.error("--yes needs --apply.")
+            if args.apply and args.json:
+                parser.error("--apply prints text; drop --json.")
             found = bridge.problems(args.ack_after)
             print(
                 views.render("problems", problems.rendered(found, args.all))
                 if args.json
                 else "\n".join(problems.lines(found, args.all))
             )
+            if args.apply:
+                return applied_remedies(bridge, found, args.yes)
             return 1 if problems.shown(found, args.all) else 0
         elif args.command in ("gc", "reclaim"):
             if args.force and not args.apply:
