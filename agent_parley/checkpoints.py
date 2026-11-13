@@ -23,6 +23,7 @@ from agent_parley import (
     denials,
     hook,
     lanes,
+    observed,
     policy,
     process,
     protocol,
@@ -267,6 +268,16 @@ EVENTS = (
     "Stop",
     "SessionEnd",
 )
+TEAM_EVENTS: dict[str, str] = {
+    "TaskCompleted": "claude",
+    "TeammateIdle": "claude",
+}
+"""Agent team events, each mapped to the one adapter whose hooks carry it.
+
+The launcher installs them for that adapter alone. `checkpoint` records
+them as evidence of the lane's progress or of an idle teammate and answers
+with nothing, so a task is never held open and a teammate never kept busy.
+"""
 
 
 class Reason(StrEnum):
@@ -3818,6 +3829,36 @@ def scan(home: Path, directory: Path, manifest: dict, agent: str) -> dict:
     }
 
 
+def teamwork(directory: Path, agent: str, event: str) -> None:
+    """Records an agent team event in the lane's activity file.
+
+    Both events come from a running session, so each updates ``updated``
+    and ``event`` the way every observed event does, which the stall and
+    polling readings take as the lane's latest sign of life. A completed
+    task is progress and also sets ``progressed``, as a finished tool call
+    does. An idle teammate sets ``teammate_idle``; the lane's own activity
+    label is left alone, because the lane itself may still be working.
+
+    Args:
+        directory: Common project state directory.
+        agent: Assigned native lane name.
+        event: `TEAM_EVENTS` name the lane's client reported.
+
+    Raises:
+        BridgeError: If the lane's checkpoint lock cannot be taken.
+        OSError: If the activity file cannot be written.
+    """
+    with lock(directory / f"{agent}-checkpoint.lock", timeout=LOCK_SECONDS):
+        state = activity(directory, agent)
+        moment = time.time()
+        state.update(updated=moment, event=event)
+        if event == "TaskCompleted":
+            state["progressed"] = moment
+        else:
+            state["teammate_idle"] = moment
+        write_json(directory / f"{agent}-activity.json", state)
+
+
 def checkpoint(
     home: Path,
     directory: Path,
@@ -3919,6 +3960,17 @@ def checkpoint(
     decision all reach the agent as context on the prompt, and only tool
     events keep their refusals.
 
+    A cwd in another worktree of the lane's own repository, such as one the
+    native client made under ``<lane>/.claude/worktrees/``, is recorded by
+    `observed.register` and accepted as inside the lane for that event. The
+    branch guard still inspects the lane path alone, so the worktree's own
+    branch is never read as drift. A ``Stop`` or ``SessionEnd`` closes the
+    records whose directory is gone, through `observed.close`.
+
+    An agent team event (`TEAM_EVENTS`) is recorded by `teamwork` before
+    any other rule, including the one that ignores a subagent's events, and
+    answered with nothing, so it can never block the task or the teammate.
+
     An event reporting that the native permission layer refused a tool call
     (`denials.EVENTS`) is recorded by `permission_denied` as one operator
     decision and answered with nothing, so the client is never told to
@@ -3952,6 +4004,11 @@ def checkpoint(
     """
     arrived = time.time()
     event = payload.get("hook_event_name")
+    if event in TEAM_EVENTS:
+        with contextlib.suppress(BridgeError, OSError):
+            teamwork(directory, agent, event)
+        record(directory, agent, payload, Reason.OBSERVED, None)
+        return {}
     if (event not in EVENTS and event not in denials.EVENTS) or (
         payload.get("agent_id") and event != "PreToolUse"
     ):
@@ -3972,11 +4029,15 @@ def checkpoint(
         return told or {}
     lane = Path(participant["lane"]).resolve()
     cwd = Path(payload.get("cwd", str(lane))).resolve()
-    if event == "PreToolUse" and not cwd.is_relative_to(lane):
+    child = observed.register(directory, agent, lane, cwd, home=home)
+    if event == "PreToolUse" and child is None and not cwd.is_relative_to(lane):
         if returned := lane_return(payload, cwd, lane):
             payload = {**payload, "cwd": str(returned)}
             cwd = returned
-    if not cwd.is_relative_to(lane):
+    if event in ("Stop", "SessionEnd"):
+        with contextlib.suppress(BridgeError, OSError, ValueError):
+            observed.close(directory, agent)
+    if child is None and not cwd.is_relative_to(lane):
         outside = outside_lane_output(event, cwd, lane)
         if outside is None:
             raise BridgeError(
@@ -4892,7 +4953,9 @@ def lane_refusal(
     """Refuses a ``PreToolUse`` call that cannot wait for a full decision.
 
     The lane comes from the roster alone. A cwd outside the lane is refused
-    as `checkpoint` refuses it, then `static_refusal` runs. With ``home``,
+    as `checkpoint` refuses it, unless it lies in a worktree the roster
+    already records for the lane (`observed.known`), then `static_refusal`
+    runs. With ``home``,
     the reservation and offer hazards `unscanned_hazard` reads from the
     store run too; the service's deadline path passes none, because its
     remaining budget cannot cover a store read.
@@ -4917,7 +4980,9 @@ def lane_refusal(
         return None
     lane = Path(participant["lane"]).resolve()
     cwd = Path(payload.get("cwd", str(lane))).resolve()
-    if not cwd.is_relative_to(lane):
+    if not cwd.is_relative_to(lane) and not observed.known(
+        manifest, agent, cwd
+    ):
         if returned := lane_return(payload, cwd, lane):
             payload = {**payload, "cwd": str(returned)}
         elif outside := outside_lane_output("PreToolUse", cwd, lane):
@@ -5219,6 +5284,7 @@ def failed(
         "PermissionRequest",
         "Stop",
         "SessionEnd",
+        *TEAM_EVENTS,
     ):
         return {"status": 0, "stdout": "{}\n", "stderr": stderr}
     return {"status": 2, "stdout": "", "stderr": stderr}

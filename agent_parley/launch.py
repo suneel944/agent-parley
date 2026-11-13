@@ -1088,7 +1088,7 @@ reported.
                         }
                     },
                 )
-                from agent_parley import denials
+                from agent_parley import checkpoints, denials
 
                 native: dict = {
                     "hooks": {
@@ -1096,6 +1096,13 @@ reported.
                         **{
                             event: hooks["PreToolUse"]
                             for event, adapter in denials.EVENTS.items()
+                            if adapter == entry["adapter"]
+                        },
+                        **{
+                            event: hooks["PostToolUse"]
+                            for event, adapter in (
+                                checkpoints.TEAM_EVENTS.items()
+                            )
                             if adapter == entry["adapter"]
                         },
                     }
