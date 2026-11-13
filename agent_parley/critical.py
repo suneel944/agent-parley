@@ -268,7 +268,10 @@ def milestone_edges(
     milestone, an issue the catalog does not name one for belonging to the
     unnamed milestone. An issue the ledger records complete, closed on the
     forge or ended there is not open, and with a non-empty catalog an issue
-    the catalog does not list is not open either.
+    the catalog does not list is not open either. A catalog that names no
+    milestone for any issue, because it is empty or its edge read never
+    landed, cannot place an issue in a milestone, so the restriction is
+    dropped and every ledger edge counts.
 
     Args:
         catalog: The forge cache's issue mapping, possibly empty.
@@ -298,6 +301,11 @@ def milestone_edges(
         """Names the milestone of an issue, empty when it has none."""
         return str(entry(number).get("milestone") or "")
 
+    if not any(
+        isinstance(item, dict) and "milestone" in item
+        for item in catalog.values()
+    ):
+        milestone = None
     open_issues = {
         number
         for number in {*catalog, *recorded}

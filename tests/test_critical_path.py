@@ -600,6 +600,64 @@ def test_a_stale_cache_leaves_the_ledger_edges_alone(bridge, repo, paired):
     assert ranked["cycles"] == []
 
 
+def test_a_named_milestone_keeps_ledger_edges_without_a_forge_reading(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    recorded(directory, age=10**6)
+    write_json(
+        directory / "issues.json",
+        {
+            "revision": 1,
+            "issues": {
+                "5": {**ledger("5")["issues"]["5"]},
+                "6": {**ledger("6")["issues"]["6"], "blocked_by": ["5"]},
+            },
+        },
+    )
+    stale = bridge.milestone_path(lane, "M1")
+    assert stale["forge_reading"] is False
+    assert [step["issue"] for step in stale["path"]] == ["5", "6"]
+    write_json(
+        directory / "issues.json",
+        {"revision": 2, "issues": ledger("5")["issues"]},
+    )
+    empty = bridge.milestone_path(lane, "M1")
+    assert recommend.render_path(empty) == (
+        "No fresh forge reading for M1; only ledger dependencies are known, "
+        "and none is recorded."
+    )
+
+
+def test_a_title_catalog_without_edges_is_not_a_forge_reading(
+    bridge, repo, paired
+):
+    lane = Path(paired["lanes"]["claude"])
+    directory = lane.parent
+    write_json(
+        directory / FORGE_ISSUES,
+        {
+            "read_at": time.time(),
+            "limit": 1000,
+            "issues": {"5": {"title": "Root"}, "6": {"title": "Leaf"}},
+        },
+    )
+    write_json(
+        directory / "issues.json",
+        {
+            "revision": 1,
+            "issues": {
+                "5": {**ledger("5")["issues"]["5"]},
+                "6": {**ledger("6")["issues"]["6"], "blocked_by": ["5"]},
+            },
+        },
+    )
+    reading = bridge.milestone_path(lane, "M1")
+    assert reading["forge_reading"] is False
+    assert [step["issue"] for step in reading["path"]] == ["5", "6"]
+
+
 def test_milestone_path_prints_the_chain_with_state_and_holder(
     bridge, repo, paired, monkeypatch, capsys
 ):

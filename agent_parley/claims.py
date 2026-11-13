@@ -664,7 +664,10 @@ class ClaimsMixin(ReportsMixin):
 
         return {
             "milestone": title,
-            "forge_reading": bool(catalog),
+            "forge_reading": any(
+                isinstance(item, dict) and "milestone" in item
+                for item in catalog.values()
+            ),
             "path": [step(number) for number in critical.path(found)],
             "cycles": found["cycles"],
         }
