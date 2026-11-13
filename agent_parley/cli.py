@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         checkpoints,
         completion,
         convergence,
+        criteria,
         evidence,
         followups,
         forge,
@@ -144,6 +145,7 @@ DEFERRED_MODULES = (
     "completion",
     "convergence",
     "copilot",
+    "criteria",
     "delivery",
     "dialogs",
     "evidence",
@@ -3745,7 +3747,7 @@ def lane_reading(bridge: Bridge, repo: Path, name: str) -> tuple[dict, dict]:
 
 
 def issue_lines(reading: dict) -> str:
-    """Renders one issue's ownership, blockers, reservations and history.
+    """Renders an issue's ownership, blockers, criteria and history.
 
     Args:
         reading: Reading produced by the issue show command.
@@ -3789,6 +3791,7 @@ def issue_lines(reading: dict) -> str:
     )
     if reading.get("convergence"):
         lines.append(convergence.describe(reading["convergence"]))
+    lines.extend(criteria.lines(record))
     reported = reading["history"]
     lines.append(
         history.describe(
@@ -4632,8 +4635,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     report.add_argument(
         "--evidence",
-        default="",
-        help="What was checked; longer evidence is attached to the report.",
+        action="append",
+        default=[],
+        help=(
+            "What was checked; repeatable, one line each. A ready report on "
+            "an issue with acceptance criteria needs one line per criterion, "
+            "written `N: <evidence>`. Longer evidence is attached to the "
+            "report."
+        ),
     )
     report.add_argument(
         "--issue",
@@ -4869,6 +4878,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Return the work to the queue instead of recording it complete. "
             "It is required when the pull request was closed without merging, "
             "because nothing was integrated."
+        ),
+    )
+    resolving.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="N: TEXT",
+        help=(
+            "Evidence for one acceptance criterion of the claim; repeatable, "
+            "one per criterion. Without it the holder's ready report evidence "
+            "stands, or the forge outcome is recorded for every criterion."
         ),
     )
     resolving.add_argument("--json", action="store_true", help=JSON_HELP)
@@ -6841,7 +6861,7 @@ def main() -> int:
                 args.state,
                 args.summary,
                 args.remaining,
-                args.evidence,
+                "\n".join(args.evidence),
                 key=args.idempotency_key,
                 issue=args.issue,
                 resume_on=args.resume_on,
@@ -6951,6 +6971,7 @@ def main() -> int:
                 args.number,
                 reason=args.reason,
                 release=args.release,
+                proof="\n".join(args.evidence),
             )
             print(
                 views.render("issue_resolve", views.resolution(ended))

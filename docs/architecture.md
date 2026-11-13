@@ -55,6 +55,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
+| `criteria` | Acceptance criteria of a claimed issue: the list items of its `Boundaries and acceptance criteria` or `Expected and actual behavior` template section, read once at claim and kept as `criteria` on the issue record; the numbered dispatch lines; the match of `N: <evidence>` lines from a ready report or `issue resolve` against them, kept as `criteria_evidence` on the claim's execution; and the forge-outcome line recorded when a resolve has no lane evidence |
 | `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema, and the lane hooks and MCP server merged into and removed from a Copilot profile |
 | `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
 | `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |

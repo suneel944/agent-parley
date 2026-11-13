@@ -38,12 +38,21 @@ def _clipped(text: str, limit: int) -> tuple[str, bool]:
     return encoded[: max(limit, 0)].decode(errors="ignore"), True
 
 
-def issue_task(number: str, details: dict | None, data: dict) -> str:
+def issue_task(
+    number: str,
+    details: dict | None,
+    data: dict,
+    criteria: list[str] | None = None,
+) -> str:
     """Builds the first prompt of a lane launched on one claimed issue.
 
     The prompt names the issue, the project's verify command and the
     expected outcome: a pull request when the project's
-    ``pull_request.self_service`` is on, else a ready report. The forge's
+    ``pull_request.self_service`` is on, else a ready report. The acceptance
+    criteria the claim recorded follow as a numbered list, apart from the
+    issue's narrative, with the evidence format the ready report must use;
+    an issue that states none gets one line asking the lane to state the
+    criteria it will prove (`criteria.dispatch_lines`). The forge's
     text follows between fixed markers as quoted, untrusted input. That
     quoted text, the title, body, linked issue titles and the newest
     `ISSUE_COMMENTS` comments, is held to `ISSUE_BUDGET` bytes: the title
@@ -57,11 +66,14 @@ def issue_task(number: str, details: dict | None, data: dict) -> str:
         number: Bare issue number the launcher claimed.
         details: The `forge.issue_details` reading, or None.
         data: Project manifest supplying ``verify`` and ``pull_request``.
+        criteria: Acceptance criteria recorded on the claim, or None.
 
     Returns:
         The opening instruction passed to the native client.
     """
     import shlex
+
+    from agent_parley import criteria as acceptance
 
     outcome = (
         "open a pull request for this work, since the project's "
@@ -74,6 +86,7 @@ def issue_task(number: str, details: dict | None, data: dict) -> str:
         f"Expected outcome: {outcome}.",
         "Verify command: "
         + (shlex.join(data.get("verify") or []) or "none recorded"),
+        *acceptance.dispatch_lines(criteria, number),
     ]
     if details is None:
         lines.append(
@@ -983,9 +996,12 @@ reported.
             if number:
                 from agent_parley import forge
 
-                self.issue(lane, "claim", number)
+                claimed = self.issue(lane, "claim", number)
                 task = issue_task(
-                    number, forge.issue_details(lane, number), data
+                    number,
+                    forge.issue_details(lane, number),
+                    data,
+                    claimed.get("criteria"),
                 )
                 if blueprint:
                     from agent_parley import blueprints

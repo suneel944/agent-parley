@@ -1986,7 +1986,8 @@ the `participants` the acknowledgement was recorded for. `provider add --json`
 and `credentials add --json` report the whole `providers` or `credentials`
 registry the definition joined. `issue resolve --json` reports `issue`,
 `outcome` (`complete` or `release`), the former `holder`, the resulting
-`owner` and execution `state`, and the forge `evidence` it acted on.
+`owner` and execution `state`, the forge `evidence` it acted on, and the
+claim's acceptance `criteria` with their `criteria_evidence` lines.
 `issue recover --json` reports the approval `id`, `issue`, `claim_id`, `owner`,
 the live session it is bound to as `session_id`, `session_pid` and
 `session_ticks`, `reason`, `authorized_by` and `authorized_at`. Without `--json`
@@ -2624,6 +2625,21 @@ was observed beside the operator's reason, and history shows a `resolve` by
 the work complete and frees the issues waiting on it; a pull request closed
 without merging integrated nothing, so `--release` is required there and
 returns the work to the queue.
+
+A claim on an issue whose `Boundaries and acceptance criteria` or `Expected
+and actual behavior` section lists items carries those items as numbered
+acceptance criteria, read once from the forge when the issue is claimed and
+delivered to a lane started with `run NAME --issue N` apart from the quoted
+issue text; an issue without them asks the lane to state its own. The lane's
+ready report must give one `--evidence` line per criterion, written `N:
+<command and its result, test name, or why it does not apply>`, and a report
+missing one is refused with each missing criterion named. `issue resolve`
+takes the same repeatable `--evidence` lines and refuses them when one is
+missing; without them the ready report's lines stand, and a claim whose
+holder recorded none gets the forge outcome, the pull request, its state and
+branch, as the evidence of every criterion, so an ended pull request still
+closes the claim. `issue show` prints each criterion beside its evidence. The
+runtime checks that each line exists, not that it proves its criterion.
 
 For eligible idle sessions, the launcher owns a native pseudo-terminal and a
 private wake socket. It admits a coordination prompt at a native idle checkpoint,

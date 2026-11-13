@@ -1090,6 +1090,35 @@ def _title_of(output: str | None) -> str | None:
     return title[:MAX_TITLE] if isinstance(title, str) else None
 
 
+def issue_body(repo: Path, number: str) -> str | None:
+    """Returns an issue's Markdown body on GitHub, when one is reachable.
+
+    The read is best effort and read only, like `issue_title`, and only a
+    claim makes it, to find the issue's acceptance criteria. Beads and the
+    null forge report absence, as does any failure of the client.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        number: Bare repository issue number.
+
+    Returns:
+        The body, empty when the issue has none, or None when no GitHub
+        project answers with a usable reading.
+    """
+    project = _reachable(repo) if _implementation(repo) == "github" else None
+    if project is None or not number.isdigit():
+        return None
+    output = _run(
+        ["gh", "issue", "view", number, "--repo", project, "--json", "body"],
+        15,
+    )
+    try:
+        body = json.loads(output or "")["body"] or ""
+    except (ValueError, TypeError, KeyError):
+        return None
+    return body if isinstance(body, str) else None
+
+
 def _beads_title(number: str) -> str | None:
     """Reads one issue's title from the Beads ledger through ``bd``."""
     if not _beads_reachable():
