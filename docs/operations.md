@@ -1452,6 +1452,11 @@ list --search "closes #N"` when a forge is configured, and stays silent
 otherwise. The forecast is advisory: nothing is withheld, and a history Git
 cannot read in time is no forecast rather than a failed call.
 
+Once lanes have committed, the service also tests what their branches would
+do when merged, with `git merge-tree --write-tree` on each pair that shares
+a changed path, and `merge plan` recommends a landing order. See
+[Merge forecast](merge-forecast.md).
+
 A person editing the base checkout is the one writer reservations never saw.
 Each `top` and `status` frame runs `git status --porcelain` once for the base
 checkout of every project and compares the dirty paths against each lane's

@@ -47,7 +47,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `pool` | The spare worktrees a project keeps prepared from its base with `init` already run: their record and lock in the project state directory, the fill that prepares them, the hand-out to a new lane, and the condition that marks one stale for the fill or `gc` to remove |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null`, the ready-report comment posted there, and one bounded reading of the check, review and merge state of up to `MAX_PULL_REQUESTS` (30) open pull requests on GitHub, and of the issues the newest `MAX_LANDINGS` (100) pull requests merged into the recorded integration base close by keyword |
-| `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
+| `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries; the merge forecast that tests overlapping lane pairs with `git merge-tree --write-tree` and the landing order `merge plan` recommends, both reading Git objects only |
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
 | `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
@@ -1062,7 +1062,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `status` | `forge-issues.json` (forge issue cache) |
 | `blueprints` | `blueprint-runs.json` under `blueprint-runs.json.lock`; `blueprint-<issue>.lock` per running blueprint |
 | `merges`, `integration`, `unattended` | `integration.json`; `merge.lock` |
-| `forecast` | `cochanges.json` (co-change cache) |
+| `forecast` | `cochanges.json` (co-change cache), `merge-forecast.json` (merge forecast) |
 | `lanes` | `lane-evidence.jsonl`, drained through `lane-evidence.draining.jsonl`, under `lane-evidence.lock` |
 | `evidence` | `review-<head>.json`, naming its `review-<head>-events.jsonl` export by file and SHA-256, both written atomically with mode `0600`; each push keeps only the newest `REVIEW_RETAINED` (20) pairs |
 | `pool` | `spares.json` under `pool.lock`; `pool.log` |

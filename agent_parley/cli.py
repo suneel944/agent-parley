@@ -1153,6 +1153,8 @@ def lane_detail(record: dict, data: dict) -> None:
         print("    " + supervision.operator_edit_marker(edited))
     if record["base_advance_paths"]:
         print("    " + record["base_advance"])
+    if conflicts := record.get("merge_conflicts"):
+        print("    " + forecast.marker(conflicts))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
     if topics := mail.get("unread_topics"):
@@ -3336,6 +3338,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "problems",
             "doctor",
             "notify",
+            "merge",
         ),
     ),
     (
@@ -5217,6 +5220,18 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "with --inbound for a group chat."
         ),
     )
+    merging = commands.add_parser(
+        "merge", help="Forecast merge conflicts between lanes."
+    )
+    merge_steps = merging.add_subparsers(dest="action", required=True)
+    landing = merge_steps.add_parser(
+        "plan",
+        help="Recommend a landing order that minimises predicted conflicts.",
+    )
+    landing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    landing.add_argument("--json", action="store_true", help=JSON_HELP)
     planning = commands.add_parser(
         "plan", help="Apply, compare or show the recorded work-order plan."
     )
@@ -7160,6 +7175,18 @@ def main() -> int:
                 else notification_report(probed)
             )
             return 0 if all(item["ok"] for item in probed["results"]) else 1
+        elif args.command == "merge":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            planned = forecast.project_plan(
+                directory,
+                reported_ready(directory),
+                directory / supervision.PULL_REQUEST_RECORD,
+            )
+            print(
+                views.render("merge_plan", planned)
+                if args.json
+                else forecast.render_plan(planned)
+            )
         elif args.command == "plan" and args.action == "update":
             recorded = bridge.task_plan(
                 args.repo.resolve(),
