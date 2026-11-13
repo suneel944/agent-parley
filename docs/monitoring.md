@@ -712,6 +712,37 @@ one `Pull requests` summary to its issues line and `status` one line per
 project over the last 7 days, each only when the window holds any, and `top --json` carries each lane's figures
 under `pull_requests`.
 
+### Verification find rate
+
+```bash
+agent-parley metrics verification
+agent-parley metrics verification --since 7d --json
+```
+
+Every review round whose findings come back and every child result relayed
+to its parent records one outcome in the project's `verification.jsonl`:
+clean, or findings with a count. The count is the one already taken from the
+capped report text, one finding per bulleted or numbered line; for a child it
+covers the report's summary and remaining work. No transcript is read. Each
+outcome carries the issue's labels, copied from the cached forge reading when
+it is recorded, and the provider and model of the lane that verified: the
+reviewer of a round, or the child.
+
+`metrics verification` reads every project's outcomes over the window, 30 days
+by default, and prints two tables: one row per issue label, with `unlabelled`
+for issues that had none, and one row per `provider/model`, with `default` for
+a lane on its provider's default model. Each row counts the outcomes, those
+that found anything, and their findings. The find rate, the share of outcomes
+that found anything, is printed only for a group with at least five outcomes;
+smaller groups show `-`, and `--json` carries `null`. An empty store prints one
+line saying nothing was recorded.
+
+`issue next` adds one reason to a candidate whose labels reach five outcomes
+in its project over the last 30 days, such as `verification find rate bug 40%
+of 10`, so a lane can judge whether a review round is worth asking for. The
+reason moves no candidate, and the coordinator never skips or adds a review
+or a child report because of it.
+
 ## Usage per issue
 
 A claim records what its lane had consumed when it began and again when it

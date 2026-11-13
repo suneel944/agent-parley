@@ -808,6 +808,11 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
     outcome, so the parent receives the real result once and is woken by
     it. The child stays retired.
 
+    A relayed result is also a verification outcome: one finding per
+    bulleted or numbered line of its summary or remaining work, counted the
+    way review findings are, on the issue the parent holds, appended through
+    ``verification.record``. No transcript is read.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -821,7 +826,7 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
     Raises:
         BridgeError: If the store refuses the message.
     """
-    from agent_parley import store
+    from agent_parley import issues, reviews, store, verification
 
     with lock(directory / "setup.lock", timeout=LOCK_SECONDS):
         manifest = roster.read(directory)
@@ -848,6 +853,22 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
         }
         entry["retired"] = at
         write_json(directory / "project.json", manifest)
+        held = issues.holders(issues.snapshot(directory))
+        owned = held.get(parent["display"]) or held.get(entry["parent"])
+        verification.record(
+            directory,
+            manifest,
+            kind=verification.CHILD,
+            issue=(owned or [""])[0],
+            lane=name,
+            findings=reviews.count(
+                "\n".join(
+                    str(report.get(field) or "")
+                    for field in ("summary", "remaining")
+                )
+            ),
+            now=at,
+        )
     return True
 
 
