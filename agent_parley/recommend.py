@@ -19,7 +19,7 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import forecast, forge, issues
+from agent_parley import critical, forecast, forge, issues
 
 MAX_SHORTLIST = 5
 MAX_LOOKUPS = 3
@@ -234,6 +234,22 @@ def _reasons(record: dict, known: bool, provider: str) -> list[str]:
                 ", ".join(f"#{n}" for n in record["planned"]) + " (planned)"
             )
         said.append("unblocks " + ", ".join(listed))
+    if record.get("reach"):
+        count, chain = record["reach"], record["chain"]
+        said.append(
+            "critical path: unblocks "
+            + ("1 open issue" if count == 1 else f"{count} open issues")
+            + f", longest chain {chain}"
+        )
+    if record.get("cycle"):
+        others = ", ".join(
+            f"#{n}" for n in record["cycle"] if n != record["issue"]
+        )
+        said.append(
+            f"dependency cycle with {others} ignored"
+            if others
+            else "dependency on itself ignored"
+        )
     if record["group"]:
         said.append(
             f"plan group {record['group']} is already under way"
@@ -282,6 +298,7 @@ def rank(
     own: str = "",
     shared: dict[str, list[dict]] | None = None,
     lane: str = "",
+    found: dict | None = None,
 ) -> list[dict]:
     """Orders the issues a lane could take next, worst obstacle last.
 
@@ -300,9 +317,12 @@ def rank(
     reserves the paths of sinks below one nobody contends, a declared
     provider this lane does not run sinks below a matching or silent one, a
     forecast collision sinks below a clean path, and what remains is decided
-    by a plan group already under way, then by how much authorized,
-    unfinished work, planned or owned, waits on the issue, then by how many
-    owned issues wait on it, then by the issue number.
+    by a plan group already under way, then by how many open issues the
+    issue transitively unblocks and the longest chain it starts, then by how
+    much authorized, unfinished work, planned or owned, waits on the issue,
+    then by how many owned issues wait on it, then by the issue number. An
+    issue with no dependency edge has no such term and ranks as it did
+    without one.
 
     Args:
         state: Published issue ledger.
@@ -320,12 +340,17 @@ def rank(
         shared: Live claims per candidate, as ``sharing`` reports them.
         lane: Lane doing the reading, which owns the claims it shares
             paths with rather than being held back by them.
+        found: Dependency graph as `critical.graph` returns it; absent or
+            empty means no edge is known and the order is unchanged.
 
     Returns:
-        One record per candidate carrying its number, recorded title, plan
-        group, the issues it unblocks and which of those are planned rather
-        than owned, the provider it declares, the peer reservations and
-        forecast collisions found for it, the lane it is named to, whether
+        One record per candidate carrying its ``reach`` and ``chain``, the
+        open issues it transitively unblocks and the longest chain it
+        starts, its ``cycle`` of mutually waiting issues when it is in one,
+        its number, recorded title, plan group, the issues it unblocks and
+        which of those are planned rather than owned, the provider it
+        declares, the peer reservations and forecast collisions found for
+        it, the lane it is named to, whether
         it is this lane's own lead, the claims of this lane it shares paths
         with, the other lanes' claims holding it back, and the reasons for
         its position.
@@ -336,12 +361,20 @@ def rank(
     owned = issues.waiters(state)
     placed = _grouped(groups)
     started = _underway(groups, state)
+    found = found or {"unblocks": {}, "cycles": []}
+    cycle_of = {
+        member: members for members in found["cycles"] for member in members
+    }
     ranked = []
     for number in issues.unclaimed(state):
         risk = risks.get(number) or {}
         group = placed.get(number, "")
         unblocks = waiting.get(number, [])
+        count, chain = critical.reach(found, number)
         record = {
+            "reach": count,
+            "chain": chain,
+            "cycle": cycle_of.get(number, []),
             "issue": number,
             "title": state["issues"][number].get("title") or "",
             "group": group,
@@ -376,12 +409,62 @@ def rank(
             bool(record["provider"]) and record["provider"] != provider,
             bool(record["collisions"]),
             not record["group_underway"],
+            -record["reach"],
+            -record["chain"],
             -len(record["unblocks"]),
             len(record["planned"]),
             int(record["issue"]),
         )
     )
     return ranked[: max(limit, 1)]
+
+
+def cached_catalog(directory: Path) -> dict[str, dict]:
+    """Reads the supervisor's cached open forge issues, when fresh.
+
+    Args:
+        directory: Private project state directory holding the cache.
+
+    Returns:
+        Issue number to its cached record, empty when the cache is missing,
+        unreadable or older than `status.FORGE_STALE` seconds, so a reading
+        without the forge falls back to the ledger's own edges.
+    """
+    import json
+    import time
+
+    from agent_parley.status import FORGE_ISSUES, FORGE_STALE
+
+    try:
+        cached = json.loads((directory / FORGE_ISSUES).read_text())
+        listed = cached["issues"]
+        fresh = time.time() - float(cached.get("read_at") or 0) < FORGE_STALE
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    if not fresh or not isinstance(listed, dict):
+        return {}
+    return {
+        str(n): item for n, item in listed.items() if isinstance(item, dict)
+    }
+
+
+def dependencies(
+    directory: Path, state: dict, milestone: str | None = None
+) -> dict:
+    """Builds the dependency graph of the open issues of one milestone.
+
+    Args:
+        directory: Private project state directory holding the cache.
+        state: Issue ledger, with forge-only issues added or not.
+        milestone: Milestone title to restrict to, or None for every issue.
+
+    Returns:
+        The graph as `critical.graph` returns it.
+    """
+    blockers, opened = critical.milestone_edges(
+        cached_catalog(directory), state, milestone
+    )
+    return critical.graph(blockers, opened)
 
 
 def shortlist(
@@ -434,11 +517,13 @@ def shortlist(
 
     Returns:
         The provider considered, whether the forge answered with any paths,
-        and the ranked candidates.
+        the ranked candidates, and the dependency ``cycles`` found among the
+        open issues.
     """
     from agent_parley import plan
 
     state = issues.with_forge(directory, issues.snapshot(directory))
+    found = dependencies(directory, state)
     free = issues.unclaimed(state)
     looked = candidate_paths(repo, free)
     commits = forecast.history(root, directory) if looked else []
@@ -460,7 +545,9 @@ def shortlist(
             own,
             sharing(state, looked, commits, repo, overlap, lane),
             lane,
+            found,
         ),
+        "cycles": found["cycles"],
     }
 
 
@@ -599,6 +686,51 @@ def render_match(result: dict) -> str:
     return "\n".join(lines)
 
 
+def cycle_lines(cycles: list[list[str]]) -> list[str]:
+    """Words each dependency cycle for a reader.
+
+    Args:
+        cycles: Member lists as `critical.graph` reports them.
+
+    Returns:
+        One line per cycle naming its members and saying its edges are not
+        used.
+    """
+    return [
+        "Dependency cycle: "
+        + ", ".join(f"#{n}" for n in members)
+        + "; its edges are ignored in the ranking."
+        for members in cycles
+    ]
+
+
+def render_path(result: dict) -> str:
+    """Formats the critical path of a milestone, blocker first.
+
+    Args:
+        result: The reading `claims.Claims.milestone_path` returns.
+
+    Returns:
+        A header, one line per issue on the path with its state and holder,
+        and one line per dependency cycle; or the statement that no edge is
+        recorded.
+    """
+    label = result["milestone"] or "every open issue"
+    chain = result["path"]
+    lines = (
+        [f"Critical path of {label} ({len(chain)} issues):"]
+        + [
+            f"#{step['issue']}"
+            + (f" {step['title']}" if step["title"] else "")
+            + f": {step['state']}, {step['holder']}"
+            for step in chain
+        ]
+        if chain
+        else [f"No dependency edge is recorded for {label}."]
+    )
+    return "\n".join([*lines, *cycle_lines(result["cycles"])])
+
+
 def render(result: dict) -> str:
     """Formats a shortlist as one line per candidate, best first.
 
@@ -607,8 +739,9 @@ def render(result: dict) -> str:
         before exploring, or a single line stating that the ledger records
         nothing free to take.
     """
+    loops = cycle_lines(result.get("cycles", []))
     if not result["candidates"]:
-        return "No unclaimed, unblocked issue is recorded."
+        return "\n".join(["No unclaimed, unblocked issue is recorded.", *loops])
     lines = [
         f"#{record['issue']}"
         + (f" {record['title']}" if record["title"] else "")
@@ -616,6 +749,7 @@ def render(result: dict) -> str:
         + "; ".join(record["reasons"])
         for record in result["candidates"]
     ]
+    lines.extend(loops)
     lines.append(
         "Claim one with agent-parley issue claim before exploring or "
         "editing; a peer may be reading the same list."

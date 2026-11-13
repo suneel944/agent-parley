@@ -612,6 +612,60 @@ class ClaimsMixin(ReportsMixin):
             ),
         }
 
+    def milestone_path(self, repo: Path, milestone: str | None = None) -> dict:
+        """Reports the longest dependency chain among a milestone's open issues.
+
+        The reading uses the issue ledger and the supervisor's cached forge
+        issues only, so it makes no forge call beyond naming the active
+        milestone when none is given, and it claims nothing, offers nothing
+        and writes nothing.
+
+        Args:
+            repo: Repository or assigned worktree that selects the project.
+            milestone: Milestone title, or None for the forge's active
+                milestone, falling back to every cached open issue when the
+                forge names none.
+
+        Returns:
+            The milestone, the chain blocker first with each issue's title,
+            lifecycle state and holder, and the dependency cycles found.
+
+        Raises:
+            BridgeError: If the repository has no recorded project.
+        """
+        from agent_parley import critical, issues, lifecycle
+        from agent_parley.cli import forge
+
+        _, directory = self.project(repo, create=False)
+        title = milestone or forge.active_milestone(repo)
+        state = issues.snapshot(directory)
+        found = recommend.dependencies(directory, state, title)
+        catalog = recommend.cached_catalog(directory)
+        recorded = state.get("issues", {})
+
+        def step(number: str) -> dict:
+            """Describes one issue on the path for the reading."""
+            record = recorded.get(number) or {}
+            owner = record.get("owner")
+            return {
+                "issue": number,
+                "title": str(
+                    record.get("title")
+                    or (catalog.get(number) or {}).get("title")
+                    or ""
+                ),
+                "state": (
+                    lifecycle.state(record)["state"] if owner else "unclaimed"
+                ),
+                "holder": owner or "nobody",
+            }
+
+        return {
+            "milestone": title,
+            "path": [step(number) for number in critical.path(found)],
+            "cycles": found["cycles"],
+        }
+
     def issue_match(
         self, repo: Path, goal: str, limit: int = recommend.MAX_SHORTLIST
     ) -> dict:

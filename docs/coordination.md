@@ -63,6 +63,24 @@ agent-parley issue next --limit 3
 agent-parley issue claim 42
 ```
 
+What an issue unblocks counts too. The reading builds a dependency graph of
+the open issues of each milestone from `Blocked by #N` and `Depends on #N`
+lines in issue bodies (lines inside code blocks and inline code are ignored),
+from the forge's issue relationships where the forge reports them, and from
+the ledger's `issue block` records. An issue that transitively unblocks more
+open issues, then one that starts a longer chain, ranks ahead of one that does
+not, and its reason says `critical path: unblocks N open issues, longest chain
+M`. An issue with no edge ranks as it always did. Issues that wait on each
+other can never start: the cycle is named with its members, its edges are
+ignored in the ranking, and `issue next` prints a `Dependency cycle` line.
+`agent-parley milestone path` prints the longest chain of the active milestone
+(or `--milestone TITLE`), blocker first, with each issue's state and holder. Both
+read the ledger and the cached forge reading only and claim nothing.
+
+```sh
+agent-parley milestone path
+```
+
 The reading before that one is whether the work is recorded at all.
 `agent-parley issue match "GOAL"` lists the open issues whose recorded title or
 forge labels share subject words with what the lane intends to do, marks the

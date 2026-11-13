@@ -2001,8 +2001,20 @@ command where one applies; `--json` is the stable machine form.
 `collisions` its likely paths run into, `named_to`, the other lane whose
 published work names it as next work or empty, `same_files`, the claims
 this lane holds whose paths its forecast paths run into, `held_back`, the
-other lanes' live claims doing so as `issue` and `owner` records, and the
-ordered `reasons` for its place.
+other lanes' live claims doing so as `issue` and `owner` records, `reach`
+and `chain`, the open issues it transitively unblocks and the longest chain it
+starts, `cycle`, the issues it waits on in a dependency cycle or empty, and
+the ordered `reasons` for its place. The top level also carries `cycles`, every
+dependency cycle found, as lists of issue numbers.
+
+`milestone path` prints the longest dependency chain among a milestone's open
+issues, blocker first, as `#N TITLE: STATE, HOLDER` per issue, where `STATE` is
+the ledger's lifecycle state or `unclaimed`, and `HOLDER` is the owning lane or
+`nobody`. `--milestone TITLE` selects the milestone, which is the forge's
+active one when omitted and every cached open issue when the forge names none.
+`--json` reports `milestone`, `path` with `issue`, `title`, `state` and
+`holder` per step, and `cycles`. It reads the ledger and the cached forge
+reading, claims nothing and writes nothing.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory`, `inbound` as

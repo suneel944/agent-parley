@@ -24,6 +24,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agent_parley import critical
+
 MAX_TITLE = 200
 MAX_PATHS = 200
 MAX_OPEN_ISSUES = 100
@@ -1334,7 +1336,7 @@ def open_issue_catalog(
     project = _reachable(repo)
     if project is None:
         return None
-    fields = "number,title,labels,assignees,updatedAt"
+    fields = "number,title,labels,assignees,updatedAt,body,milestone"
     selection = ["--state", "open"]
     if since is not None:
         stamp = datetime.fromtimestamp(since, UTC).strftime(
@@ -1388,10 +1390,99 @@ def open_issue_catalog(
                     if since is not None
                     else {}
                 ),
+                "blocked_by": critical.references(
+                    str(record.get("body") or "")
+                ),
+                "milestone": str(
+                    (record.get("milestone") or {}).get("title") or ""
+                ),
             }
     except (ValueError, TypeError, KeyError, AttributeError):
         return None
+    if catalog:
+        for number, related in issue_blockers(repo, limit, timeout).items():
+            if number in catalog:
+                catalog[number]["blocked_by"] = sorted(
+                    {*catalog[number]["blocked_by"], *related}, key=int
+                )
     return catalog
+
+
+def issue_blockers(
+    repo: Path, limit: int = MAX_OPEN_ISSUES, timeout: int = 15
+) -> dict[str, list[str]]:
+    """Reads the issue relationships the forge records as blocking.
+
+    One bounded GraphQL call lists the open issues with the issues each is
+    blocked by. The reading is best effort and never fails the caller: a
+    forge without the field, a refusal, a timeout or unreadable output
+    yields no relationships. A failed call restores the failure record to
+    what it was before the call, so an optional enrichment never shows as
+    a forge failure or an operator problem.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        limit: Most open issues to read, capped at 100 by the forge.
+        timeout: Seconds the one client call may take.
+
+    Returns:
+        Issue number to the numbers of the issues blocking it; an issue
+        with no recorded blocker is absent.
+    """
+    if _implementation(repo) != "github":
+        return {}
+    project = _reachable(repo)
+    if project is None or "/" not in project:
+        return {}
+    owner, name = project.split("/", 1)
+    query = (
+        "query($owner: String!, $name: String!, $count: Int!) {"
+        " repository(owner: $owner, name: $name) {"
+        " issues(first: $count, states: OPEN) { nodes { number"
+        " blockedBy(first: 20) { nodes { number } } } } } }"
+    )
+    with _FAILURE_LOCK:
+        saved = (dict(_failure), dict(_recorded))
+    earlier = getattr(_own, "failure", None)
+    output = _run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+            "-F",
+            f"count={max(1, min(limit, 100))}",
+        ],
+        timeout,
+    )
+    if output is None:
+        with _FAILURE_LOCK:
+            _failure.clear()
+            _failure.update(saved[0])
+            _recorded.clear()
+            _recorded.update(saved[1])
+        _own.failure = earlier
+        return {}
+    try:
+        nodes = json.loads(output)["data"]["repository"]["issues"]["nodes"]
+        related = {
+            str(int(node["number"])): sorted(
+                {
+                    str(int(other["number"]))
+                    for other in node["blockedBy"]["nodes"]
+                },
+                key=int,
+            )
+            for node in nodes
+        }
+    except (ValueError, TypeError, KeyError):
+        return {}
+    return {number: found for number, found in related.items() if found}
 
 
 def issue_providers(repo: Path, limit: int = MAX_OPEN_ISSUES) -> dict[str, str]:

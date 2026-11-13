@@ -33,6 +33,7 @@ NEW_COMMANDS = (
     ("approval", "resume", "--help"),
     ("branch", "show", "--help"),
     ("forge", "show", "--help"),
+    ("milestone", "path", "--help"),
     ("state", "show", "--help"),
     ("history", "issue", "--help"),
 )
