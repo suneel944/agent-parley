@@ -1963,22 +1963,33 @@ def bridge_invocation(words: list[str]) -> bool:
     )
 
 
-def touched_path(payload: dict, lane: Path, *, fold: bool = False) -> str:
+def touched_path(
+    payload: dict,
+    lane: Path,
+    *,
+    fold: bool = False,
+    linked: tuple[tuple[str, Path], ...] = (),
+) -> str:
     """Names the lane-relative path a file tool call would write.
 
     Resolving a path does not canonicalize its case on a case-insensitive
     file system, so an absolute path whose lane prefix is spelled in
     another case still names a file in the lane. Folding case accepts that
-    prefix and keeps the rest of the path as the call spelled it.
+    prefix and keeps the rest of the path as the call spelled it. A path in
+    one of the lane's linked worktrees is named as the reservation key
+    ``NAME//path`` of that linked repository.
 
     Args:
         payload: Native ``PreToolUse`` hook payload.
         lane: Resolved lane worktree the call runs in.
         fold: Whether the lane prefix is matched without regard to case.
+        linked: Link name and resolved worktree of each linked repository
+            the lane works in.
 
     Returns:
-        The POSIX path relative to the lane, or an empty string when the
-        call names no path inside the lane.
+        The POSIX path relative to the lane or, prefixed ``NAME//``, to a
+        linked worktree, or an empty string when the call names no path
+        inside any of them.
     """
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
@@ -1991,6 +2002,10 @@ def touched_path(payload: dict, lane: Path, *, fold: bool = False) -> str:
                 path = lane / path
             with contextlib.suppress(OSError, ValueError):
                 resolved = path.resolve()
+                for name, tree in linked:
+                    if resolved.is_relative_to(tree):
+                        relative = resolved.relative_to(tree).as_posix()
+                        return f"{name}//{relative}"
                 depth = len(lane.parts)
                 if (
                     fold
@@ -2223,6 +2238,7 @@ def hazard(
     issues: dict,
     *,
     fold: bool = False,
+    linked: tuple[tuple[str, Path], ...] = (),
 ) -> tuple[Reason, str] | None:
     """Finds the coordination hazard that makes one tool call unsafe.
 
@@ -2241,6 +2257,7 @@ def hazard(
         mail: Mailbox batch read for this decision.
         issues: Issue ledger snapshot read for this decision.
         fold: Whether paths are compared without regard to case.
+        linked: The lane's linked worktrees, as `touched_path` takes them.
 
     Returns:
         The denial cause and its reason text, or None when the call is safe.
@@ -2256,7 +2273,9 @@ def hazard(
         )
     if exempt(payload):
         return None
-    if conflict := reserved_conflict(payload, lane, mail, fold=fold):
+    if conflict := reserved_conflict(
+        payload, lane, mail, fold=fold, linked=linked
+    ):
         path, held = conflict
         return Reason.RESERVED_PATH, (
             f"{path} overlaps {held['pattern']}, reserved by "
@@ -2296,7 +2315,12 @@ def exempt(payload: dict) -> bool:
 
 
 def reserved_conflict(
-    payload: dict, lane: Path, mail: dict, *, fold: bool = False
+    payload: dict,
+    lane: Path,
+    mail: dict,
+    *,
+    fold: bool = False,
+    linked: tuple[tuple[str, Path], ...] = (),
 ) -> tuple[str, dict] | None:
     """Finds the peer reservation one tool call would write into.
 
@@ -2305,12 +2329,13 @@ def reserved_conflict(
         lane: Resolved lane worktree the call runs in.
         mail: Mailbox batch carrying the peers' exclusive reservations.
         fold: Whether paths are compared without regard to case.
+        linked: The lane's linked worktrees, as `touched_path` takes them.
 
     Returns:
         The lane-relative path the call writes and the overlapping
         reservation with its ``pattern`` and ``holder``, or None.
     """
-    path = touched_path(payload, lane, fold=fold)
+    path = touched_path(payload, lane, fold=fold, linked=linked)
     if not path:
         return None
     for held in mail.get("peer_reservations") or []:
@@ -2535,6 +2560,7 @@ def overlap_notice(
     mail: dict,
     issues: dict,
     shown: list[str],
+    linked: tuple[tuple[str, Path], ...] = (),
 ) -> dict | None:
     """Finds the peer work one call would duplicate before it runs.
 
@@ -2561,6 +2587,7 @@ def overlap_notice(
         mail: Mailbox batch carrying the lane's own reservations.
         issues: Issue ledger snapshot.
         shown: Finding keys this lane was already shown.
+        linked: The lane's linked worktrees, as `touched_path` takes them.
 
     Returns:
         The notice ``text``, the finding ``keys`` it shows and whether it
@@ -2570,7 +2597,9 @@ def overlap_notice(
         return None
     fold = roster.case_insensitive(manifest)
     filed = filed_issue(payload, lane)
-    path = "" if filed else touched_path(payload, lane, fold=fold)
+    path = (
+        "" if filed else touched_path(payload, lane, fold=fold, linked=linked)
+    )
     paths = filed[1] if filed else [path] if path else []
     if not filed and not path:
         return None
@@ -2657,6 +2686,7 @@ def hazard_denial(
     danger: tuple[Reason, str],
     *,
     fold: bool = False,
+    linked: tuple[tuple[str, Path], ...] = (),
 ) -> dict:
     """Builds the native denial for a hazard and records who caused it.
 
@@ -2674,12 +2704,13 @@ def hazard_denial(
         mail: Mailbox batch the hazard was found in.
         danger: Denial cause and reason text `hazard` returned.
         fold: Whether paths are compared without regard to case.
+        linked: The lane's linked worktrees, as `touched_path` takes them.
 
     Returns:
         Native hook output that denies the call with the reason text.
     """
     reason, unsafe = danger
-    conflict = reserved_conflict(payload, lane, mail, fold=fold)
+    conflict = reserved_conflict(payload, lane, mail, fold=fold, linked=linked)
     if reason is Reason.RESERVED_PATH and conflict:
         path, held = conflict
         with contextlib.suppress(OSError, sqlite3.Error, BridgeError):
@@ -2703,6 +2734,7 @@ def unscanned_hazard(
     agent: str,
     *,
     fold: bool = False,
+    linked: tuple[tuple[str, Path], ...] = (),
 ) -> tuple[dict, tuple[Reason, str]] | None:
     """Finds a hazard for a call decided without the context scans.
 
@@ -2721,6 +2753,7 @@ def unscanned_hazard(
         lane: Resolved lane worktree the call runs in.
         agent: Assigned native lane name.
         fold: Whether paths are compared without regard to case.
+        linked: The lane's linked worktrees, as `touched_path` takes them.
 
     Returns:
         The mailbox batch read and the hazard found, or None when the call
@@ -2731,7 +2764,13 @@ def unscanned_hazard(
     try:
         mail = mailbox(home, root, name)
         danger = hazard(
-            payload, lane, agent, mail, snapshot(directory), fold=fold
+            payload,
+            lane,
+            agent,
+            mail,
+            snapshot(directory),
+            fold=fold,
+            linked=linked,
         )
     except (OSError, sqlite3.Error, BridgeError):
         return None
@@ -3264,6 +3303,43 @@ def event_summary(
     }
 
 
+def lane_worktrees(participant: dict, cwd: Path) -> list[tuple[Path, str]]:
+    """Lists the lane's worktrees the hooks guard, the one holding cwd first.
+
+    The lane's own worktree is always listed; a worktree in a linked
+    repository is listed while it exists. When cwd lies in none of them,
+    the lane's own worktree comes first.
+
+    Args:
+        participant: Participant record from the manifest.
+        cwd: Resolved hook working directory.
+
+    Returns:
+        Resolved worktree path and expected branch per worktree.
+    """
+    found = [
+        (path.resolve(), branch)
+        for name, path, branch in roster.worktrees(participant)
+        if not name or path.is_dir()
+    ]
+    return sorted(found, key=lambda tree: not cwd.is_relative_to(tree[0]))
+
+
+def linked_roots(participant: dict) -> tuple[tuple[str, Path], ...]:
+    """Names the lane's linked worktrees for mapping a written path.
+
+    Args:
+        participant: Participant record from the manifest.
+
+    Returns:
+        Link name and resolved worktree per linked repository.
+    """
+    return tuple(
+        (name, path.resolve())
+        for name, path, _ in roster.worktrees(participant)[1:]
+    )
+
+
 def branch_guard(
     event: str, payload: dict, lane: Path, expected: str
 ) -> tuple[dict | None, Reason]:
@@ -3317,12 +3393,18 @@ def branch_guard(
             create=create,
         ):
             return None, Reason.BRANCH_RESTORE
+        cwd = Path(payload.get("cwd", str(lane))).resolve()
+        git_in = (
+            "git"
+            if cwd.is_relative_to(lane)
+            else f"git -C {shlex.quote(str(lane))}"
+        )
         repair = (
-            f"git branch -m {shlex.quote(actual)} {shlex.quote(expected)}"
+            f"{git_in} branch -m {shlex.quote(actual)} {shlex.quote(expected)}"
             if rename_from
-            else f"git switch -c {shlex.quote(expected)}"
+            else f"{git_in} switch -c {shlex.quote(expected)}"
             if create
-            else f"git switch {shlex.quote(expected)}"
+            else f"{git_in} switch {shlex.quote(expected)}"
         )
         message = (
             f"Agent Parley lane is on {actual!r}, expected {expected!r}. "
@@ -3972,11 +4054,13 @@ def checkpoint(
         return told or {}
     lane = Path(participant["lane"]).resolve()
     cwd = Path(payload.get("cwd", str(lane))).resolve()
-    if event == "PreToolUse" and not cwd.is_relative_to(lane):
+    trees = lane_worktrees(participant, cwd)
+    linked = linked_roots(participant)
+    if event == "PreToolUse" and not cwd.is_relative_to(trees[0][0]):
         if returned := lane_return(payload, cwd, lane):
             payload = {**payload, "cwd": str(returned)}
             cwd = returned
-    if not cwd.is_relative_to(lane):
+    if not cwd.is_relative_to(trees[0][0]):
         outside = outside_lane_output(event, cwd, lane)
         if outside is None:
             raise BridgeError(
@@ -4017,9 +4101,10 @@ def checkpoint(
         return refusal or {}
     stages.enter("guard")
     try:
-        guarded, guard_reason = branch_guard(
-            event, payload, lane, participant["branch"]
-        )
+        for tree, expected in trees:
+            guarded, guard_reason = branch_guard(event, payload, tree, expected)
+            if guarded is not None or guard_reason is not Reason.BRANCH_OK:
+                break
     except subprocess.TimeoutExpired as exc:
         message = f"Git branch inspection timed out after {exc.timeout}s."
         with lock(directory / f"{agent}-checkpoint.lock", timeout=LOCK_SECONDS):
@@ -4134,6 +4219,7 @@ def checkpoint(
             lane,
             agent,
             fold=roster.case_insensitive(manifest),
+            linked=linked,
         )
     stages.enter("lock")
     waits = settle if event in SETTLING or record_only else LOCK_SECONDS
@@ -4356,6 +4442,7 @@ def checkpoint(
                         mail,
                         issues,
                         fold=roster.case_insensitive(manifest),
+                        linked=linked,
                     )
                     if event == "PreToolUse"
                     else None
@@ -4373,6 +4460,7 @@ def checkpoint(
                         mail,
                         issues,
                         noticed,
+                        linked,
                     )
                     if event == "PreToolUse" and not danger
                     else None
@@ -4538,6 +4626,7 @@ def checkpoint(
                             mail,
                             danger,
                             fold=roster.case_insensitive(manifest),
+                            linked=linked,
                         )
                     elif overlap and overlap["filing"]:
                         reason = Reason.FILING_OVERLAP
@@ -4601,6 +4690,7 @@ def checkpoint(
                 lane,
                 *urgent,
                 fold=roster.case_insensitive(manifest),
+                linked=linked,
             )
         if event in RECOVERY_EVENTS and pending is not None:
             pending["recovery"] = True
@@ -4917,21 +5007,24 @@ def lane_refusal(
         return None
     lane = Path(participant["lane"]).resolve()
     cwd = Path(payload.get("cwd", str(lane))).resolve()
-    if not cwd.is_relative_to(lane):
+    trees = lane_worktrees(participant, cwd)
+    if not cwd.is_relative_to(trees[0][0]):
         if returned := lane_return(payload, cwd, lane):
             payload = {**payload, "cwd": str(returned)}
         elif outside := outside_lane_output("PreToolUse", cwd, lane):
             return outside, Reason.OUTSIDE_LANE
         else:
             return None
-    if refused := static_refusal(payload, lane, participant["branch"]):
-        return refused
+    for tree, expected in trees:
+        if refused := static_refusal(payload, tree, expected):
+            return refused
     if home is None:
         return None
     name = json.loads((directory / f"{agent}-identity.json").read_text())[
         "name"
     ]
     fold = roster.case_insensitive(manifest)
+    linked = linked_roots(participant)
     urgent = unscanned_hazard(
         home,
         directory,
@@ -4941,11 +5034,19 @@ def lane_refusal(
         lane,
         agent,
         fold=fold,
+        linked=linked,
     )
     if urgent is None:
         return None
     denial = hazard_denial(
-        home, manifest["root"], name, payload, lane, *urgent, fold=fold
+        home,
+        manifest["root"],
+        name,
+        payload,
+        lane,
+        *urgent,
+        fold=fold,
+        linked=linked,
     )
     return denial, urgent[1][0]
 

@@ -127,6 +127,57 @@ class ClaimsMixin(ReportsMixin):
 
         return recovery.authorize(directory, data, parse_issue(number), reason)
 
+    def _link_worktrees(
+        self, directory: Path, agent: str, names: list[str]
+    ) -> dict[str, str]:
+        """Prepares the lane's linked worktrees for a new claim.
+
+        Each repository the claim names gains a worktree in the project
+        state directory, beside the lane, so the linked repository holds no
+        coordination state. It checks out the lane's own branch, created
+        from the linked checkout's ``HEAD`` when that repository lacks it.
+        A worktree the lane already has is kept. Every linked worktree of
+        the lane, named by this claim or kept from an earlier one, records
+        the commit its branch stands on as ``base``, so a resolve counts
+        only commits made under this claim, never those a reused lane
+        branch carried from an earlier one.
+
+        Args:
+            directory: Private project state directory.
+            agent: Claiming participant.
+            names: Link names the claim asked for.
+
+        Returns:
+            The worktree path per link name, covering every linked worktree
+            of the lane.
+        """
+        from agent_parley.cli import git, has_branch, lock, roster, write_json
+
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            participant = data["participants"][agent]
+            branch = participant["branch"]
+            linked = participant.get("linked", {})
+            if not names and not linked:
+                return {}
+            for name in sorted({*names, *linked}):
+                root = Path(data["links"][name])
+                lane = directory / f"{agent}.links" / name
+                if not lane.exists():
+                    git(root, "worktree", "prune")
+                    if has_branch(root, branch):
+                        git(root, "worktree", "add", str(lane), branch)
+                    else:
+                        git(root, "worktree", "add", "-b", branch, str(lane))
+                linked[name] = {
+                    "lane": str(lane),
+                    "branch": branch,
+                    "base": git(lane, "rev-parse", branch),
+                }
+            participant["linked"] = linked
+            write_json(directory / "project.json", data)
+        return {name: entry["lane"] for name, entry in sorted(linked.items())}
+
     def issue(
         self,
         repo: Path,
@@ -142,6 +193,7 @@ class ClaimsMixin(ReportsMixin):
         when_released: str = "",
         remaining: list[str] | None = None,
         take_orphaned: bool = False,
+        links: list[str] | None = None,
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
@@ -195,6 +247,9 @@ class ClaimsMixin(ReportsMixin):
                 per entry, recorded beside the summary.
             take_orphaned: Whether this claim takes an issue the supervisor
                 marked orphaned, recording the previous owner and the reason.
+            links: Linked repositories this claim also works in. The lane
+                gains a worktree in each, on its own branch, and the result
+                names them under ``linked``.
 
         Returns:
             The whole ledger for list, or the resulting issue record. An
@@ -254,6 +309,14 @@ class ClaimsMixin(ReportsMixin):
                     "issue": parse_issue(number),
                     "condition": f"released:{parse_issue(when_released)}",
                 },
+            )
+        unknown = sorted(set(links or ()) - set(data.get("links", {})))
+        if links and action != "claim":
+            raise BridgeError("Only a claim adds linked worktrees.")
+        if unknown:
+            raise BridgeError(
+                f"This project links no repository named {unknown[0]}; run "
+                "agent-parley link show."
             )
         forge.select(repo, data)
         title = (
@@ -343,6 +406,8 @@ class ClaimsMixin(ReportsMixin):
             )
             if likely:
                 record = {**record, "forecast": likely}
+            if linked := self._link_worktrees(directory, agent, links or []):
+                record = {**record, "linked": linked}
         elif action == "release":
             forge_unclaim(repo, directory, parse_issue(number))
         return record
@@ -814,6 +879,10 @@ class ClaimsMixin(ReportsMixin):
         holder that is answering is never resolved out from under it. The
         transition is recorded as the operator's own, never as the lane's.
 
+        Each linked repository whose lane branch gained commits since the
+        claim must show the same evidence for that branch, recorded under
+        ``repositories`` with the link name.
+
         Peers gain nothing here. The escalation goes to the operator, and no
         lane is given any power over another lane's claim.
 
@@ -839,6 +908,7 @@ class ClaimsMixin(ReportsMixin):
         from agent_parley.cli import (
             budgets,
             forge,
+            git,
             issues,
             lifecycle,
             parse_issue,
@@ -878,23 +948,57 @@ class ClaimsMixin(ReportsMixin):
             evidence = forge.branch_evidence(
                 Path(data["root"]), str(participant.get("branch", ""))
             )
-        if not evidence or evidence["state"] not in ("MERGED", "CLOSED"):
-            raise BridgeError(
-                f"No merged or closed pull request was observed for {holder}, "
-                f"so issue #{issue} has no evidence to resolve it on."
-            )
-        if evidence["created_at"] < supervision.claimed_since(record):
-            raise BridgeError(
-                f"The newest pull request on {evidence['branch']} predates "
-                f"the current claim on issue #{issue}, so it does not name "
-                "this work."
-            )
-        if evidence["state"] != "MERGED" and not release:
-            raise BridgeError(
-                f"The pull request on {evidence['branch']} was closed without "
-                "merging, so nothing was integrated; add --release to return "
-                "the work to the queue."
-            )
+
+        def verified(found: dict | None, where: str) -> dict:
+            """Returns forge evidence once it proves this claim's work.
+
+            Args:
+                found: Pull request evidence one repository's forge read.
+                where: Lane and repository the refusal names.
+
+            Returns:
+                The same evidence.
+
+            Raises:
+                BridgeError: If no closed pull request was observed, it
+                    predates the claim, or it closed unmerged without
+                    ``release``.
+            """
+            if not found or found["state"] not in ("MERGED", "CLOSED"):
+                raise BridgeError(
+                    f"No merged or closed pull request was observed for "
+                    f"{where}, so issue #{issue} has no evidence to resolve "
+                    "it on."
+                )
+            if found["created_at"] < supervision.claimed_since(record):
+                raise BridgeError(
+                    f"The newest pull request on {found['branch']} predates "
+                    f"the current claim on issue #{issue}, so it does not "
+                    "name this work."
+                )
+            if found["state"] != "MERGED" and not release:
+                raise BridgeError(
+                    f"The pull request on {found['branch']} was closed "
+                    "without merging, so nothing was integrated; add "
+                    "--release to return the work to the queue."
+                )
+            return found
+
+        evidence = verified(evidence, holder)
+        repositories = []
+        for name, _, branch in roster.worktrees(participant)[1:]:
+            root = Path(data["links"][name])
+            base = participant["linked"][name]["base"]
+            if git(root, "rev-list", "--count", f"{base}..{branch}") != "0":
+                found = forge.branch_evidence(root, branch)
+                repositories.append(
+                    {
+                        "repository": name,
+                        **verified(found, f"{holder} in {name}"),
+                    }
+                )
+        if repositories:
+            evidence = {**evidence, "repositories": repositories}
         resolved = lifecycle.resolve(
             directory,
             issue,

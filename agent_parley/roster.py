@@ -217,6 +217,51 @@ def identifier(value: str, kind: str) -> str:
     return value
 
 
+def links(value: object) -> dict[str, str]:
+    """Validates the sibling repositories a project links.
+
+    Args:
+        value: Mapping from link name to the absolute path of the linked
+            repository's checkout.
+
+    Returns:
+        The accepted mapping.
+
+    Raises:
+        BridgeError: If a name is malformed or a path is not absolute.
+    """
+    if not isinstance(value, dict):
+        raise BridgeError("links must map a name to a repository path.")
+    for name, path in value.items():
+        identifier(name, "Link name")
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            raise BridgeError(f"Link {name} must name an absolute path.")
+    return dict(value)
+
+
+def worktrees(participant: dict) -> list[tuple[str, Path, str]]:
+    """Lists every worktree a lane works in.
+
+    The lane's own worktree comes first under the empty repository name.
+    A participant record without ``linked`` has only that one, so records
+    written before linked repositories existed read as the primary
+    repository.
+
+    Args:
+        participant: Participant record from the manifest.
+
+    Returns:
+        Repository name, worktree path and expected branch per worktree.
+    """
+    return [
+        ("", Path(participant["lane"]), participant.get("branch", "")),
+        *(
+            (name, Path(entry["lane"]), entry["branch"])
+            for name, entry in sorted(participant.get("linked", {}).items())
+        ),
+    ]
+
+
 def branch_prefix(value: str) -> str:
     """Validates the prefix every new lane branch is created under.
 
@@ -1408,6 +1453,9 @@ def normalize(manifest: dict) -> dict:
             {"blueprint_templates": dict(manifest["blueprint_templates"])}
             if manifest.get("blueprint_templates")
             else {}
+        ),
+        **(
+            {"links": links(manifest["links"])} if manifest.get("links") else {}
         ),
         "supervision": project,
         "participants": participants,

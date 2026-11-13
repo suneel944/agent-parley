@@ -1047,7 +1047,8 @@ Files in `projects/<key>/`, grouped the same way:
 
 | Module | Files |
 | --- | --- |
-| `core` | `project.json` (participant manifest); `setup.lock` |
+| `core` | `project.json` (participant manifest, with `links` naming each linked sibling repository and each participant's `linked` worktrees, branch and base by link name; a record without them reads as the primary repository only); `setup.lock` |
+| `claims` | `<lane>.links/<NAME>/`, the lane's worktree of linked repository `NAME`, registered with that repository's Git and removed by `link remove` or `participant retire` |
 | `issues` | `issues.json` under `issues.lock`; `supervision-error.json` |
 | `plan` | `plan.json` under `plan.lock` |
 | `decisions` | `decisions.json` under `decisions.lock` |

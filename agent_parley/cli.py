@@ -1658,6 +1658,73 @@ def shown_paths(paths: Sequence[str]) -> list[str]:
     return shown
 
 
+def lane_ignored(participant: dict) -> list[str]:
+    """Names the ignored paths removing every worktree of a lane deletes.
+
+    Args:
+        participant: Participant record from the manifest.
+
+    Returns:
+        Ignored paths of the lane's own worktree as they are, then those of
+        each existing linked worktree written ``NAME//path``.
+    """
+    return [
+        f"{name}//{path}" if name else path
+        for name, tree, _ in roster.worktrees(participant)
+        if tree.exists()
+        for path in ignored_paths(tree)
+    ]
+
+
+def removable(
+    tree: Path,
+    owner: str,
+    discard: Sequence[str],
+    *,
+    prefix: str = "",
+    action: str = "retire",
+    confirm: str = "",
+) -> None:
+    """Refuses removing a worktree that holds work its removal loses.
+
+    ``git worktree remove`` refuses uncommitted changes, but it deletes
+    ignored files, which ``git status`` never reports. Checking every
+    worktree of a removal before the first one is removed keeps a refusal
+    from leaving the removal half done.
+
+    Args:
+        tree: Existing worktree about to be removed.
+        owner: Name the refusal gives the worktree's lane.
+        discard: Ignored paths the operator agreed to delete.
+        prefix: ``NAME//`` for a linked worktree, so its ignored paths are
+            matched against ``discard`` as ``NAME//path``.
+        action: Command the refusal says never discards work.
+        confirm: Clause naming how to confirm deleting the ignored files,
+            or empty when nothing confirms it.
+
+    Raises:
+        BridgeError: If the worktree holds uncommitted changes or an
+            ignored path ``discard`` does not name.
+    """
+    if git(tree, "status", "--porcelain"):
+        raise BridgeError(
+            f"{owner} has uncommitted changes. Commit or preserve them "
+            f"first; {action} never discards work.",
+            next_command=worktrees.commit_all(tree),
+        )
+    kept = [
+        prefix + path
+        for path in ignored_paths(tree)
+        if prefix + path not in discard
+    ]
+    if kept:
+        raise BridgeError(
+            f"{owner}'s worktree holds ignored files that removing it "
+            f"deletes: {', '.join(shown_paths(kept))}. Move them first"
+            f"{confirm}."
+        )
+
+
 def retired_lane(
     bridge: Bridge, repo: Path, name: str, assume_yes: bool
 ) -> str:
@@ -1679,8 +1746,7 @@ def retired_lane(
     """
     _, data = lane_roster(bridge, repo)
     participant = data["participants"].get(name)
-    lane = Path(participant["lane"]) if participant else None
-    ignored = ignored_paths(lane) if lane and lane.exists() else []
+    ignored = lane_ignored(participant) if participant else []
     if ignored and not confirmed(
         f"Retiring {name} deletes these ignored files:\n"
         + "\n".join(f"- {path}" for path in shown_paths(ignored)),
@@ -2369,6 +2435,9 @@ class Bridge(
         retirement before anything is removed. Removing the worktree deletes
         its ignored files, which `git status` never reports, so they are
         deleted only when every one of them was named in ``discard``. The
+        lane's worktrees in linked repositories are checked the same way,
+        their ignored paths written ``NAME//path``, and every worktree is
+        checked before the first one is removed. The
         lane's session and checkpoint locks are both taken before the first
         irreversible step, so a busy lane refuses the retirement with its
         worktree, branch, credential and record intact rather than failing
@@ -2409,25 +2478,25 @@ class Bridge(
                 ),
                 lock(directory / f"{name}-checkpoint.lock", timeout=1),
             ):
-                if lane.exists():
-                    if git(lane, "status", "--porcelain"):
-                        raise BridgeError(
-                            f"{name} has uncommitted changes. Commit or "
-                            "preserve them first; retire never discards work.",
-                            next_command=worktrees.commit_all(lane),
+                for link, tree, _ in roster.worktrees(participant):
+                    if tree.exists():
+                        removable(
+                            tree,
+                            f"{name} in {link}" if link else name,
+                            discard,
+                            prefix=f"{link}//" if link else "",
+                            confirm=(
+                                ", or run `agent-parley participant retire "
+                                f"{name}` to confirm deleting them"
+                            ),
                         )
-                    kept = [
-                        path
-                        for path in ignored_paths(lane)
-                        if path not in discard
-                    ]
-                    if kept:
-                        raise BridgeError(
-                            f"{name}'s worktree holds ignored files that "
-                            f"removing it deletes: "
-                            f"{', '.join(shown_paths(kept))}. Move "
-                            "them first, or run `agent-parley participant "
-                            f"retire {name}` to confirm deleting them."
+                for link, tree, _ in roster.worktrees(participant)[1:]:
+                    if tree.exists():
+                        git(
+                            Path(data["links"][link]),
+                            "worktree",
+                            "remove",
+                            str(tree),
                         )
                 retirement.return_work(directory, data, name)
                 if lane.exists():
@@ -3191,12 +3260,13 @@ class Bridge(
         for row in rows:
             if not row["reclaim"]:
                 continue
-            lane = Path(manifest["participants"][row["participant"]]["lane"])
             try:
                 self.retire(
                     repo,
                     row["participant"],
-                    discard=ignored_paths(lane) if lane.exists() else (),
+                    discard=lane_ignored(
+                        manifest["participants"][row["participant"]]
+                    ),
                 )
             except BridgeError as exc:
                 row.update(reclaim=False, removed=False, reason=str(exc))
@@ -3314,6 +3384,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "pool",
             "blueprint",
             "branch",
+            "link",
             "forge",
             "deadlines",
             "budget",
@@ -4806,6 +4877,16 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     "lane that is merely idle is never orphaned."
                 ),
             )
+            command.add_argument(
+                "--link",
+                action="append",
+                default=[],
+                metavar="NAME",
+                help=(
+                    "Also work in this linked repository: the lane gains a "
+                    "worktree there on its own branch. Repeat for several."
+                ),
+            )
         if action == "offer":
             command.add_argument(
                 "--to", required=True, help="Lane the ownership is offered to."
@@ -5419,6 +5500,15 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "recording the same decision again records nothing further."
         ),
     )
+    deciding.add_argument(
+        "--link",
+        default="",
+        metavar="NAME",
+        help=(
+            "Linked repository the decision concerns, recorded as [NAME] "
+            "before the subject; without it the primary repository."
+        ),
+    )
     deciding.add_argument("--json", action="store_true", help=JSON_HELP)
     decision = commands.add_parser(
         "decision",
@@ -6024,6 +6114,48 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     naming_base.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    linking = commands.add_parser(
+        "link",
+        help="Show, add or remove sibling repositories lanes can work in.",
+    )
+    linkings = linking.add_subparsers(dest="action", required=True)
+    link_show = linkings.add_parser(
+        "show", help="List the repositories this project links."
+    )
+    link_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    link_add = linkings.add_parser(
+        "add", help="Link a sibling repository; operator-only."
+    )
+    link_add.add_argument(
+        "path",
+        metavar="PATH",
+        type=Path,
+        help="Any checkout of the repository to link.",
+    )
+    link_add.add_argument(
+        "--name",
+        default="",
+        help=(
+            "Link name used by issue claim --link and in reservation keys "
+            "NAME//path; defaults to the checkout directory's name."
+        ),
+    )
+    link_add.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    link_remove = linkings.add_parser(
+        "remove",
+        help=(
+            "Remove a link and its clean lane worktrees; branches remain. "
+            "Operator-only."
+        ),
+    )
+    link_remove.add_argument("name", metavar="NAME", help="Link name.")
+    link_remove.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     tracker = commands.add_parser(
@@ -7015,6 +7147,7 @@ def main() -> int:
                 when_released=getattr(args, "when_released", ""),
                 remaining=getattr(args, "remaining", None),
                 take_orphaned=getattr(args, "take_orphaned", False),
+                links=getattr(args, "link", None),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))
@@ -7287,7 +7420,11 @@ def main() -> int:
                     print(line)
         elif args.command == "decide":
             recorded = bridge.decide(
-                args.repo.resolve(), args.text, args.subject, args.key
+                args.repo.resolve(),
+                args.text,
+                args.subject,
+                args.key,
+                args.link,
             )
             print(
                 views.render("decide", recorded)
@@ -7397,6 +7534,18 @@ def main() -> int:
                 print(
                     bridge.branch_naming(
                         repository, getattr(args, "prefix", None)
+                    )
+                )
+        elif args.command == "link":
+            repository = args.repo.resolve()
+            if args.action == "remove":
+                print(bridge.unlink(repository, args.name))
+            else:
+                print(
+                    bridge.link(
+                        repository,
+                        getattr(args, "path", None),
+                        getattr(args, "name", ""),
                     )
                 )
         elif args.command == "forge":

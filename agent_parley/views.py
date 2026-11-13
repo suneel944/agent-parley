@@ -978,6 +978,7 @@ def _row(row: dict) -> dict:
         "shared_file_degree": row.get("shared_file_degree"),
         "host": row["host"],
         "worktree": row["worktree"],
+        "linked_worktrees": dict(row.get("linked_worktrees") or {}),
         "hook_events": row["hook_events"],
         "denials": row["denials"],
         "denied_by": [dict(item) for item in row.get("denied_by") or []],

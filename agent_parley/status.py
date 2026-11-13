@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_parley import BridgeError, protocol
-from agent_parley.context import lane_diffstats, lane_fields
+from agent_parley.context import lane_diffstats, lane_fields, location_cell
 from agent_parley.core import BridgeCore
 
 if TYPE_CHECKING:
@@ -2390,6 +2390,11 @@ class StatusMixin(BridgeCore):
                 print(row)
             for record in reported:
                 print_plan(record)
+                if record.get("linked_worktrees"):
+                    print(
+                        f"{record['participant']} worktrees: "
+                        f"{location_cell(record)}"
+                    )
                 for claim in record["claims"]:
                     if claim.get("blueprint"):
                         print(f"Blueprint {claim['blueprint']}")

@@ -2059,6 +2059,60 @@ def named_resource(pattern: str) -> bool:
     return bool(separator) and "/" not in scheme
 
 
+def repository(key: str) -> str:
+    """Names the repository a reservation key belongs to.
+
+    A path in a linked repository is written ``NAME//path``. A normalized
+    path never holds ``//``, so a key without the prefix, including every
+    reservation recorded before linked repositories existed, belongs to
+    the primary repository. Named resources are shared by every
+    repository.
+
+    Args:
+        key: Reservation key or repository-relative path.
+
+    Returns:
+        The link name, or an empty string for the primary repository.
+    """
+    if named_resource(key):
+        return ""
+    name, separator, _ = key.partition("//")
+    return name if separator and roster.IDENTIFIER.fullmatch(name) else ""
+
+
+def linked_keys(home: Path, root: str, paths: object) -> None:
+    """Refuses a reservation key in a repository the project does not link.
+
+    A misspelt ``NAME//`` prefix would otherwise be granted as a
+    reservation that covers nothing any lane writes.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key recorded in the manifest.
+        paths: Reservation keys the call asks for, still unvalidated.
+
+    Raises:
+        BridgeError: If a key names a link the project manifest lacks.
+    """
+    if not isinstance(paths, list):
+        return
+    names = {repository(key) for key in paths if isinstance(key, str)}
+    names.discard("")
+    if not names:
+        return
+    directory = roster.locate(home, root) if root else None
+    try:
+        links = roster.read(directory).get("links", {}) if directory else {}
+    except (BridgeError, OSError, ValueError):
+        links = {}
+    if unknown := sorted(names - set(links)):
+        raise BridgeError(
+            f"{unknown[0]}// names no repository this project links. Linked: "
+            + (", ".join(sorted(links)) or "none")
+            + "; run agent-parley link show."
+        )
+
+
 def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
     """Reports whether two reservation keys can name the same thing.
 
@@ -2073,7 +2127,8 @@ def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
 
     A project on a case-insensitive file system folds case, so two paths
     that open the same file overlap however each is spelled. Named
-    resources are still compared exactly.
+    resources are still compared exactly. Paths in different repositories
+    never overlap.
 
     Args:
         pattern: Reservation key or repository-relative path.
@@ -2085,6 +2140,8 @@ def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
     """
     if named_resource(pattern) or named_resource(other):
         return pattern == other
+    if repository(pattern) != repository(other):
+        return False
     if fold:
         pattern = pattern.casefold()
         other = other.casefold()
@@ -2114,7 +2171,8 @@ def overlapping_paths(
     spelling, so either side being one is answered by a set lookup; only a
     globbed path checked against a plain pattern uses the pairwise rule.
     Folding case answers the same question over casefolded paths and
-    reports each match in the spelling the caller gave.
+    reports each match in the spelling the caller gave. Keys spanning
+    several repositories are answered one repository at a time.
 
     Args:
         paths: Reservation keys or repository-relative paths.
@@ -2127,6 +2185,31 @@ def overlapping_paths(
     """
     if not patterns:
         return set()
+    names = {
+        repository(key)
+        for key in (*paths, *patterns)
+        if not named_resource(key)
+    }
+    if len(names) > 1:
+        return set().union(
+            *(
+                overlapping_paths(
+                    [
+                        path
+                        for path in paths
+                        if named_resource(path) or repository(path) == name
+                    ],
+                    [
+                        pattern
+                        for pattern in patterns
+                        if named_resource(pattern)
+                        or repository(pattern) == name
+                    ],
+                    fold=fold,
+                )
+                for name in names
+            )
+        )
     if fold:
         spellings: dict[str, list[str]] = {}
         for path in paths:
@@ -2227,15 +2310,17 @@ def _keys(
                 )
             keys.append(pattern)
             continue
-        parts = PurePosixPath(pattern)
+        name = repository(pattern)
+        path = pattern.removeprefix(name + "//") if name else pattern
+        parts = PurePosixPath(path)
         if (
             parts.is_absolute()
             or ".." in parts.parts
-            or "\\" in pattern
+            or "\\" in path
             or str(parts) == "."
         ):
             raise BridgeError("Reservations require repository-relative paths.")
-        keys.append(str(parts))
+        keys.append(f"{name}//{parts}" if name else str(parts))
     return keys, ttl, exclusive, reason
 
 
@@ -3525,6 +3610,7 @@ def _dispatch(
         return _review_round(home, actor, args)
     if tool in RESERVING:
         children.confine(home, actor, args.get("paths"))
+        linked_keys(home, str(actor.get("project", "")), args.get("paths"))
     declared = (
         declared_resources(home, str(actor.get("project", "")))
         if tool in RESERVING
