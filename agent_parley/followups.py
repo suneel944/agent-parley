@@ -17,7 +17,8 @@ A suggestion nobody accepts expires after `TTL` seconds; it is then kept in
 the ``expired`` state, the newest `KEPT_EXPIRED` of them, so the record
 shows what lapsed and when instead of losing it. A title already pending
 is one suggestion whichever lane proposes it: a second lane gets the
-recorded suggestion back and is added to its ``lanes``.
+recorded suggestion back, is added to its ``lanes`` and keeps its own
+``why`` and ``paths`` under ``reasons``.
 
 Duplicate matching reads the open forge issues from the supervisor's cache.
 When that cache is missing, damaged or older than ``FORGE_STALE``, the
@@ -87,35 +88,54 @@ def _read(directory: Path) -> dict:
     return value
 
 
-def _prune(record: dict, now: float) -> None:
+def _number(ident: str) -> int:
+    """Orders identifiers by their counter, so ``f9`` sorts before ``f10``.
+
+    Args:
+        ident: Suggestion identifier, ``f`` and a counter.
+
+    Returns:
+        The counter, or zero when the identifier carries none.
+    """
+    digits = ident[1:]
+    return int(digits) if digits.isdigit() else 0
+
+
+def _prune(record: dict, now: float) -> bool:
     """Marks lapsed suggestions expired and bounds the finished ones.
 
     A pending suggestion past its expiry turns ``expired`` with the time
-    it was found lapsed under ``expired_at``. Only the newest
-    `KEPT_ACCEPTED` accepted and `KEPT_EXPIRED` expired suggestions stay.
+    it lapsed, its ``expires``, under ``expired_at``. Only the newest
+    `KEPT_ACCEPTED` accepted and `KEPT_EXPIRED` expired suggestions stay;
+    tied stamps keep the higher identifier counter.
 
     Args:
         record: Suggestion record, changed in place.
         now: Unix time the expiry is judged at.
+
+    Returns:
+        Whether the record changed.
     """
     kept = record["suggestions"]
+    changed = False
     for entry in kept.values():
-        if (
-            entry.get("state") == PENDING
-            and float(entry.get("expires") or 0) <= now
-        ):
-            entry.update(state=EXPIRED, expired_at=now)
+        lapsed = float(entry.get("expires") or 0)
+        if entry.get("state") == PENDING and lapsed <= now:
+            entry.update(state=EXPIRED, expired_at=lapsed)
+            changed = True
     for state, stamp, bound in (
         (ACCEPTED, "accepted", KEPT_ACCEPTED),
         (EXPIRED, "expired_at", KEPT_EXPIRED),
     ):
         finished = sorted(
-            (float(entry.get(stamp) or 0), key)
+            (float(entry.get(stamp) or 0), _number(key), key)
             for key, entry in kept.items()
             if entry.get("state") == state
         )
-        for _, ident in finished[: max(len(finished) - bound, 0)]:
+        for _, _, ident in finished[: max(len(finished) - bound, 0)]:
             kept.pop(ident)
+            changed = True
+    return changed
 
 
 def _text(value: object, label: str, limit: int) -> str:
@@ -143,6 +163,15 @@ def _paths(value: object) -> list[str]:
     if not isinstance(value, list) or len(value) > MAX_PATHS:
         raise BridgeError(f"paths must be a list of at most {MAX_PATHS}.")
     return [_text(path, "Each path", MAX_PATH) for path in value]
+
+
+def _folded(title: str) -> str:
+    """Reduces a title to the form two equal titles share.
+
+    Case and runs of whitespace are ignored, so ``Fix  the Cache`` and
+    ``fix the cache`` are one suggestion.
+    """
+    return " ".join(title.split()).casefold()
 
 
 def _terms(text: str) -> set[str]:
@@ -264,8 +293,10 @@ def suggest(
 
     Any lane suggesting a title already pending, compared without case,
     gets the recorded suggestion back, so a retried call or a second lane
-    noticing the same work does not queue it twice. ``lane`` keeps the
-    first lane; ``lanes`` lists every lane that suggested it.
+    noticing the same work does not queue it twice. ``lane``, ``why`` and
+    ``paths`` keep the first lane's; ``lanes`` lists every lane that
+    suggested it, and ``reasons`` keeps each lane's first ``why`` and
+    ``paths`` by lane.
 
     Args:
         directory: Private project state directory.
@@ -301,7 +332,7 @@ def suggest(
             (
                 entry
                 for entry in waiting
-                if entry.get("title", "").casefold() == named.casefold()
+                if _folded(entry.get("title", "")) == _folded(named)
             ),
             None,
         )
@@ -321,6 +352,7 @@ def suggest(
                 "title": named,
                 "why": reason,
                 "paths": listed,
+                "reasons": {lane: {"why": reason, "paths": listed}},
                 "created": stamp,
                 "expires": stamp + TTL,
                 "state": PENDING,
@@ -335,6 +367,16 @@ def suggest(
             lanes = same.setdefault("lanes", [same.get("lane", "")])
             if lane not in lanes:
                 lanes.append(lane)
+            reasons = same.setdefault(
+                "reasons",
+                {
+                    same.get("lane", ""): {
+                        "why": same.get("why", ""),
+                        "paths": same.get("paths") or [],
+                    }
+                },
+            )
+            reasons.setdefault(lane, {"why": reason, "paths": listed})
         write_json(directory / RECORD_NAME, record)
     found, checked = _matches(directory, named)
     return {
@@ -366,8 +408,11 @@ def link_decision(directory: Path, ident: str, decision: str) -> None:
 def pending(directory: Path, now: float = 0.0) -> list[dict]:
     """Lists the suggestions still waiting for the operator, oldest first.
 
-    This is the reading `status` and the web view render. It writes
-    nothing, calls no forge and reads only the private state directory.
+    This is the reading `status` and the web view render. Under
+    `LOCK_NAME` it marks lapsed suggestions expired and bounds the
+    finished ones, as `suggest` does, and writes the record only when
+    that changed it. It calls no forge and touches only the private
+    state directory.
 
     Args:
         directory: Private project state directory.
@@ -377,17 +422,26 @@ def pending(directory: Path, now: float = 0.0) -> list[dict]:
         Each unexpired pending suggestion with the open issues and claims
         it duplicates under ``duplicates``, and ``forge_checked`` false
         when the open forge issues could not be read for that match.
+
+    Raises:
+        BridgeError: If the record lock is not free within
+            `LOCK_SECONDS`.
     """
     stamp = now or time.time()
-    record = _read(directory)
+    with lock(directory / LOCK_NAME, timeout=LOCK_SECONDS):
+        record = _read(directory)
+        if _prune(record, stamp):
+            write_json(directory / RECORD_NAME, record)
     waiting = sorted(
         (
             entry
             for entry in record["suggestions"].values()
             if entry.get("state") == PENDING
-            and float(entry.get("expires") or 0) > stamp
         ),
-        key=lambda entry: (float(entry.get("created") or 0), entry["id"]),
+        key=lambda entry: (
+            float(entry.get("created") or 0),
+            _number(str(entry.get("id") or "")),
+        ),
     )
     rows = []
     for entry in waiting:
@@ -689,13 +743,18 @@ def render(rows: list[dict]) -> str:
     for entry in rows:
         lines.append(f"{entry['id']}  {entry['lane']}: {entry['title']}")
         lines.append(f"    why: {entry['why']}")
-        others = [
-            name for name in entry.get("lanes") or [] if name != entry["lane"]
-        ]
-        if others:
-            lines.append(f"    also suggested by: {', '.join(others)}")
         if entry.get("paths"):
             lines.append(f"    paths: {', '.join(entry['paths'])}")
+        reasons = entry.get("reasons") or {}
+        for name in entry.get("lanes") or []:
+            if name == entry["lane"]:
+                continue
+            said = reasons.get(name) or {}
+            lines.append(f"    also suggested by {name}")
+            if said.get("why"):
+                lines.append(f"      why: {said['why']}")
+            if said.get("paths"):
+                lines.append(f"      paths: {', '.join(said['paths'])}")
         if entry.get("forge_checked") is False:
             lines.append(f"    {FORGE_UNCHECKED}")
         for match in entry.get("duplicates") or []:

@@ -3753,7 +3753,12 @@ def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
                 ),
                 options=(followups.ACCEPT,),
                 detail=recorded["why"]
-                + (f"\nMay duplicate {matched}." if matched else ""),
+                + (f"\nMay duplicate {matched}." if matched else "")
+                + (
+                    ""
+                    if recorded["forge_checked"]
+                    else f"\n{followups.FORGE_UNCHECKED}"
+                ),
                 confirm=(followups.ACCEPT,),
                 ttl=followups.TTL,
             )

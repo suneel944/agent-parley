@@ -147,6 +147,10 @@ def test_an_unaccepted_suggestion_expires(lane):
     later = created["expires"] + 1
     assert followups.pending(lane["directory"], now=1001.0)
     assert followups.pending(lane["directory"], now=later) == []
+    path = lane["directory"] / followups.RECORD_NAME
+    listed = json.loads(path.read_text())["suggestions"][created["id"]]
+    assert listed["state"] == followups.EXPIRED
+    assert listed["expired_at"] == created["expires"]
     followups.suggest(
         lane["directory"], "codex", "New idea", "Fresh.", now=later
     )
@@ -156,7 +160,7 @@ def test_an_unaccepted_suggestion_expires(lane):
         for entry in record["suggestions"].values()
     }
     assert states == {
-        "Old idea": (followups.EXPIRED, later),
+        "Old idea": (followups.EXPIRED, created["expires"]),
         "New idea": (followups.PENDING, None),
     }
 
@@ -176,23 +180,53 @@ def test_expired_suggestions_are_bounded_and_cannot_be_accepted(
         for entry in record["suggestions"].values()
         if entry["state"] == followups.EXPIRED
     ]
-    assert len(expired) == 1
+    assert expired == ["f2"]
     with pytest.raises(BridgeError, match="No pending suggestion"):
         bridge.followup_accept(repo, expired[0])
     assert filed == []
 
 
+def test_tied_suggestions_order_by_identifier_counter(lane, monkeypatch):
+    monkeypatch.setattr(followups, "KEPT_EXPIRED", 1)
+    for index in range(10):
+        followups.suggest(
+            lane["directory"], "codex", f"Idea {index}", "Why.", now=1000.0
+        )
+    rows = followups.pending(lane["directory"], now=1000.0)
+    assert [row["id"] for row in rows] == [f"f{n}" for n in range(1, 11)]
+    lapsed = 2000.0 + followups.TTL
+    assert followups.pending(lane["directory"], now=lapsed) == []
+    record = json.loads((lane["directory"] / followups.RECORD_NAME).read_text())
+    assert list(record["suggestions"]) == ["f10"]
+
+
 def test_another_lane_suggesting_the_same_title_joins_the_record(lane):
-    first = followups.suggest(lane["directory"], "codex", "Cache reads", "A.")
-    again = followups.suggest(lane["directory"], "claude", "cache READS", "B.")
-    twice = followups.suggest(lane["directory"], "claude", "Cache reads", "B.")
+    first = followups.suggest(
+        lane["directory"], "codex", "Cache reads", "A.", ["a.py"]
+    )
+    again = followups.suggest(
+        lane["directory"], "claude", " cache   READS ", "B.", ["b.py"]
+    )
+    twice = followups.suggest(lane["directory"], "claude", "Cache reads", "C.")
     assert again["id"] == twice["id"] == first["id"]
     assert again["repeated"] is True
-    assert again["lane"] == "codex"
+    assert (again["lane"], again["why"], again["paths"]) == (
+        "codex",
+        "A.",
+        ["a.py"],
+    )
     assert twice["lanes"] == ["codex", "claude"]
+    assert twice["reasons"] == {
+        "codex": {"why": "A.", "paths": ["a.py"]},
+        "claude": {"why": "B.", "paths": ["b.py"]},
+    }
     rows = followups.pending(lane["directory"])
     assert len(rows) == 1
-    assert "also suggested by: claude" in followups.render(rows)
+    rendered = followups.render(rows)
+    assert (
+        "    also suggested by claude\n      why: B.\n      paths: b.py"
+        in rendered
+    )
 
 
 def test_a_suggestion_matching_a_claim_or_open_issue_shows_duplicates(
@@ -382,6 +416,22 @@ def test_the_telegram_accept_button_files_through_the_decision(
     assert answered["answer"] == followups.ACCEPT
     assert len(filed) == 1
     assert followups.pending(lane["directory"]) == []
+
+
+def test_the_telegram_decision_says_when_the_forge_was_unchecked(bridge, lane):
+    suggest(bridge, lane, suggestion())
+    opened = decisions.list_open(lane["directory"])
+    assert opened[0]["detail"].endswith(f"\n{followups.FORGE_UNCHECKED}")
+
+
+def test_the_telegram_decision_omits_the_note_for_a_checked_forge(bridge, lane):
+    write_json(
+        lane["directory"] / FORGE_ISSUES,
+        {"issues": {}, "read_at": time.time()},
+    )
+    suggest(bridge, lane, suggestion())
+    opened = decisions.list_open(lane["directory"])
+    assert followups.FORGE_UNCHECKED not in opened[0]["detail"]
 
 
 def test_followup_commands_list_and_accept(
