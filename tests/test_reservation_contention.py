@@ -237,3 +237,149 @@ def test_the_record_waits_out_the_window_before_a_new_count(
     age(bridge, store.CONTENTION_WINDOW + 1)
     assert reserve(bridge, asker)["conflicts"]
     assert store.contentions(bridge.home, paired["root"]) == []
+
+
+def counts(bridge):
+    """Reads every stored contention count."""
+    with store.connect(bridge.home) as db:
+        return [
+            row["count"]
+            for row in db.execute("SELECT count FROM reservation_contention")
+        ]
+
+
+def plant(bridge, paired, low, high, flagged=1.0):
+    """Stores one flagged record between two lane names."""
+    with store.connect(bridge.home, write=True) as db:
+        project = db.execute(
+            "SELECT id FROM projects WHERE human_key=?", (paired["root"],)
+        ).fetchone()["id"]
+        db.execute(
+            "INSERT INTO reservation_contention(project_id,low,high,"
+            "path_pattern,count,first_ts,last_ts,flagged_ts) "
+            "VALUES (?,?,?,?,4,?,?,?)",
+            (project, low, high, "src/other.py", flagged, flagged, flagged),
+        )
+
+
+def test_the_whole_flow_shows_then_ends_one_line_and_one_row(
+    bridge, repo, paired, lanes, monkeypatch, capsys
+):
+    from agent_parley import problems
+
+    def rows():
+        """Counts the contention rows of the problems view."""
+        return [
+            row
+            for row in bridge.problems()
+            if row["condition"] == problems.CONTENTION
+        ]
+
+    trade(bridge, lanes, store.CONTENTION_ATTEMPTS)
+    monkeypatch.chdir(repo)
+    assert show(monkeypatch, bridge, "status") == 0
+    assert capsys.readouterr().out.count("contention: ") == 1
+    assert len(rows()) == 1
+    offered = bridge.issue(
+        Path(paired["lanes"]["claude"]),
+        "offer",
+        "1",
+        to="codex",
+        summary="Take the engine work.",
+    )["offer"]
+    bridge.issue(
+        Path(paired["lanes"]["codex"]), "accept", "1", offer_id=offered["id"]
+    )
+    assert show(monkeypatch, bridge, "status") == 0
+    assert "contention: " not in capsys.readouterr().out
+    assert rows() == []
+
+
+def test_one_lane_retrying_against_an_idle_holder_flags_nothing(
+    bridge, paired, lanes
+):
+    reserve(bridge, lanes["claude"])
+    for _ in range(store.CONTENTION_ATTEMPTS + 2):
+        assert reserve(bridge, lanes["codex"])["conflicts"]
+    assert counts(bridge) == [1]
+    assert store.contentions(bridge.home, paired["root"]) == []
+    assert notices(bridge, lanes["claude"]) == []
+
+
+def test_a_hook_refusal_does_not_count_toward_contention(bridge, paired, lanes):
+    for lane, holder in (("codex", "claude"), ("claude", "codex")) * 3:
+        store.record_refusal(bridge.home, paired["root"], lane, holder, PATH)
+    assert counts(bridge) == []
+
+
+def test_one_refusal_blocked_by_two_leases_counts_once(bridge, paired, lanes):
+    reserve(bridge, lanes["claude"], "src/**")
+    reserve(bridge, lanes["claude"], PATH)
+    result = reserve(bridge, lanes["codex"])
+    assert len(result["conflicts"]) == 2
+    assert counts(bridge) == [1]
+
+
+def test_four_refusals_spread_over_more_than_the_window_do_not_flag(
+    bridge, paired, lanes
+):
+    holder, asker = lanes["claude"], lanes["codex"]
+    reserve(bridge, holder)
+    step = store.CONTENTION_WINDOW * 0.6
+    for _ in range(store.CONTENTION_ATTEMPTS):
+        assert reserve(bridge, asker)["conflicts"]
+        release(bridge, holder)
+        reserve(bridge, asker)
+        holder, asker = asker, holder
+        age(bridge, step)
+    assert store.contentions(bridge.home, paired["root"]) == []
+    assert counts(bridge) == [2]
+
+
+def test_a_retired_lane_leaves_no_reported_flag_and_prune_removes_it(
+    bridge, paired, lanes
+):
+    trade(bridge, lanes, store.CONTENTION_ATTEMPTS)
+    store.revoke(bridge.home, paired["root"], "codex")
+    assert store.contentions(bridge.home, paired["root"]) == []
+    assert store.prune(bridge.home, 1e12)["reservation_contention"] == 1
+    assert counts(bridge) == []
+
+
+def test_an_old_flag_is_pruned_and_a_recent_one_stays(bridge, paired, lanes):
+    trade(bridge, lanes, store.CONTENTION_ATTEMPTS)
+    assert store.prune(bridge.home, 1.0)["reservation_contention"] == 0
+    assert len(store.contentions(bridge.home, paired["root"])) == 1
+
+
+def test_a_handoff_keeps_records_against_other_lanes(bridge, paired, lanes):
+    trade(bridge, lanes, store.CONTENTION_ATTEMPTS)
+    plant(bridge, paired, "claude", "zed")
+    offered = bridge.issue(
+        Path(paired["lanes"]["claude"]),
+        "offer",
+        "1",
+        to="codex",
+        summary="Take the engine work.",
+    )["offer"]
+    bridge.issue(
+        Path(paired["lanes"]["codex"]), "accept", "1", offer_id=offered["id"]
+    )
+    assert store.contentions(bridge.home, paired["root"]) == []
+    with store.connect(bridge.home) as db:
+        kept = [
+            (row["low"], row["high"])
+            for row in db.execute("SELECT low,high FROM reservation_contention")
+        ]
+    assert kept == [("claude", "zed")]
+
+
+def test_a_release_keeps_records_while_the_lane_holds_another_issue(
+    bridge, paired, lanes
+):
+    trade(bridge, lanes, store.CONTENTION_ATTEMPTS)
+    bridge.issue(Path(paired["lanes"]["claude"]), "claim", "3")
+    bridge.issue(Path(paired["lanes"]["claude"]), "release", "1")
+    assert len(store.contentions(bridge.home, paired["root"])) == 1
+    bridge.issue(Path(paired["lanes"]["claude"]), "release", "3")
+    assert store.contentions(bridge.home, paired["root"]) == []

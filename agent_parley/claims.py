@@ -326,9 +326,11 @@ class ClaimsMixin(ReportsMixin):
         if action in ("accept", "release"):
             self._end_contention(
                 data,
+                directory,
                 (record.get("handoff") or {}).get("from")
                 if action == "accept"
                 else agent,
+                agent if action == "accept" else None,
             )
         if action == "accept":
             return self._inherit(data, agent, record)
@@ -419,27 +421,48 @@ class ClaimsMixin(ReportsMixin):
             carried["diff_bytes"] = len(text.encode())
         return carried
 
-    def _end_contention(self, data: dict, lane: str | None) -> None:
-        """Clears the contention records of the lane whose work moved.
+    def _end_contention(
+        self,
+        data: dict,
+        directory: Path,
+        lane: str | None,
+        peer: str | None,
+    ) -> None:
+        """Clears the contention records the moved work answers.
 
-        An accepted handoff or a release is the operator's answer to a
-        flagged pair, so the pair may be flagged again if refusals resume.
-        A store that cannot answer leaves the records, which the next
-        handoff or release clears.
+        An accepted handoff answers only the pair of the offering and the
+        accepting lane. A release answers the releasing lane's records only
+        when that lane holds no other issue, because a record names a path
+        and the claim ledger does not record which paths an issue touched.
+        A flag may be raised again if refusals resume. A store that cannot
+        answer leaves the records, which the next handoff or release clears.
 
         Args:
             data: Project manifest.
+            directory: Coordination directory of the project.
             lane: Participant that gave up the work, or None when unknown.
+            peer: Participant that accepted the work, or None for a release.
         """
         import sqlite3
 
-        from agent_parley.cli import store
+        from agent_parley.cli import snapshot, store
 
-        if lane not in data["participants"]:
+        participants = data["participants"]
+        if lane not in participants or (
+            peer is not None and peer not in participants
+        ):
+            return
+        if peer is None and any(
+            record.get("owner") == lane
+            for record in snapshot(directory)["issues"].values()
+        ):
             return
         with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
             store.clear_contention(
-                self.home, data["root"], data["participants"][lane]["display"]
+                self.home,
+                data["root"],
+                participants[lane]["display"],
+                participants[peer]["display"] if peer is not None else None,
             )
 
     def _inherit(self, data: dict, agent: str, record: dict) -> dict:

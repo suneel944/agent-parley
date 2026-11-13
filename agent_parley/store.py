@@ -81,6 +81,12 @@ PRUNES = (
         "scheduled_deliveries WHERE coalesce(delivered_ts,cancelled_ts)<:epoch "
         "AND id<(SELECT max(id) FROM scheduled_deliveries) LIMIT :limit)",
     ),
+    (
+        "reservation_contention",
+        "DELETE FROM reservation_contention WHERE rowid IN (SELECT rowid "
+        "FROM reservation_contention WHERE "
+        "coalesce(flagged_ts,last_ts)<:epoch LIMIT :limit)",
+    ),
 )
 REFUSAL_SECONDS = 86400.0
 CONTENTION_WINDOW = 1800.0
@@ -220,7 +226,7 @@ CREATE TABLE IF NOT EXISTS reservation_contention (
  project_id INTEGER NOT NULL REFERENCES projects(id),
  low TEXT NOT NULL, high TEXT NOT NULL, path_pattern TEXT NOT NULL,
  count INTEGER NOT NULL, first_ts REAL NOT NULL, last_ts REAL NOT NULL,
- flagged_ts REAL,
+ flagged_ts REAL, last_lane TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(project_id,low,high,path_pattern));
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -3563,6 +3569,7 @@ def _dispatch(
         )
         if tool in RESERVING and result.get("conflicts"):
             _record_refusals(db, actor, result["conflicts"])
+            _contend(db, actor, result["conflicts"], time.time())
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -5583,21 +5590,24 @@ def _record_refusals(
         "DELETE FROM reservation_refusals WHERE project_id=? AND refused_ts<?",
         (actor["project_id"], now - REFUSAL_SECONDS),
     )
-    _contend(db, actor, conflicts, now)
 
 
 def _contend(
     db: sqlite3.Connection, actor: dict, conflicts: list[dict], now: float
 ) -> None:
-    """Counts refusals between one pair of lanes on one key and flags it.
+    """Counts alternating refusals between two lanes on one key and flags it.
 
     Refusals in either direction between the same two lanes on the same key
-    share one row. A refusal arriving more than `CONTENTION_WINDOW` after the
-    previous one restarts the count. The row that reaches
-    `CONTENTION_ATTEMPTS` is flagged once and each lane receives one bounded
-    update. A flagged row is never changed or sent again until
-    `clear_contention` removes it. Reservations stay advisory: nothing here
-    locks a path.
+    share one row. The count rises only when the refused lane differs from
+    the lane refused in the previous counted refusal, so one lane retrying
+    against an idle holder counts once, and `CONTENTION_ATTEMPTS` means that
+    many alternating refusals. A refusal blocked by several leases of one
+    owner counts once per owner and key. A refusal arriving more than
+    `CONTENTION_WINDOW` after the first refusal of the count restarts the
+    count at that refusal. The row that reaches `CONTENTION_ATTEMPTS` is
+    flagged once and each lane receives one bounded update. A flagged row is
+    never changed or sent again until `clear_contention` removes it or the
+    prune retires it. Reservations stay advisory: nothing here locks a path.
 
     Args:
         db: Open transaction that also carries the refused call.
@@ -5611,13 +5621,17 @@ def _contend(
         "AND flagged_ts IS NULL AND last_ts<?",
         (project, now - REFUSAL_SECONDS),
     )
-    for conflict in conflicts:
-        low, high = sorted((str(actor["name"]), str(conflict["owner"])))
+    lane = str(actor["name"])
+    refused = dict.fromkeys(
+        (str(conflict["owner"]), conflict["path"]) for conflict in conflicts
+    )
+    for owner, path in refused:
+        low, high = sorted((lane, owner))
         if low == high:
             continue
-        key = (project, low, high, conflict["path"])
+        key = (project, low, high, path)
         row = db.execute(
-            "SELECT count,first_ts,last_ts,flagged_ts FROM "
+            "SELECT count,first_ts,flagged_ts,last_lane FROM "
             "reservation_contention WHERE project_id=? AND low=? AND high=? "
             "AND path_pattern=?",
             key,
@@ -5625,23 +5639,27 @@ def _contend(
         if row is None:
             db.execute(
                 "INSERT INTO reservation_contention(project_id,low,high,"
-                "path_pattern,count,first_ts,last_ts) VALUES (?,?,?,?,1,?,?)",
-                (*key, now, now),
+                "path_pattern,count,first_ts,last_ts,last_lane) "
+                "VALUES (?,?,?,?,1,?,?,?)",
+                (*key, now, now, lane),
             )
             continue
         if row["flagged_ts"] is not None:
             continue
-        fresh = now - row["last_ts"] <= CONTENTION_WINDOW
-        count = row["count"] + 1 if fresh else 1
+        if now - row["first_ts"] > CONTENTION_WINDOW:
+            count, first = 1, now
+        else:
+            count = row["count"] + (row["last_lane"] != lane)
+            first = row["first_ts"]
         flagged = now if count >= CONTENTION_ATTEMPTS else None
         db.execute(
             "UPDATE reservation_contention SET count=?,first_ts=?,last_ts=?,"
-            "flagged_ts=? WHERE project_id=? AND low=? AND high=? "
-            "AND path_pattern=?",
-            (count, row["first_ts"] if fresh else now, now, flagged, *key),
+            "flagged_ts=?,last_lane=? WHERE project_id=? AND low=? "
+            "AND high=? AND path_pattern=?",
+            (count, first, now, flagged, lane, *key),
         )
         if flagged is not None:
-            _warn_contention(db, project, (low, high), conflict["path"], now)
+            _warn_contention(db, project, (low, high), path, now)
 
 
 def _warn_contention(
@@ -5699,7 +5717,12 @@ def _warn_contention(
 
 
 def _contended(db: sqlite3.Connection, root: str) -> list[dict]:
-    """Reads the flagged contention records of one project, oldest first."""
+    """Reads the flagged records of one project whose lanes both remain.
+
+    A record naming a retired lane, one without an active credential, is
+    left out, so the surviving lane is not reported as contended with a
+    lane that can no longer act. Records come oldest first.
+    """
     return [
         {
             "lanes": [row["low"], row["high"]],
@@ -5711,7 +5734,10 @@ def _contended(db: sqlite3.Connection, root: str) -> list[dict]:
             "SELECT c.low,c.high,c.path_pattern,c.count,c.flagged_ts "
             "FROM reservation_contention c "
             "JOIN projects p ON p.id=c.project_id WHERE p.human_key=? "
-            "AND c.flagged_ts IS NOT NULL ORDER BY c.flagged_ts,c.low,c.high",
+            "AND c.flagged_ts IS NOT NULL AND (SELECT count(*) FROM agents a "
+            "WHERE a.project_id=c.project_id AND a.name IN (c.low,c.high) "
+            "AND a.token_digest IS NOT NULL)=2 "
+            "ORDER BY c.flagged_ts,c.low,c.high",
             (root,),
         )
     ]
@@ -5735,8 +5761,10 @@ def contentions(home: Path, root: str) -> list[dict]:
         return _contended(db, root)
 
 
-def clear_contention(home: Path, root: str, name: str) -> int:
-    """Removes every contention record that names one lane.
+def clear_contention(
+    home: Path, root: str, name: str, peer: str | None = None
+) -> int:
+    """Removes the contention records that name one lane.
 
     The operator's handoff or release of that lane's work is the action that
     ends a flag, so the pair is flagged again only if refusals resume. A
@@ -5746,17 +5774,21 @@ def clear_contention(home: Path, root: str, name: str) -> int:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
         name: Registered identity whose records are removed.
+        peer: When given, only the records between `name` and this lane are
+            removed and records against any other lane stay.
 
     Returns:
         How many records were removed.
     """
     if not (home / DATABASE).exists():
         return 0
+    low, high = sorted((name, peer)) if peer is not None else (name, name)
+    clause = "low=? AND high=?" if peer is not None else "(low=? OR high=?)"
     with connect(home, write=True) as db:
         return db.execute(
             "DELETE FROM reservation_contention WHERE project_id=("
-            "SELECT id FROM projects WHERE human_key=?) AND (low=? OR high=?)",
-            (root, name, name),
+            f"SELECT id FROM projects WHERE human_key=?) AND {clause}",
+            (root, low, high),
         ).rowcount
 
 
