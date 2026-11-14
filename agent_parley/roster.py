@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1066,43 +1067,93 @@ def provider_budget(home: Path, name: str, changes: dict) -> dict:
     return _define(home, PROVIDERS, name, entry)
 
 
+RATE_FIELDS = ("input", "output", "cache_read")
+
+
 def price(value: object) -> dict:
     """Validates the price an operator recorded on one provider.
 
-    A price is never fetched. It is the operator's own figure per million
-    tokens, applied to the one token count a client records for input and
-    output alike, so it yields an estimate and never a bill.
+    A price is never fetched. ``per_mtok`` is the operator's own figure per
+    million tokens, applied to the one token count a client records for
+    input and output alike. ``models`` maps a model name to the input,
+    output and cache-read rates per million tokens. Either way the result is
+    an estimate and never a bill.
 
     Args:
-        value: Recorded price, holding ``per_mtok``.
+        value: Recorded price, holding ``per_mtok`` and or ``models``.
 
     Returns:
         The validated price.
 
     Raises:
-        BridgeError: If a field is unknown or the price is not positive.
+        BridgeError: If a field is unknown, a rate is unusable, or the price
+            records neither a blended figure nor a model.
     """
-    if not isinstance(value, dict) or set(value) != {"per_mtok"}:
-        raise BridgeError("A price accepts only: per_mtok.")
-    amount = value["per_mtok"]
-    if type(amount) not in (int, float) or not 0 < amount <= MAX_BUDGET:
-        raise BridgeError(
-            "The price per million tokens must be a positive number no "
-            f"greater than {MAX_BUDGET}."
-        )
-    return {"per_mtok": amount}
+    if (
+        not isinstance(value, dict)
+        or not value
+        or set(value) - {"per_mtok", "models"}
+    ):
+        raise BridgeError("A price accepts only: per_mtok, models.")
+    result: dict = {}
+    if "per_mtok" in value:
+        amount = value["per_mtok"]
+        if type(amount) not in (int, float) or not 0 < amount <= MAX_BUDGET:
+            raise BridgeError(
+                "The price per million tokens must be a positive number no "
+                f"greater than {MAX_BUDGET}."
+            )
+        result["per_mtok"] = amount
+    models = value.get("models")
+    if models is not None:
+        if not isinstance(models, dict) or not models:
+            raise BridgeError("A price lists models as a nonempty object.")
+        result["models"] = {}
+        for model, rates in models.items():
+            if (
+                not isinstance(model, str)
+                or not model.strip()
+                or not isinstance(rates, dict)
+                or set(rates) != set(RATE_FIELDS)
+                or any(
+                    type(rate) not in (int, float)
+                    or not 0 <= rate <= MAX_BUDGET
+                    for rate in rates.values()
+                )
+            ):
+                raise BridgeError(
+                    f"A model price for {model!r} needs a name and these "
+                    "rates per million tokens, each from 0 up to "
+                    f"{MAX_BUDGET}: " + ", ".join(RATE_FIELDS) + "."
+                )
+            result["models"][model] = {
+                field: rates[field] for field in RATE_FIELDS
+            }
+    return result
 
 
-def provider_price(home: Path, name: str, per_mtok: float) -> dict:
+def provider_price(
+    home: Path,
+    name: str,
+    per_mtok: float | None,
+    model: str = "",
+    rates: dict | None = None,
+) -> dict:
     """Records or removes the operator's price on one provider definition.
 
     Like a budget, a price on a built-in preset is kept on a local override,
-    and `provider remove` drops it with the override.
+    and `provider remove` drops it with the override. Recording a model's
+    rates keeps the blended figure and every other model; a blended figure
+    of 0 removes only that figure.
 
     Args:
         home: Private bridge state root.
         name: Provider name.
-        per_mtok: Price per million tokens; 0 removes the price.
+        per_mtok: Price per million tokens; 0 removes the blended figure;
+            None leaves it alone.
+        model: Model whose rates are recorded, or empty for none.
+        rates: Input, output and cache-read rates per million tokens of
+            ``model``.
 
     Returns:
         The stored provider definition.
@@ -1111,10 +1162,50 @@ def provider_price(home: Path, name: str, per_mtok: float) -> dict:
         BridgeError: If the provider is not defined or the price is unusable.
     """
     entry = dict(provider(home, name))
-    entry.pop("price", None)
-    if per_mtok:
-        entry["price"] = price({"per_mtok": per_mtok})
+    recorded = dict(entry.pop("price", None) or {})
+    if per_mtok is not None:
+        recorded.pop("per_mtok", None)
+        if per_mtok:
+            recorded["per_mtok"] = per_mtok
+    if model:
+        recorded["models"] = {**recorded.get("models", {}), model: rates}
+    if recorded:
+        entry["price"] = price(recorded)
     return _define(home, PROVIDERS, name, entry)
+
+
+def price_table(home: Path) -> dict[str, dict[str, dict]]:
+    """Collects every model price the operator recorded, by provider.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        Rates per model per provider, holding only providers that record a
+        model price.
+    """
+    table = {}
+    for name, entry in sorted(providers(home).items()):
+        models = (entry.get("price") or {}).get("models")
+        if models:
+            table[name] = models
+    return table
+
+
+def price_version(table: dict) -> str:
+    """Derives the version of a price table from its content.
+
+    Args:
+        table: Result of `price_table`.
+
+    Returns:
+        A short digest that changes whenever any recorded rate changes, or
+        an empty string for an empty table.
+    """
+    if not table:
+        return ""
+    text = json.dumps(table, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
 def credentials(home: Path) -> dict:
