@@ -481,6 +481,37 @@ minutes between polls, a stopped service, is charged to nothing. `status
 time a lane's total crosses a whole minute an `accounting` event is added to
 its lane history.
 
+## Stagnation: more mail than progress
+
+Lanes that talk instead of working keep sending mail while their commits stop.
+`status` and `top` compare each project's last hour with the hour before it.
+Mail is the messages each lane sent. Progress is the commits its branch adds
+past the project base, timed by author time so a rebase or amend does not
+read as new work; the reservations and reservation requests it made; the
+reports it filed; and the handoffs it offered, accepted or assigned. A
+declined, cancelled, refused or unassigned handoff is not progress. Only
+recorded events are counted; no message or commit text is read. A project with
+no progress counts as one event, so the ratio is never infinite. Each source
+is read once for both hours, and `top` reuses a reading for 60 seconds
+(`dashboard.STAGNATION_TTL`) rather than on every refresh.
+
+When mail per progress event reaches 10 and progress did not rise over the
+earlier hour, `status` prints one line at the top of the project and `top`
+prints it under its first summary line:
+
+```text
+Stagnation: last 60 min, 12 mail per 0 progress events (ratio 12, threshold 10; previous 60 min 0 events); most mail per progress: lane-1 2/0, lane-2 2/0, lane-3 2/0. Nothing was sent to lanes.
+```
+
+The line names at most the three lanes with the highest ratio, as mail/progress.
+The window and the threshold are fixed in code with their rationale
+(`stagnation.WINDOW`, `stagnation.THRESHOLD`), so every project is read the
+same way. The signal is for the operator only: nothing is sent to any lane. A
+retired lane is not counted. `status --json` carries the reading per project
+under `stagnation`. `metrics throughput` reports `mail_sent`, `progress` and
+`mail_ratio` per lane and in the project totals, over its own `--since`
+window, and its table ends each project with a `Lane mail:` line.
+
 ## `problems`
 
 One screen says what needs you now. `agent-parley problems` lists, longest-held
@@ -745,6 +776,50 @@ of 10`, so a lane can judge whether a review round is worth asking for. The
 reason moves no candidate, and the coordinator never skips or adds a review
 or a child report because of it.
 
+## Suspected flaky tests
+
+The supervision poll keeps the test failures and passes lanes record, and
+names a test suspected flaky only from those recorded occurrences. Two
+sources feed it:
+
+- report evidence (`agent-parley report --evidence ...`) recorded `clean`:
+  the worktree had no tracked change and no untracked file outside the
+  ignore rules, so the run tested exactly the reported commit; read from
+  the lane's report log;
+- a lane's pull request on the forge: the failed-step logs the poll already
+  quotes to the lane when checks fail, and checks that finish green, both
+  for the head commit the same reading names. Review bodies and inline
+  comments quoted beside the logs are never read.
+
+Test identifiers are pytest node ids (`tests/test_core.py::test_value`) read
+from `FAILED <id>`, `<id> FAILED`, the same forms with `ERROR`, and
+`PASSED <id>` or `<id> PASSED`. Report evidence passes only the tests it
+names as passed, since a report cannot show whether it ran the whole suite;
+a green forge run passes every test already tracked on that commit's tree.
+
+A test is suspected flaky when it:
+
+- failed and passed on the same Git tree, or
+- failed in two lanes forked from the same base commit whose diffs, each
+  against that fork from the base checkout's head, change neither the test
+  file nor a module it imports.
+
+A failure in a lane whose diff changes the test or one of its imports never
+counts towards two lanes, so a regression the change caused is not marked.
+Requiring one fork point means the two lanes ran the same base code: a
+regression merged into the base between their forks gives them different
+fork points and is not counted. A test the shared base itself breaks is
+still marked, which only labels it.
+Each lane that is not retired gets one update per suspicion, naming the test
+and up to six occurrences, and one `test:` issue is suggested to the
+operator, who sees it in `agent-parley followup list` and accepts it with
+`agent-parley followup accept`. The lanes file nothing, and no test is
+skipped or disabled: the flag is a label with evidence. More occurrences of
+a suspected test send nothing more. A later failure on a tree whose diff
+changes the test or its imports clears the suspicion; the test is suspected
+again only on new evidence, and then each lane is told again. The record is
+`flaky.json` in the project's state directory.
+
 ## Usage per issue
 
 A claim records what its lane had consumed when it began and again when it
@@ -781,6 +856,11 @@ token count gains an `estimated_spend` and the totals gain a sum. The text
 output labels the total as an estimate from recorded prices, not a bill. A lane
 cannot set or change a price: the command refuses a lane worktree and any
 process holding a lane's `AGENT_PARLEY_TOKEN`.
+
+Per-model rates for input, output and cache-read tokens are set with
+`provider price NAME --model MODEL --input A --output B --cache-read C` and
+feed `metrics cost` ([Operations](operations.md#estimated-cost-per-shipped-unit)).
+Removing the blended price leaves those rows in place.
 
 ## `watch`
 

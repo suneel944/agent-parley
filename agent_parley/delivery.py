@@ -147,8 +147,7 @@ def _notices(
         )[0]
         parts.append(
             checkpoints.clip(notice, 400)
-            + "\nRun agent-parley issue list for full state. Pause offered "
-            "work until resolved. Silence never transfers ownership."
+            + checkpoints.ISSUE_STATE
             + checkpoints.offered_attachments(issues, agent)
         )
     if offer and offer["id"] != state.get("work_offer"):
