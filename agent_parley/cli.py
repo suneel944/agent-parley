@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         store,
         supervision,
         terminal,
+        verification,
         views,
         worktrees,
     )
@@ -179,6 +180,7 @@ DEFERRED_MODULES = (
     "supervision",
     "tables",
     "terminal",
+    "verification",
     "views",
     "watch",
     "worktrees",
@@ -4471,6 +4473,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     delivered.add_argument("--json", action="store_true", help=JSON_HELP)
+    verified = readings.add_parser(
+        "verification",
+        help=(
+            "Report the find rate of review rounds and child reports by "
+            "issue label and by provider and model."
+        ),
+    )
+    verified.add_argument(
+        "--since",
+        dest="window",
+        type=duration,
+        default=verification.WINDOW,
+        metavar="WINDOW",
+        help="Count outcomes inside this window, such as 7d; 30d by default.",
+    )
+    verified.add_argument("--json", action="store_true", help=JSON_HELP)
     spent = readings.add_parser(
         "cost",
         help=(
@@ -7061,6 +7079,12 @@ def main() -> int:
                 print(json.dumps(reading, indent=2))
             else:
                 print(metrics.describe_throughput(reading), end="")
+        elif args.command == "metrics" and args.reading == "verification":
+            outcomes = verification.reading(bridge.home, args.window)
+            if args.json:
+                print(json.dumps(outcomes, indent=2))
+            else:
+                print(verification.describe(outcomes), end="")
         elif args.command == "metrics" and args.reading == "cost":
             reading = metrics.cost(bridge.home, args.start)
             if args.json:
