@@ -16,14 +16,17 @@ from typing import Any
 from agent_parley import (
     approvals,
     budgets,
+    collisions,
     decisions,
     lanes,
     metrics,
+    observed,
     plan,
     process,
     protocol,
     records,
     roster,
+    stagnation,
     store,
     supervision,
     tables,
@@ -55,6 +58,8 @@ from agent_parley.status import (
     bucket_cell,
     bucket_of,
     bucket_order,
+    contention_lines,
+    contention_reading,
     lane_bucket,
     plan_cell,
     plan_reading,
@@ -63,6 +68,14 @@ from agent_parley.status import (
 )
 
 BRANCH_TTL = 5.0
+STAGNATION_TTL = 60.0
+"""Seconds a project's stagnation reading is reused by a live view.
+
+The reading compares two one-hour windows, so it moves little within a
+minute, while it costs a store query per table and a ``git log`` per lane.
+Reading it once a minute instead of on every branch refresh keeps ``top``
+cheap without hiding a stalled project for long.
+"""
 MAX_PROMPT = 120
 COLUMNS = (
     ("PARTICIPANT", 14),
@@ -85,6 +98,7 @@ COLUMNS = (
     ("IDLE", 8),
     ("UNUSED", 7),
     ("FIT", 8),
+    ("MERGED", 6),
     ("PLAN", 14),
     ("TASK", 4),
 )
@@ -106,6 +120,7 @@ DEFAULT_COLUMNS = (
 FLEX = ("STATE", "TASK")
 ONCE_HINT = "Live view: top without --once; ? explains each column."
 DROP_ORDER = (
+    "MERGED",
     "PROVIDER",
     "EVENT",
     "BRANCH",
@@ -150,6 +165,9 @@ SORT_KEYS: dict[str, Callable[[dict], Any]] = {
         -(row.get("accounting") or {}).get("idle_per_lane_hour", -1.0)
     ),
     "FIT": lambda row: 0 if row["fit"] is False else 1 if row["fit"] else 2,
+    "MERGED": lambda row: (
+        -(-1.0 if row.get("merge_fraction") is None else row["merge_fraction"])
+    ),
     "PLAN": lambda row: -row["task_plan"]["done"],
     "TASK": lambda row: row["prompt"],
 }
@@ -196,8 +214,12 @@ LEGEND = (
     "budget counts what the client recorded, not spend.",
     "TASK is the lane's last prompt or recorded task, clipped to the "
     "terminal; enter shows it whole. The default columns leave out "
-    "PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED and FIT; c or "
-    "--columns all shows them.",
+    "PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED, FIT and "
+    "MERGED; c or --columns all shows them.",
+    "MERGED is the share of the lane's pull requests opened in the outcome "
+    "window, the --since window or the last 7 days, that merged; - when the "
+    "lane opened none. It reads the pull request record supervision keeps "
+    "and never asks the forge.",
     "Columns: MAIL unread/pending acknowledgement; LEASES held leases, "
     "!past a declared time to live, +queued requests waiting on those "
     "keys, with the age of the oldest; DENIALS "
@@ -311,26 +333,57 @@ def _fitness(row: dict) -> str:
     return f"{value}+{row.get('offer_kind', '')}"
 
 
-def _cached(cache: dict, key: object, read: Callable[[], Any]) -> Any:
-    """Runs a Git reading at most once per branch refresh interval.
+def _cached(
+    cache: dict,
+    key: object,
+    read: Callable[[], Any],
+    ttl: float = BRANCH_TTL,
+) -> Any:
+    """Runs a Git reading at most once per refresh interval.
 
     Args:
         cache: Caller-owned mapping of key to its last reading.
         key: What the reading is about, such as a lane or a project root.
         read: Produces a fresh reading.
+        ttl: Seconds a reading is reused; the branch refresh interval
+            unless the reading names a longer one.
 
     Returns:
-        The last reading when it is younger than ``BRANCH_TTL``, otherwise a
-        fresh one. Git subprocesses dominate a frame, so a live view pays for
+        The last reading when it is younger than ``ttl``, otherwise a fresh
+        one. Git subprocesses dominate a frame, so a live view pays for
         them on this interval instead of on every redraw.
     """
     now = time.monotonic()
     cached = cache.get(key)
-    if cached and now - cached[0] < BRANCH_TTL:
+    if cached and now - cached[0] < ttl:
         return cached[1]
     value = read()
     cache[key] = (now, value)
     return value
+
+
+def _stagnation(
+    home: Path, directory: Path, manifest: dict, ledger: dict
+) -> dict:
+    """Reads one project's stagnation signal on its own store connection.
+
+    Args:
+        home: Private bridge state root.
+        directory: Private project state directory.
+        manifest: Project manifest.
+        ledger: The project's issue ledger.
+
+    Returns:
+        The reading `stagnation.reading` returns; one without the store
+        counts no mail, so it never reads as stagnant.
+    """
+    if store.present(home):
+        try:
+            with store.connect(home) as db:
+                return stagnation.reading(db, directory, manifest, ledger)
+        except (BridgeError, OSError, sqlite3.Error):
+            return stagnation.reading(None, directory, manifest, ledger)
+    return stagnation.reading(None, directory, manifest, ledger)
 
 
 def _pull_request_record(directory: Path) -> object:
@@ -519,9 +572,16 @@ def _row(
         "alive": process.alive(
             state.get("session_pid"), state.get("session_ticks")
         ),
-        "provider": (
-            f"{participant['provider']}/"
-            f"{participant['credential'] or 'default'}"
+        "provider": " ".join(
+            filter(
+                None,
+                (
+                    f"{participant['provider']}/"
+                    f"{participant['credential'] or 'default'}",
+                    participant.get("model"),
+                    participant.get("effort"),
+                ),
+            )
         ),
         "credential": participant["credential"],
         "state": tables.session(
@@ -573,6 +633,7 @@ def _row(
         "last_event_ts": events["last_ts"],
         "branch": branch,
         "drift": branch != participant["branch"],
+        "worktrees": observed.of(data, agent),
         "review": str(review.get("verdict", "")),
         "reviewer": str(review.get("reviewer", "")),
         "reviewed_report": str(review.get("report_id", "")),
@@ -604,6 +665,12 @@ def _row(
         "stale_lease_age": stats.get("stale_lease_age", 0),
         "queued": stats.get("queued", 0),
         "queued_by": list(stats.get("queued_by", [])),
+        "contention": contention_reading(
+            stats.get("contention", []),
+            data,
+            context["issues"]["issues"],
+            participant["display"],
+        ),
         "injected_bytes": events["injected_bytes"],
         "injected_per_hour": hourly_rate(state),
         "hook_events": events["events"],
@@ -882,15 +949,46 @@ def collect(
             _row(home, path.parent, data, agent, context)
             for agent in sorted(data["participants"], key=tables.natural_key)
         ]
+        converging = collisions.read(
+            home,
+            path.parent,
+            data,
+            {row["participant"]: row["branch"] for row in rows},
+        )
+        for row in rows:
+            row["converging"] = collisions.peers(converging, row["participant"])
+            row["bucket"] = lane_bucket(row)
         _orphan_remedies(rows, data["root"])
+        metrics.share_files(rows)
+        retired = [
+            counts
+            for name, counts in outcomes["lanes"].items()
+            if name not in data["participants"]
+        ]
         if providers:
             rows = [row for row in rows if row["provider_name"] in providers]
+            retired = []
         projects.append(
             {
                 "root": data["root"],
                 "present": present,
                 "rows": rows,
                 "pull_requests_excluded": outcomes["excluded"],
+                "merge_health": metrics.merge_health([*rows, *retired]),
+                "provider_health": {
+                    name: metrics.merge_health(
+                        [row for row in rows if row["provider_name"] == name]
+                    )
+                    for name in {row["provider_name"] for row in rows}
+                },
+                "stagnation": _cached(
+                    branches,
+                    ("stagnation", data["root"]),
+                    functools.partial(
+                        _stagnation, home, path.parent, data, ledger
+                    ),
+                    STAGNATION_TTL,
+                ),
                 "ready_groups": plan.ready_groups(
                     plan.groups(path.parent),
                     context["issues"],
@@ -975,6 +1073,11 @@ def row_cells(row: dict) -> tuple[str, ...]:
         tables.age(row["idle_seconds"]) + ("" if row["idle_complete"] else "+"),
         _unused(row.get("accounting")),
         _fitness(row),
+        (
+            "-"
+            if row.get("merge_fraction") is None
+            else f"{row['merge_fraction']:.0%}"
+        ),
         plan_cell(row["task_plan"]),
         row["prompt"] or "-",
     )
@@ -1014,8 +1117,10 @@ def notes(row: dict) -> list[str]:
         The branch drift, rejected call, stall, operator edit, base
         advance, orphan, budget, stale plugin, fitness, work offer, failed
         review,
-        escalated dispatch and blueprint run markers the lane holds, in
-        that order. The note
+        escalated dispatch and blueprint run markers the lane holds, then
+        one line per open observed worktree with its path, branch, base
+        and a flag marker when it lies outside the CLI's worktree
+        directory, in that order. The note
         row already names the lane, so a fitness reason drops its own copy
         of the name. Drift, rejected calls, offers and failed reviews are
         noted because their columns can be dropped or left out of the
@@ -1050,6 +1155,14 @@ def notes(row: dict) -> list[str]:
     if row["work_dispatch"].get("state") == "escalated":
         found.append(row["work_dispatch"]["last_result"])
     found.append(row.get("blueprint", ""))
+    found.extend(contention_lines([row]))
+    found.extend(
+        f"worktree {tree['path']} on {tree['branch'] or 'no branch'} "
+        f"(base {tree['base']})"
+        + (", flagged: outside .claude/worktrees" if tree["flagged"] else "")
+        for tree in row.get("worktrees", [])
+        if not tree.get("closed")
+    )
     found.append(recap_note(row))
     return [str(note) for note in found if note]
 
@@ -1478,7 +1591,12 @@ def _summary(view: dict, rate: str) -> list[str]:
         f"{totals['denials']} denied ({rate})"
         + f"   Context: {tables.size(totals['context'])}"
     )
-    return [first, f"{lanes_line}   {issues_line}", traffic]
+    stalled = [
+        (f"{project['root']}: " if len(view["projects"]) > 1 else "") + text
+        for project in view["projects"]
+        if (text := stagnation.line(project.get("stagnation") or {}))
+    ]
+    return [first, *stalled, f"{lanes_line}   {issues_line}", traffic]
 
 
 def layout(

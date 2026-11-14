@@ -44,7 +44,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from agent_parley import issues, lifecycle
+from agent_parley import issues, lifecycle, protocol
 from agent_parley.state import BridgeError, lock, write_json
 
 PUBLICATION = "convergence.json"
@@ -710,8 +710,9 @@ def message(action: dict, notified: bool = False) -> tuple[str, str]:
         "improvement; a passing gate does."
     )
     record = (
-        f"Record each gate result with `agent-parley report --state partial "
-        f"--issue {number} --evidence '<gate summary line>'`."
+        f"Record each gate result with `{protocol.cli_command()} report "
+        f"--state partial --issue {number} --evidence "
+        "'<gate summary line>'`."
     )
     if action["stage"] == APPROACH:
         return (
@@ -732,9 +733,11 @@ def message(action: dict, notified: bool = False) -> tuple[str, str]:
         f"{subject}; operator notified" if notified else subject,
         f"Issue #{number} is still not converging after the request to change "
         f"approach. {account} {operator} If another "
-        "lane should take it, offer it explicitly with `agent-parley issue "
-        f"offer {number} --to NAME --summary TEXT`; the operator can reassign "
-        f"it with `agent-parley issue assign {number} NAME`. Nothing moves on "
+        "lane should take it, offer it explicitly with "
+        f"`{protocol.cli_command()} issue offer {number} --to NAME --summary "
+        "TEXT`; the operator can reassign "
+        f"it with `{protocol.cli_command()} issue assign {number} NAME`. "
+        "Nothing moves on "
         "its own, and no further convergence notice follows until a verified "
         "improvement or a new claim.",
     )

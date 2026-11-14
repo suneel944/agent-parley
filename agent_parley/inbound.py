@@ -45,7 +45,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from agent_parley import decisions, followups, notify
+from agent_parley import decisions, followups, notify, protocol
 from agent_parley.state import BridgeError, write_json
 
 if TYPE_CHECKING:
@@ -951,7 +951,8 @@ def _carrying(
         manifest["participants"][peer]["display"],
         f"Take {dead}'s orphaned claims {listed}",
         f"The operator gave you {dead}'s orphaned claims {listed}. Take "
-        "each with agent-parley issue claim NUMBER --take-orphaned.",
+        f"each with `{protocol.cli_command()} issue claim NUMBER "
+        "--take-orphaned`.",
         f"decision:{record['id']}",
     )
 

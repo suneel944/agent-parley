@@ -197,11 +197,28 @@ would. With no idle lane it stays unclaimed for the next lane that pulls work.
 A repeat prints the issue already filed. Filing needs the GitHub forge; a
 refusal leaves the suggestion pending. With Telegram configured, each
 suggestion also arrives as a decision with an `accept` button that takes a
-confirming tap. Unaccepted suggestions expire after seven days.
+confirming tap. Unaccepted suggestions expire after seven days; an expired one
+stays in `followups.json` in the `expired` state with `expired_at`, the time it
+lapsed, the newest 100 of them, and can no longer be accepted. Listing
+suggestions records the expiry too, so the file never shows a lapsed suggestion
+as pending.
+
+A title already pending, compared without case or extra spaces, is one
+suggestion whichever lane proposes it: a second lane gets the recorded one back
+as repeated. `lane`, `why` and `paths` keep the first lane's, `lanes` lists
+every lane and `reasons` keeps each lane's `why` and `paths`; `followup list`
+prints each other lane under `also suggested by` with its reasons.
+Open forge issues are matched from the supervisor's cached forge reading. When
+that cache is missing, unreadable or stale, the suggestion result and each
+listed suggestion carry `forge_checked: false`, and the note, the Telegram
+decision and `followup list` say open issues could not be checked, so
+duplicates cover claims only.
 
 `followup list --json` prints `kind: followup_list` with `suggestions`, each
-carrying `id`, `lane`, `title`, `why`, `paths`, `created`, `expires`, `state`
-and `duplicates` (`issue`, `title`, `owner`). `followup accept --json` prints
+carrying `id`, `lane`, `lanes`, `reasons`, `title`, `why`, `paths`, `created`,
+`expires`,
+`state`, `forge_checked` and `duplicates` (`issue`, `title`, `owner`).
+`followup accept --json` prints
 `kind: followup_accept` with the same fields plus `issue`, `milestone`,
 `offered_to`, `offer_id` and `repeated`.
 
@@ -585,6 +602,8 @@ live lane; `problems` answers what needs an operator right now.
 agent-parley problems
 agent-parley problems --ack-after 900
 agent-parley problems --json
+agent-parley problems --apply
+agent-parley problems --apply --yes
 ```
 
 The command derives its rows from the same reading `status` and `top` print,
@@ -628,6 +647,7 @@ condition, that count, its age and what clears it:
 | `checks failed` | An open pull request's checks are red with at least one check the forge ran and failed, or its head is pending on the one automatic re-run supervision requested. The row names the attempt and the failed checks. | `gh pr checks URL`, then fix and push or re-run; while the automatic re-run is pending, wait for its conclusion; after it, run the re-run command the row names yourself, or fix and push. |
 | `ci rounds exhausted` | An open pull request's head is red after it used its CI rounds: the `ci_rounds` supervision setting (2) plus any round the operator granted. A round is a head commit whose checks finished; a re-run on the same head is not a new round. The lane was told once to stop pushing and report blocked, and one decision offers `grant one more round` or `take over`. The row replaces `checks failed` for that pull request and clears on a green head. | Answer the decision: a grant lets the lane push once more; a takeover stops further decisions for that pull request. The limit is advisory and never refuses a push. |
 | `checks refused` | A required check the forge never started blocks one or more open pull requests. One row per check name and forge conclusion names every pull request it blocks. | Resolve it at the forge (billing, spending limit or manual approval), then re-run once. |
+| `reservation contention` | Two lanes were refused by each other, alternating, four times on one path inside 30 minutes of the first; one lane retrying against an idle holder does not count, and a refusal blocked by several leases of one holder counts once. Each lane was told once to finish or stash its edit on that path and wait. One row per pair and path names both claims, and the lanes sit in the needs-input group of `status` and `top`; `issue show` prints it for both issues. Reservations stay advisory and nothing locks the path. The pair is not flagged again for that path until the operator acts. | `agent-parley issue offer N --to LANE` then the other lane accepts, or `agent-parley issue release N`; an accept ends only the record between the two lanes, and a release ends the releasing lane's records only when it holds no other issue. Counting then restarts. A record naming a retired lane is no longer reported, and old records are pruned. |
 | `session outliving its claim` | The lane holds no claim, yet a native session in a worktree the lane made showed activity in the last 60 seconds. | `agent-parley status NAME`; Agent Parley never stops such a session. |
 | `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
 | `root missing` | The project root checkout is gone. Lanes retire only once it has been gone `root_gone_after` (an hour by default), and never while its parent directory cannot be listed; the row then says the root is unreachable. Past that, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
@@ -644,6 +664,30 @@ condition, that count, its age and what clears it:
 | `over budget` | The lane crossed an advisory token, call or hour limit. | `agent-parley participant budget NAME` |
 | `run budget exhausted` | The project's enforced run budget is used up or its ledger was unreadable or missing; no wake, dispatch, retry or launch starts. | `agent-parley budget resume` after raising the limit, or `--reset` |
 | `run budget unmetered` | A lane has no readable token records while a token limit is enforced, or a live session not started by `agent-parley run` while an hours limit is, so it is refused wakes, dispatch and retries. | `agent-parley budget enforce --tokens 0 --hours 0`, or relaunch the lane with `agent-parley run` on a provider whose transcripts Parley reads |
+
+`--apply` runs, after the list, the remedies that cannot drop work. Each
+row whose remedy could be run carries a structured action that marks it safe
+or names why not, so the classification never parses the printed command.
+Two remedies are safe:
+
+- Retiring a lane `ready to retire` whose session process is recorded gone,
+  whose project root still exists and whose worktree Git reads as clean,
+  with no ignored files. It runs the same path as `participant retire NAME`,
+  which checks the session lock and the worktree again before it removes
+  anything.
+- Collecting the private state of a project whose root is gone after the
+  service retired its lanes, as `gc --project ROOT --apply` does. It keeps
+  the recovery checkpoints. No `problems` row names such a project without
+  `--apply`.
+
+Everything else is listed as skipped with its reason: a lane whose session
+may still run, a worktree with uncommitted changes, ignored files or one Git
+could not read, and a gone root whose lanes are live, refused retirement or
+are not retired yet. One question covers the safe set; `--yes` answers it,
+and an unanswered question, as on a closed standard input, declines and runs
+nothing. Each remedy prints its result or its failure. The command exits 1
+when the operator declines or any remedy fails, and 0 otherwise. `--yes`
+without `--apply`, or `--apply` with `--json`, is a usage error.
 
 A retired lane reports nothing but that kept worktree. Its quiet is the state
 it was asked for, so it raises no stall, no inactivity and no acknowledgement
@@ -1808,6 +1852,56 @@ never handed out twice. A history window cannot reach past rows that
 retention removed. Freed pages stay in `bridge.sqlite3` for reuse rather
 than shrinking the file.
 
+### Audit bundle
+
+`agent-parley audit export` writes one JSON file a third party can check:
+
+```sh
+agent-parley audit export --since v0.22.0 --until v0.23.0 --output audit.json
+agent-parley audit export --since 7d --output audit.json --sign ~/.ssh/id_ed25519
+agent-parley audit verify audit.json --require-signature
+```
+
+The bundle covers the lanes with their provider and model, the issues resolved
+in the window, claims and handoffs, ready reports with their evidence, review
+rounds with their findings count, the pull requests supervision saw open in the
+window, and each lane's commits beyond the base. A `REF` is read first as an
+instant or a window, as every other `--since` reads it, and otherwise as a
+commit of the project, which stands for its committer time; `--until` defaults
+to now. Records are read through the modules that keep them; the store is
+opened read-only and the only file written is the one `--output` names.
+
+Each record carries the SHA-256 of its canonical JSON (sorted keys, no
+insignificant whitespace, non-ASCII text escaped) with the hash of the record
+before it, so `audit verify` names the first record that was changed, removed
+or reordered and exits with status 1. Credentials, tokens and transcripts never
+enter the bundle: lanes are copied field by field, and any key named like a
+token, secret, password, credential or prompt is dropped unless it holds a
+number such as a token count. A key whose last underscore-separated part is
+`key`, such as `key`, `api_key`, `ssh_key` or `signing_key`, is dropped too,
+while `monkey` or `keyboard` stay. Text claiming assistant authorship is
+withheld.
+
+The bundle can hold only what coordination still keeps. Each issue keeps its
+newest 50 history entries, closed pull requests are kept for 30 days, and each
+lane's report log keeps its newest 2000 records that fit under 262144 bytes;
+past that size it is trimmed to half of it, so long reports leave far fewer
+than 2000. The bundle's `horizons` field names each cap with its limit and
+unit, plus the byte bound for the report log, and marks it `exceeded` when
+records older than the oldest one kept may have fallen inside the window, so
+the bundle can be missing records there.
+
+The chain proves the bundle is consistent, not who wrote it. `--sign KEY` signs
+the bundle with an existing SSH key through `ssh-keygen -Y sign` under the
+`agent-parley-audit` namespace and embeds the signature. `audit verify` checks
+it with `ssh-keygen -Y check-novalidate`, which needs no allowed-signers file,
+and prints the signing key's fingerprint; compare it with `ssh-keygen -l -f
+KEY.pub` of the key you expect. `--signer PUBKEY_FILE` makes that comparison
+for you: the signature is checked with `ssh-keygen -Y verify` against an
+allowed-signers file trusting only that public key, and a signature by any
+other key, or no signature, fails. A bundle without a signature verifies on
+its chain alone unless `--require-signature` or `--signer` is given.
+
 ### Following one lane
 
 `agent-parley watch NAME` sits on one participant and prints its coordination
@@ -1969,7 +2063,8 @@ the `participants` the acknowledgement was recorded for. `provider add --json`
 and `credentials add --json` report the whole `providers` or `credentials`
 registry the definition joined. `issue resolve --json` reports `issue`,
 `outcome` (`complete` or `release`), the former `holder`, the resulting
-`owner` and execution `state`, and the forge `evidence` it acted on.
+`owner` and execution `state`, the forge `evidence` it acted on, and the
+claim's acceptance `criteria` with their `criteria_evidence` lines.
 `issue recover --json` reports the approval `id`, `issue`, `claim_id`, `owner`,
 the live session it is bound to as `session_id`, `session_pid` and
 `session_ticks`, `reason`, `authorized_by` and `authorized_at`. Without `--json`
@@ -1984,8 +2079,24 @@ command where one applies; `--json` is the stable machine form.
 `collisions` its likely paths run into, `named_to`, the other lane whose
 published work names it as next work or empty, `same_files`, the claims
 this lane holds whose paths its forecast paths run into, `held_back`, the
-other lanes' live claims doing so as `issue` and `owner` records, and the
-ordered `reasons` for its place.
+other lanes' live claims doing so as `issue` and `owner` records, `reach`
+and `chain`, the open issues it transitively unblocks and the longest chain it
+starts, `cycle`, the issues it waits on in a dependency cycle or empty, and
+the ordered `reasons` for its place. The top level also carries `cycles`, every
+dependency cycle found, as lists of issue numbers.
+
+`milestone path` prints the longest dependency chain among a milestone's open
+issues, blocker first, as `#N TITLE: STATE, HOLDER` per issue, where `STATE` is
+the ledger's lifecycle state or `unclaimed`, and `HOLDER` is the owning lane or
+`nobody`. `--milestone TITLE` selects the milestone, which is the forge's
+active one when omitted and every cached open issue when the forge names none.
+`--json` reports `milestone`, `forge_reading`, `path` with `issue`, `title`,
+`state` and `holder` per step, and `cycles`. `forge_reading` is false when the
+cached forge reading is missing or older than the freshness window, or the
+project has no GitHub forge; the text then says `No fresh forge reading` rather
+than that no edge is recorded, because only ledger dependencies are known. It
+reads the ledger and the cached forge reading, claims nothing and writes
+nothing.
 
 `resources show --json` reports `root`, the declared `resources` array and
 `declared`. `status` reports `server`, `state_directory`, `inbound` as
@@ -2108,16 +2219,28 @@ every project series `project`. The lane families are
 `agent_parley_lane_pull_requests_merged_window`,
 `agent_parley_lane_pull_requests_closed_window`,
 `agent_parley_lane_first_pass_ratio`, `agent_parley_lane_ci_rounds_unknown`,
-`agent_parley_lane_ci_rounds_median` and
-`agent_parley_lane_claim_to_merge_seconds_median`. The project families are
+`agent_parley_lane_ci_rounds_median`,
+`agent_parley_lane_claim_to_merge_seconds_median`,
+`agent_parley_lane_merge_fraction_ratio`,
+`agent_parley_lane_pull_requests_abandoned_window`,
+`agent_parley_lane_pull_requests_end_unknown_window` and
+`agent_parley_lane_shared_file_degree_ratio`. The project families are
 `agent_parley_project_participants`, `agent_parley_project_idle_seconds`,
 `agent_parley_project_context_bytes_window`,
 `agent_parley_project_hook_events_window`,
-`agent_parley_project_hook_denials_window` and
-`agent_parley_project_pull_requests_excluded`; the summed families add up the
+`agent_parley_project_hook_denials_window`,
+`agent_parley_project_pull_requests_excluded`,
+`agent_parley_project_merge_fraction_ratio`,
+`agent_parley_project_pull_requests_abandoned_window`,
+`agent_parley_project_pull_requests_end_unknown_window` and
+`agent_parley_project_shared_file_degree_ratio`; the summed families add up the
 rows that project reports, so a total never counts a lane the export does not
-show. The pull request families are explained in
-[Monitoring](monitoring.md).
+show. The provider families, labelled `project` and `provider`, are
+`agent_parley_provider_merge_fraction_ratio`,
+`agent_parley_provider_pull_requests_abandoned_window`,
+`agent_parley_provider_pull_requests_end_unknown_window` and
+`agent_parley_provider_shared_file_degree_ratio`. The pull request and merge
+health families are explained in [Monitoring](monitoring.md).
 `agent_parley_lane_hook_denials_by_cause_window` splits a lane's denials by
 `reason` and `tool`, so a refusal over a reserved path or an expiring offer
 reads apart from a policy refusal.
@@ -2213,6 +2336,58 @@ Per lane it reports:
 The project total counts a merged issue and an operator message once. A lane
 whose retained transitions start inside the window is named, because its
 hours understate the window; each project keeps its latest 2000 lane events.
+
+### Estimated cost per shipped unit
+
+```bash
+agent-parley provider price claude --model opus --input 15 --output 75 --cache-read 1.5
+agent-parley provider price claude
+agent-parley metrics cost --since 7d
+agent-parley metrics cost --since 7d --json
+```
+
+`provider price NAME --model MODEL --input A --output B --cache-read C` records
+a price row: what one million tokens of that model cost, in whatever currency
+the operator uses. All three rates are required, each from 0 up. The rows live
+in the provider registry beside the blended `--per-mtok` figure, which keeps
+working for `report usage`; setting one does not remove the other. Setting a
+row for the same provider and model again overwrites it. `provider price NAME`
+with no flag prints the rows. Like every provider setting, the command is
+operator only. The table's version is a short digest of its content, so any
+change to a rate gives a new version.
+
+`metrics cost --since` takes an instant or a window like `metrics throughput`
+and joins each lane's native client token counts in the window with what the
+lane shipped in it. A lane's model comes from its participant record; a lane
+with no recorded model is priced with the row named `default`
+(`provider price NAME --model default ...`), and a lane whose recorded model
+has no row is `unknown` and never falls back to `default`. Its
+input is split into cache-read tokens, priced at the cache-read rate, and the
+rest, priced at the input rate. It prints a provider table totalled across
+every project, so the provider with the lowest cost per shipped unit can be
+read, then per project a lane table and a provider table, each with the
+estimated cost and the cost per merged issue, per merged pull request and per
+review finding the lane returned as a reviewer. Merges, tokens and findings
+all stop at the window end. `--json` prints one document that carries
+`price_table_version`, the per-project figures and the cross-project
+`providers`.
+
+The output is an estimate from the clients' own token counts and the
+operator's recorded prices. It is not billed spend, and the command makes no
+claim about tokens saved.
+
+- With no price table recorded the command prints one line saying so and how
+  to record a row. It uses no default price.
+- A lane whose provider reports no token count, such as amp, or whose model
+  has no price row, is `unknown` with the reason. It is never zero and adds
+  nothing to the provider total, which lists it under `unknown_lanes`.
+- The cost per unit is the lane's windowed cost divided by its units in the
+  window, not a measure of the cost of one claim: no client record names the
+  claim it was working on. A unit count of zero leaves that figure unknown.
+- Only Claude and Codex report a cache-read count. For the other providers
+  all input is priced at the input rate.
+- Review rounds are retained for seven days, so findings older than that are
+  not counted.
 
 ## Participants, providers and accounts
 
@@ -2595,6 +2770,21 @@ was observed beside the operator's reason, and history shows a `resolve` by
 the work complete and frees the issues waiting on it; a pull request closed
 without merging integrated nothing, so `--release` is required there and
 returns the work to the queue.
+
+A claim on an issue whose `Boundaries and acceptance criteria` or `Expected
+and actual behavior` section lists items carries those items as numbered
+acceptance criteria, read once from the forge when the issue is claimed and
+delivered to a lane started with `run NAME --issue N` apart from the quoted
+issue text; an issue without them asks the lane to state its own. The lane's
+ready report must give one `--evidence` line per criterion, written `N:
+<command and its result, test name, or why it does not apply>`, and a report
+missing one is refused with each missing criterion named. `issue resolve`
+takes the same repeatable `--evidence` lines and refuses them when one is
+missing; without them the ready report's lines stand, and a claim whose
+holder recorded none gets the forge outcome, the pull request, its state and
+branch, as the evidence of every criterion, so an ended pull request still
+closes the claim. `issue show` prints each criterion beside its evidence. The
+runtime checks that each line exists, not that it proves its criterion.
 
 For eligible idle sessions, the launcher owns a native pseudo-terminal and a
 private wake socket. It admits a coordination prompt at a native idle checkpoint,
@@ -2990,6 +3180,32 @@ irreversible, so every option takes the `confirm` tap and no timeout ever
 applies a default to it. Nothing retries, rewords or works around the
 refused call, and the service never writes the suggested rule or any bypass
 flag: adding the rule is the operator's edit to their own settings.
+
+### Worktrees a lane's client makes
+
+A Claude Code lane runs its hook on the shared lifecycle events, on
+`PermissionDenied`, and on `TaskCompleted` and `TeammateIdle`. The last two
+record progress or an idle teammate in `<lane>-activity.json`, including for a
+subagent's event, and never block. No `WorktreeCreate` or `WorktreeRemove`
+hook is installed: the `claude` CLI hands checkout creation to a configured
+`WorktreeCreate` hook, which must then make the worktree and print its path,
+and fires `WorktreeRemove` only for worktrees such a hook made. The launcher
+never creates, moves or prunes a checkout for the client.
+
+Instead a hook event whose working directory is another worktree of the lane's
+repository is recorded on the lane's roster entry, accepted as inside the lane,
+and listed in `top` with its path, branch and base. A worktree outside
+`<lane>/.claude/worktrees/` is flagged, because unrecorded checkouts in other
+places are how one audit found 971 stray worktrees. Its base reads `lane` when
+it contains the lane branch tip and `default` otherwise: the CLI's
+`worktree.baseRef` setting can cut a worktree from `origin/<default>` rather
+than from the lane, and a `default` base means its work does not start from
+the lane's. On first sight the lane reserves the worktree's repository-relative
+path, so a peer reserving it is told of the conflict; reservations are
+advisory. A worktree outside the repository is recorded and flagged but not
+reserved. At `Stop` or `SessionEnd` a record whose directory is gone is closed;
+its reservation stays until the lane's own release, because the store releases
+a lane's reservations only all at once.
 
 ### Reclaiming landed lanes
 
@@ -3858,6 +4074,12 @@ agent-parley unattended show
 agent-parley unattended run claude-1
 agent-parley unattended set          # remove it; operator-only again
 ```
+
+`show` is the default action. `unattended`, `verify`, `init`, `pool`,
+`approval` and `timeout` typed with no action print what `show` prints and
+exit 0, and accept the options `show` accepts, such as `--repo` and `--json`.
+Every command that changes state still requires its own action, and
+`--help` and shell completion still list every action.
 
 The policy is stored in `project.json` as
 `"integration": {"unattended": {"target": "main", "issues": ["42", "43"]}}`.

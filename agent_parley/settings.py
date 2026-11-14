@@ -701,20 +701,31 @@ class SettingsMixin(BridgeCore):
             + f" Standing: {standing}. A budget informs and does not gate."
         )
 
-    def price(self, repo: Path, name: str, per_mtok: float | None) -> str:
+    def price(
+        self,
+        repo: Path,
+        name: str,
+        per_mtok: float | None,
+        model: str = "",
+        rates: dict | None = None,
+    ) -> str:
         """Reports or records the operator's price on one provider.
 
         A price turns a recorded token count into an estimated spend in
-        `report usage`; nothing is fetched from a vendor. Only the operator
-        records one: a process holding a lane's token is refused wherever
-        it runs, and so is a command run from a lane's worktree, the same
-        boundary every operator-only project setting keeps.
+        `report usage` and `metrics cost`; nothing is fetched from a vendor.
+        Only the operator records one: a process holding a lane's token is
+        refused wherever it runs, and so is a command run from a lane's
+        worktree, the same boundary every operator-only project setting
+        keeps.
 
         Args:
             repo: Directory the command runs from.
             name: Provider the price belongs to.
             per_mtok: Price per million tokens, 0 to remove it, or None to
-                report the recorded price.
+                leave it alone.
+            model: Model whose input, output and cache-read rates are
+                recorded, or empty to record none.
+            rates: Rates per million tokens of ``model``.
 
         Returns:
             An account of the recorded price.
@@ -729,7 +740,7 @@ class SettingsMixin(BridgeCore):
         from agent_parley import unattended
         from agent_parley.cli import roster
 
-        if per_mtok is not None:
+        if per_mtok is not None or model:
             if os.environ.get(roster.LANE_TOKEN):
                 raise BridgeError(
                     "A price is recorded from an operator shell, never from "
@@ -743,14 +754,25 @@ class SettingsMixin(BridgeCore):
                 unattended.operator_only(
                     repo, root, roster.read(directory), "A price is recorded"
                 )
-            roster.provider_price(self.home, name, per_mtok)
+            roster.provider_price(self.home, name, per_mtok, model, rates)
         recorded = roster.provider(self.home, name).get("price")
         if not recorded:
             return f"provider {name} has no price; report usage shows no spend."
-        return (
-            f"provider {name} price {recorded['per_mtok']:g} per million "
-            "tokens; report usage shows spend as an estimate."
-        )
+        parts = []
+        if "per_mtok" in recorded:
+            parts.append(
+                f"price {recorded['per_mtok']:g} per million tokens; "
+                "report usage shows spend as an estimate"
+            )
+        for each, row in sorted((recorded.get("models") or {}).items()):
+            parts.append(
+                f"model {each} per million tokens: "
+                + ", ".join(
+                    f"{field.replace('_', '-')} {row[field]:g}"
+                    for field in roster.RATE_FIELDS
+                )
+            )
+        return f"provider {name} " + "; ".join(parts) + "."
 
     def enforce(self, repo: Path, changes: dict | None = None) -> str:
         """Reports or records the run budget a project opted into enforcing.

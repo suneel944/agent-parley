@@ -20,6 +20,7 @@ retention kept is reported as incomplete rather than quietly counted as zero.
 
 from __future__ import annotations
 
+import collections
 import datetime
 import json
 import sqlite3
@@ -36,7 +37,9 @@ from agent_parley import (
     lanes,
     process,
     records,
+    reviews,
     roster,
+    stagnation,
     store,
 )
 from agent_parley.state import (
@@ -125,16 +128,71 @@ def record_report(directory: Path, name: str, entry: dict) -> dict:
             with lock(directory / f"{name}-reports.lock", timeout=0.2):
                 with path.open("a", encoding="utf-8") as stream:
                     stream.write(line)
-                for dropped in trim_log(
+                dropped = trim_log(
                     path, MAX_REPORT_LOG_BYTES, MAX_REPORT_RECORDS
-                ):
-                    _drop_attachment(directory, dropped)
+                )
+                for line in dropped:
+                    _drop_attachment(directory, line)
+                if dropped:
+                    _mark_trim(directory, name, dropped[-1])
         except BridgeError:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(line)
     except OSError:
         return record
     return record
+
+
+def _trim_path(directory: Path, name: str) -> Path:
+    """Returns the file holding when one lane's report log last lost a record.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        The marker path beside the report log.
+    """
+    return directory / f"{name}-reports.trimmed"
+
+
+def _mark_trim(directory: Path, name: str, line: str) -> None:
+    """Records the time of the newest record a report log rotation dropped.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+        line: Newest serialized record the rotation dropped; a damaged
+            line is ignored.
+    """
+    try:
+        dropped = json.loads(line)
+        at = float(dropped["at"])
+    except (ValueError, TypeError, KeyError):
+        return
+    _trim_path(directory, name).write_text(f"{at}\n", encoding="utf-8")
+
+
+def report_trimmed_at(directory: Path, name: str) -> float:
+    """Reads when one lane's report log last dropped a record.
+
+    The size of a rotated log says nothing reliable about whether it was
+    rotated, because the byte rotation leaves it at or under half the cap
+    and an unrotated log can be larger. The rotation therefore records the
+    time of the newest record it dropped, and a reader asks for that.
+
+    Args:
+        directory: Private state directory for the common repository.
+        name: Participant that owns the lane.
+
+    Returns:
+        Unix time of the newest dropped record, or zero when the log has
+        never dropped one.
+    """
+    try:
+        return float(_trim_path(directory, name).read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
 
 
 def _drop_attachment(directory: Path, line: str) -> None:
@@ -612,12 +670,15 @@ def ci_rounds(reading: dict | None) -> int | None:
     return value
 
 
-def _merges(ledger: dict, since: float) -> dict[str, dict]:
+def _merges(
+    ledger: dict, since: float, until: float | None = None
+) -> dict[str, dict]:
     """Lists the pull requests a claim's resolution recorded as merged.
 
     Args:
         ledger: Published issue ledger.
         since: Unix time the window starts.
+        until: Unix time the window ends, or None for no upper bound.
 
     Returns:
         One entry per pull request number merged inside the window: the
@@ -642,7 +703,7 @@ def _merges(ledger: dict, since: float) -> dict[str, dict]:
             ):
                 continue
             at = float(evidence.get("closed_at") or entry.get("at") or 0)
-            if at < since:
+            if at < since or (until is not None and at > until):
                 continue
             merged[str(int(evidence["pull_request"]))] = {
                 "lane": str(entry["holder"]),
@@ -672,6 +733,14 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
     when it left the open list without one. One whose reading names no lane
     and no claim names either is excluded and counted as such.
 
+    A closed unmerged pull request is abandoned only when the forge read
+    supervision made as it left the open list, stored as ``ended``, said
+    ``CLOSED``. One with no such answer, such as a reading archived before
+    the answer was stored, is counted as unknown, never as abandoned; a
+    failed read keeps the pull request in the open list. The merge
+    fraction is the share of pull requests opened in the window that a
+    resolution or that forge read records as merged.
+
     Args:
         record: Parsed pull request record, or anything else when it could
             not be read, which reports nothing.
@@ -680,11 +749,12 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
 
     Returns:
         ``lanes`` mapping each participant with an outcome to its counts,
-        first-pass rate over merged pull requests with a known CI round
-        count, the count without one, the median CI rounds and the median
-        claim-to-merge seconds, with None for a rate or a median over
-        nothing, so a lane without the data reports no value; and
-        ``excluded``, the pull requests no lane owns.
+        merge fraction, abandoned and unknown-end counts, first-pass rate
+        over merged pull requests with a known CI round count, the count
+        without one, the median CI rounds and the median claim-to-merge
+        seconds, with None for a fraction, a rate or a median over nothing,
+        so a lane without the data reports no value; and ``excluded``, the
+        pull requests no lane owns.
     """
     stored = record if isinstance(record, dict) else {}
     opened = stored.get("pull_requests")
@@ -718,6 +788,9 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
                 "rounds": [],
                 "unknown": 0,
                 "seconds": [],
+                "landed": 0,
+                "abandoned": 0,
+                "unread": 0,
             },
         )
 
@@ -732,18 +805,27 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
         counted.add(number)
         owner = item.get("lane") or every.get(number, {}).get("lane")
         if owner:
-            tally(str(owner))["opened"] += 1
+            counts = tally(str(owner))
+            counts["opened"] += 1
+            counts["landed"] += int(
+                number in every or item.get("ended") == "MERGED"
+            )
         else:
             excluded.add(number)
     for number, item in readings.items():
         if (
             number in every
+            or item.get("ended") == "MERGED"
             or not item.get("gone_at")
             or float(item["gone_at"]) < since
         ):
             continue
         if item.get("lane"):
-            tally(str(item["lane"]))["closed"] += 1
+            counts = tally(str(item["lane"]))
+            counts["closed"] += 1
+            ended = item.get("ended")
+            counts["abandoned"] += int(ended == "CLOSED")
+            counts["unread"] += int(ended not in {"CLOSED", "MERGED"})
         else:
             excluded.add(number)
     for number, merge in merged.items():
@@ -764,6 +846,14 @@ def pull_request_outcomes(record: object, ledger: dict, since: float) -> dict:
                 "pull_requests_opened": counts["opened"],
                 "pull_requests_merged": counts["merged"],
                 "pull_requests_closed": counts["closed"],
+                "pull_requests_opened_merged": counts["landed"],
+                "pull_requests_abandoned": counts["abandoned"],
+                "pull_requests_end_unknown": counts["unread"],
+                "merge_fraction": (
+                    counts["landed"] / counts["opened"]
+                    if counts["opened"]
+                    else None
+                ),
                 "first_pass": counts["first"],
                 "first_pass_known": len(counts["rounds"]),
                 "first_pass_rate": (
@@ -828,6 +918,65 @@ def outcome_line(outcomes: dict, window: str) -> str:
         + (f" ({unknown} without CI rounds)" if unknown else "")
         + (f", {excluded} unowned excluded" if excluded else "")
     )
+
+
+def share_files(rows: list[dict]) -> None:
+    """Marks on each lane row the files another lane of its project touches.
+
+    The footprint is the diff `top` already reads, each row's
+    ``diff_paths``; a row whose diff could not be read touches nothing.
+
+    Args:
+        rows: Every participant row of one project, before any filter,
+            each gaining ``shared_paths`` and ``shared_file_degree``, the
+            share of its own files another lane touches, or None for a lane
+            that touches no file.
+    """
+    touched = collections.Counter(
+        path for row in rows for path in set(row.get("diff_paths") or [])
+    )
+    for row in rows:
+        own = set(row.get("diff_paths") or [])
+        shared = sorted(path for path in own if touched[path] > 1)
+        row["shared_paths"] = shared
+        row["shared_file_degree"] = len(shared) / len(own) if own else None
+
+
+def merge_health(rows: list[dict]) -> dict:
+    """Sums merge fraction, abandonment and file sharing over lane rows.
+
+    Args:
+        rows: Lane rows carrying the counts of `pull_request_outcomes` and
+            the marks of `share_files`, such as one project's or one
+            provider's reported rows.
+
+    Returns:
+        The opened, opened-and-merged, abandoned and unknown-end counts,
+        ``merge_fraction`` and ``shared_file_degree``, the share of the
+        files the rows touch that more than one lane touches. Each share is
+        None over nothing, so no pull request reports no fraction, not 0.
+    """
+    counts = {
+        key: sum(int(row.get(key) or 0) for row in rows)
+        for key in (
+            "pull_requests_opened",
+            "pull_requests_opened_merged",
+            "pull_requests_abandoned",
+            "pull_requests_end_unknown",
+        )
+    }
+    files = {path for row in rows for path in row.get("diff_paths") or []}
+    shared = {path for row in rows for path in row.get("shared_paths") or []}
+    return {
+        **counts,
+        "merge_fraction": (
+            counts["pull_requests_opened_merged"]
+            / counts["pull_requests_opened"]
+            if counts["pull_requests_opened"]
+            else None
+        ),
+        "shared_file_degree": len(shared) / len(files) if files else None,
+    }
 
 
 def _bucket(state: str, cause: str) -> str:
@@ -919,7 +1068,9 @@ def _count(usage: dict, names: tuple[str, ...]) -> int:
     )
 
 
-def _record_tokens(adapter: str, record: dict) -> tuple[str, int, int] | None:
+def _record_tokens(
+    adapter: str, record: dict
+) -> tuple[str, int, int, int] | None:
     """Reads the input and output tokens one native record reports.
 
     Args:
@@ -927,10 +1078,13 @@ def _record_tokens(adapter: str, record: dict) -> tuple[str, int, int] | None:
         record: One parsed line of a native session record.
 
     Returns:
-        The message identifier, empty for a running total, and the input
-        and output tokens, or None when the record reports no usage. Claude
-        input includes the cache creation and cache read tokens; Codex and
-        Copilot CLI report running session totals.
+        The message identifier, empty for a running total, the input and
+        output tokens, and the part of the input the client reports as read
+        from cache, or None when the record reports no usage. Claude input
+        includes the cache creation and cache read tokens, and Codex input
+        includes its cached tokens; Codex and Copilot CLI report running
+        session totals. Gemini and Copilot CLI report no cache split here,
+        so their cache part is 0.
     """
     if adapter == "claude":
         message = record.get("message")
@@ -948,6 +1102,7 @@ def _record_tokens(adapter: str, record: dict) -> tuple[str, int, int] | None:
                 ),
             ),
             _count(usage, ("output_tokens",)),
+            _count(usage, ("cache_read_input_tokens",)),
         )
     if adapter == "gemini":
         tokens = record.get("tokens")
@@ -962,6 +1117,7 @@ def _record_tokens(adapter: str, record: dict) -> tuple[str, int, int] | None:
             identifier,
             _count(tokens, ("input",)),
             _count(tokens, ("output",)),
+            0,
         )
     if adapter == "codex":
         payload = record.get("payload")
@@ -976,6 +1132,7 @@ def _record_tokens(adapter: str, record: dict) -> tuple[str, int, int] | None:
             "",
             _count(usage, ("input_tokens",)),
             _count(usage, ("output_tokens",)),
+            _count(usage, ("cached_input_tokens",)),
         )
     data = record.get("data")
     if record.get("type") != "session.shutdown" or not isinstance(data, dict):
@@ -992,6 +1149,7 @@ def _record_tokens(adapter: str, record: dict) -> tuple[str, int, int] | None:
         "",
         sum(_count(usage, ("inputTokens",)) for usage in usages),
         sum(_count(usage, ("outputTokens",)) for usage in usages),
+        0,
     )
 
 
@@ -1007,8 +1165,8 @@ def _timestamp(value: object) -> float | None:
 
 def _file_tokens(
     path: Path, adapter: str, since: float, now: float
-) -> tuple[int, int]:
-    """Reads the input and output tokens one session record spent in a window.
+) -> tuple[int, int, int]:
+    """Reads the tokens one session record spent in a window.
 
     A per-message record is counted once per message identifier, from its
     first copy, when that copy's timestamp falls inside the window. A
@@ -1023,13 +1181,14 @@ def _file_tokens(
         now: Unix time the window ends.
 
     Returns:
-        Input and output tokens spent inside the window.
+        Input, output and cache-read tokens spent inside the window, the
+        last being the part of the input the client reports as cached.
     """
     mark = TOKEN_MARKS[adapter]
     seen: set[str] = set()
-    counted = [0, 0]
-    before = (0, 0)
-    latest: tuple[int, int] | None = None
+    counted = [0, 0, 0]
+    before = (0, 0, 0)
+    latest: tuple[int, int, int] | None = None
     with path.open("rb") as handle:
         for line in handle:
             if mark not in line:
@@ -1046,12 +1205,12 @@ def _file_tokens(
             at = _timestamp(record.get("timestamp")) if read else None
             if read is None or at is None or at > now:
                 continue
-            identifier, entered, produced = read
+            identifier, entered, produced, cached = read
             if adapter in CUMULATIVE:
                 if at < since:
-                    before = (entered, produced)
+                    before = (entered, produced, cached)
                 else:
-                    latest = (entered, produced)
+                    latest = (entered, produced, cached)
                 continue
             if identifier in seen:
                 continue
@@ -1060,9 +1219,12 @@ def _file_tokens(
             if at >= since:
                 counted[0] += entered
                 counted[1] += produced
+                counted[2] += cached
     if latest is not None:
-        counted = [max(0, latest[0] - before[0]), max(0, latest[1] - before[1])]
-    return counted[0], counted[1]
+        counted = [
+            max(0, new - old) for new, old in zip(latest, before, strict=True)
+        ]
+    return counted[0], counted[1], counted[2]
 
 
 def native_tokens(
@@ -1083,9 +1245,10 @@ def native_tokens(
         now: Unix time the window ends.
 
     Returns:
-        ``input`` and ``output`` token counts, or None when the provider has
-        no reader that tells input from output, such as OpenCode, whose
-        database reports one combined total.
+        ``input``, ``output`` and ``cache_read`` token counts, the last
+        being the part of the input the client reports as cached, or None
+        when the provider has no reader that tells input from output, such
+        as OpenCode, whose database reports one combined total.
     """
     try:
         entry = roster.provider(home, str(participant.get("provider", "")))
@@ -1102,7 +1265,7 @@ def native_tokens(
         )
     except (BridgeError, KeyError, OSError, ValueError):
         return None
-    entered = produced = 0
+    entered = produced = cached = 0
     for path in paths:
         try:
             if path.stat().st_mtime < since:
@@ -1112,7 +1275,8 @@ def native_tokens(
             continue
         entered += spent[0]
         produced += spent[1]
-    return {"input": entered, "output": produced}
+        cached += spent[2]
+    return {"input": entered, "output": produced, "cache_read": cached}
 
 
 def _operator_mail(
@@ -1194,6 +1358,7 @@ def _lane_throughput(
     answered = context["decisions"].get(name, 0)
     queued = _report_waits(directory, name, since)
     tokens = native_tokens(home, participant, since, now)
+    activity = context["activity"].get(name, {"mail_sent": 0, "progress": 0})
     return {
         "provider": str(participant.get("provider", "")),
         "merged_issues": len(
@@ -1223,6 +1388,9 @@ def _lane_throughput(
         "merge_wait_hours": round(
             sum(wait["seconds"] for wait in queued) / HOUR, 2
         ),
+        "mail_sent": activity["mail_sent"],
+        "progress": activity["progress"],
+        "mail_ratio": stagnation.ratio(**activity),
     }
 
 
@@ -1317,6 +1485,7 @@ def _project_throughput(
         "mail": mail,
         "decisions": answered,
         "merges": merges,
+        "activity": stagnation.counts(db, directory, manifest, ledger, window),
     }
     measured = {
         name: _lane_throughput(home, directory, manifest, name, window, context)
@@ -1342,6 +1511,9 @@ def _project_throughput(
     )
     totals["history_complete"] = all(
         counts["history_complete"] for counts in measured.values()
+    )
+    totals["mail_ratio"] = stagnation.ratio(
+        totals.get("mail_sent", 0), totals.get("progress", 0)
     )
     return {"root": manifest["root"], "lanes": measured, "totals": totals}
 
@@ -1462,6 +1634,11 @@ def describe_throughput(reading: dict) -> str:
             f"{totals['merge_waits']} merge-queue waits, "
             f"{totals['merge_waits_pending']} pending"
         )
+        lines.append(
+            f"Lane mail: {totals.get('mail_sent', 0)} sent per "
+            f"{totals.get('progress', 0)} progress events, ratio "
+            f"{totals['mail_ratio']:g}"
+        )
         partial = sorted(
             name
             for name, counts in project["lanes"].items()
@@ -1474,4 +1651,276 @@ def describe_throughput(reading: dict) -> str:
             )
     if quiet:
         lines += ["", f"{quiet} projects recorded nothing in the window."]
+    return "\n".join(lines) + "\n"
+
+
+ESTIMATE = (
+    "Estimate from the native clients' own token counts and the operator's "
+    "recorded prices; not billed spend."
+)
+NO_PRICE_TABLE = (
+    "No price table is recorded, so no cost is shown. Record model rates "
+    "per million tokens with: agent-parley provider price PROVIDER --model "
+    "MODEL --input AMOUNT --output AMOUNT --cache-read AMOUNT"
+)
+
+
+def lane_cost(tokens: dict | None, rates: dict | None) -> float | None:
+    """Prices one lane's token counts with one model's recorded rates.
+
+    Args:
+        tokens: Result of `native_tokens`, or None when the lane's client
+            reports no input and output split.
+        rates: ``input``, ``output`` and ``cache_read`` prices per million
+            tokens, or None when no price row matches the lane.
+
+    Returns:
+        The estimated cost in the operator's currency, or None when either
+        argument is missing: an unknown cost is never zero. The cached part
+        of the input is priced at the cache-read rate and the rest of the
+        input at the input rate.
+    """
+    if tokens is None or rates is None:
+        return None
+    cached = min(tokens["cache_read"], tokens["input"])
+    return (
+        (tokens["input"] - cached) * rates["input"]
+        + cached * rates["cache_read"]
+        + tokens["output"] * rates["output"]
+    ) / 1_000_000
+
+
+def _per(cost: float | None, units: int) -> float | None:
+    """Divides a cost by a count of shipped units, or None when undefined."""
+    return None if cost is None or not units else round(cost / units, 4)
+
+
+def _lane_cost_row(
+    participant: dict,
+    tokens: dict | None,
+    table: dict,
+    units: dict[str, int],
+) -> dict:
+    """Joins one lane's priced tokens with what it shipped."""
+    provider = str(participant.get("provider", ""))
+    model = str(participant.get("model", ""))
+    rows = table.get(provider, {})
+    rates = rows.get(model or "default")
+    spent = lane_cost(tokens, rates)
+    if tokens is None:
+        reason = "the provider reports no token count"
+    elif rates is None:
+        reason = f"no price row for {provider} model {model or '(default)'}"
+    else:
+        reason = ""
+    return {
+        "provider": provider,
+        "model": model,
+        "estimated_cost": None if spent is None else round(spent, 4),
+        "unknown_reason": reason,
+        "input_tokens": None if tokens is None else tokens["input"],
+        "output_tokens": None if tokens is None else tokens["output"],
+        "cache_read_tokens": None if tokens is None else tokens["cache_read"],
+        **units,
+        "cost_per_issue": _per(spent, units["issues"]),
+        "cost_per_pull_request": _per(spent, units["pull_requests"]),
+        "cost_per_finding": _per(spent, units["findings"]),
+    }
+
+
+def _provider_cost_rows(lanes_read: dict[str, dict]) -> dict[str, dict]:
+    """Totals the priced lanes of each provider and names the unpriced."""
+    grouped: dict[str, dict] = {}
+    for name, row in lanes_read.items():
+        group = grouped.setdefault(
+            row["provider"],
+            {
+                "estimated_cost": None,
+                "unknown_lanes": [],
+                **dict.fromkeys(("issues", "pull_requests", "findings"), 0),
+            },
+        )
+        if row["estimated_cost"] is None:
+            group["unknown_lanes"].append(name)
+            continue
+        group["estimated_cost"] = (group["estimated_cost"] or 0) + row[
+            "estimated_cost"
+        ]
+        for field in ("issues", "pull_requests", "findings"):
+            group[field] += row[field]
+    for group in grouped.values():
+        spent = group["estimated_cost"]
+        if spent is not None:
+            group["estimated_cost"] = round(spent, 4)
+        group["cost_per_issue"] = _per(spent, group["issues"])
+        group["cost_per_pull_request"] = _per(spent, group["pull_requests"])
+        group["cost_per_finding"] = _per(spent, group["findings"])
+    return grouped
+
+
+def _project_cost(
+    home: Path,
+    directory: Path,
+    manifest: dict,
+    window: tuple[float, float],
+    table: dict,
+) -> dict:
+    """Prices every lane of one project and totals them by provider."""
+    since, now = window
+    try:
+        ledger = issues.snapshot(directory)
+    except (OSError, ValueError):
+        ledger = {"issues": {}}
+    merges = _merges(ledger, since, now)
+    found: dict[str, int] = {}
+    for entry in reviews.rounds(directory):
+        if entry.get("state") != reviews.RETURNED:
+            continue
+        try:
+            returned = float(entry.get("returned") or 0)
+            count = int(entry.get("findings") or 0)
+        except (TypeError, ValueError):
+            continue
+        if since <= returned <= now:
+            reviewer = str(entry.get("reviewer", ""))
+            found[reviewer] = found.get(reviewer, 0) + count
+    measured = {}
+    for name in sorted(manifest["participants"]):
+        participant = manifest["participants"][name]
+        held = [merge for merge in merges.values() if merge["lane"] == name]
+        units = {
+            "issues": len({merge["issue"] for merge in held}),
+            "pull_requests": len(held),
+            "findings": found.get(name, 0),
+        }
+        measured[name] = _lane_cost_row(
+            participant,
+            native_tokens(home, participant, since, now),
+            table,
+            units,
+        )
+    return {
+        "root": manifest["root"],
+        "lanes": measured,
+        "providers": _provider_cost_rows(measured),
+    }
+
+
+def cost(home: Path, since: float, now: float = 0.0) -> dict:
+    """Estimates what each lane and provider spent per shipped unit.
+
+    A lane's client token counts inside the window are priced with the
+    operator's rate row for the lane's provider and model, then divided by
+    the issues the lane merged, the pull requests it merged and the review
+    findings it returned as a reviewer inside the same window. The counts
+    are the clients' own and the rates the operator's, so every figure is an
+    estimate and never billed spend. A lane whose provider reports no token
+    count, or whose model has no price row, is unknown and adds nothing to a
+    provider's total. A divisor of zero leaves its figure unknown. A lane
+    with no recorded model is priced with the row its provider names
+    ``default``, and a lane with a recorded model never is.
+
+    Args:
+        home: Private bridge state root.
+        since: Unix time the window starts.
+        now: Unix time the window ends; the current time when zero.
+
+    Returns:
+        ``estimate``, ``price_table_version`` and, once a table is
+        recorded, ``since``, ``until``, one entry per project with its
+        ``lanes`` and ``providers``, and ``providers`` totalled across every
+        project, so the cheapest provider per shipped unit can be read;
+        otherwise a ``message`` that no price table is recorded and no
+        project figures.
+    """
+    table = roster.price_table(home)
+    if not table:
+        return {
+            "estimate": ESTIMATE,
+            "price_table_version": None,
+            "message": NO_PRICE_TABLE,
+        }
+    ends = now or time.time()
+    projects = [
+        _project_cost(home, directory, manifest, (since, ends), table)
+        for directory, manifest in _manifests(home)
+    ]
+    return {
+        "estimate": ESTIMATE,
+        "price_table_version": roster.price_version(table),
+        "since": since,
+        "until": ends,
+        "projects": projects,
+        "providers": _provider_cost_rows(
+            {
+                f"{project['root']}:{name}": row
+                for project in projects
+                for name, row in project["lanes"].items()
+            }
+        ),
+    }
+
+
+def _money(value: float | None) -> str:
+    """Formats an estimated cost, naming an unknown one ``unknown``."""
+    return "unknown" if value is None else f"{value:,.4f}"
+
+
+def describe_cost(reading: dict) -> str:
+    """Formats a cost reading for a terminal.
+
+    Args:
+        reading: Result of `cost`.
+
+    Returns:
+        The estimate label, then per project a lane table and a provider
+        table, or the line saying no price table is recorded.
+    """
+    if reading["price_table_version"] is None:
+        return reading["message"] + "\n"
+    lines = [
+        f"{reading['estimate']} Price table version "
+        f"{reading['price_table_version']}."
+    ]
+
+    def header(label: str) -> str:
+        """Formats the column names over a lane or provider table."""
+        return (
+            f"{label:<16} {'PROVIDER':<10} {'COST':>12} {'ISSUES':>6} "
+            f"{'PRS':>4} {'FINDINGS':>8} {'PER_ISSUE':>12} {'PER_PR':>12} "
+            f"{'PER_FINDING':>12}"
+        )
+
+    def row(label: str, counts: dict, provider: str) -> str:
+        """Formats one lane or provider row."""
+        return (
+            f"{label[:16]:<16} {provider[:10]:<10} "
+            f"{_money(counts['estimated_cost']):>12} "
+            f"{counts['issues']:>6} {counts['pull_requests']:>4} "
+            f"{counts['findings']:>8} "
+            f"{_money(counts['cost_per_issue']):>12} "
+            f"{_money(counts['cost_per_pull_request']):>12} "
+            f"{_money(counts['cost_per_finding']):>12}"
+        )
+
+    lines += ["", "All projects", header("PROVIDER")]
+    lines += [
+        row(name, counts, "") for name, counts in reading["providers"].items()
+    ]
+    for project in reading["projects"]:
+        lines += ["", f"Project {project['root']}", header("LANE")]
+        lines += [
+            row(name, counts, counts["provider"])
+            for name, counts in project["lanes"].items()
+        ]
+        lines.append(header("PROVIDER"))
+        lines += [
+            row(name, counts, "")
+            for name, counts in project["providers"].items()
+        ]
+        lines += [
+            f"{name}: cost unknown, {counts['unknown_reason']}"
+            for name, counts in project["lanes"].items()
+            if counts["estimated_cost"] is None
+        ]
     return "\n".join(lines) + "\n"

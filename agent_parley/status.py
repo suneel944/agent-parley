@@ -173,7 +173,9 @@ def lane_bucket(record: dict, now: float | None = None) -> dict:
     facts changes. A lane needs input while it is blocked on a permission
     prompt, a question such as AskUserQuestion or another native dialog,
     while its ready report awaits an approval, while a decision for it is
-    open, or while it reports a claim it holds as blocked. Otherwise it is
+    open, while it reports a claim it holds as blocked, or while it
+    converges with another lane on one branch, new file or path set, as
+    `collisions.find` decides. Otherwise it is
     working while starting or working, done once a claim it holds ended or
     a pull request of it merged in the window or it reported ready, and
     idle in every other state. A block on exhausted capacity waits on time,
@@ -184,7 +186,10 @@ def lane_bucket(record: dict, now: float | None = None) -> dict:
             live view. The keys read are ``condition``, ``provenance``,
             ``availability``, ``retired_at``, ``paused``,
             ``awaiting_approval``, ``decisions``, ``outcome``, ``claims``,
-            ``report_age_seconds`` and ``pull_requests_merged``; a missing
+            ``converging``, ``report_age_seconds``,
+            ``pull_requests_merged`` and ``contention``, the flagged
+            reservation contention records naming the lane, each carrying
+            ``since``; a missing
             key is no evidence.
         now: Unix time ages are measured to, or None for the clock.
 
@@ -226,6 +231,12 @@ def lane_bucket(record: dict, now: float | None = None) -> dict:
         waits.append((named, min(opened)))
     if record.get("outcome") == "blocked" and record.get("claims"):
         waits.append(("blocked claim", reported))
+    for peer in record.get("converging") or []:
+        waits.append((f"converging with {peer}", None))
+    if flagged := record.get("contention"):
+        waits.append(
+            ("contention", min(float(item["since"]) for item in flagged))
+        )
     starts = [start for _, start in waits if start is not None]
     ended = any(claim.get("ended") for claim in record.get("claims") or [])
     if waits:
@@ -251,6 +262,83 @@ def lane_bucket(record: dict, now: float | None = None) -> dict:
         ),
         "inferred": observed,
     }
+
+
+def held_issues(held: dict, data: dict, lane: str) -> list[int]:
+    """Lists the issues one lane owns in the ledger.
+
+    Args:
+        held: The ``issues`` mapping of the published ledger.
+        data: Project manifest.
+        lane: Registered identity, the display name, of the lane.
+
+    Returns:
+        The issue numbers whose owner has that identity, ascending.
+    """
+    names = {key: item["display"] for key, item in data["participants"].items()}
+    return sorted(
+        int(number)
+        for number, entry in held.items()
+        if names.get(entry.get("owner")) == lane
+    )
+
+
+def contention_reading(
+    flagged: list[dict], data: dict, held: dict, lane: str
+) -> list[dict]:
+    """Adds both lanes' claims to a lane's flagged contention records.
+
+    Args:
+        flagged: The ``contention`` records the store reported for the lane.
+        data: Project manifest.
+        held: The ``issues`` mapping of the published ledger.
+        lane: Registered identity, the display name, of the lane.
+
+    Returns:
+        The records, each carrying ``lane``, the issues it ``own``s and the
+        issues its ``peer`` holds as ``theirs``.
+    """
+    return [
+        {
+            **item,
+            "lane": lane,
+            "own": held_issues(held, data, lane),
+            "theirs": held_issues(held, data, item["peer"]),
+        }
+        for item in flagged
+    ]
+
+
+def contention_lines(records: list[dict]) -> list[str]:
+    """Words each flagged pair of lanes once, with both claims and the key.
+
+    Args:
+        records: Lanes of the status reading or rows of the live view.
+
+    Returns:
+        One line per pair and key, such as ``contention: claude (#1) and
+        codex (#2) on src/a.py``, however many of the lanes carry the record.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    lines = []
+    for record in records:
+        for item in record.get("contention") or []:
+            first, second = sorted((item["lane"], item["peer"]))
+            if (first, second, item["path"]) in seen:
+                continue
+            seen.add((first, second, item["path"]))
+            claims = {item["lane"]: item["own"], item["peer"]: item["theirs"]}
+            lines.append(
+                "contention: "
+                + " and ".join(
+                    f"{lane} ("
+                    + (", ".join(f"#{n}" for n in claims[lane]) or "no issue")
+                    + ")"
+                    for lane in (first, second)
+                )
+                + f" on {item['path']}"
+            )
+    return lines
 
 
 def bucket_cell(bucket: dict) -> str:
@@ -459,6 +547,10 @@ def bucket_lines(lines: list[str], records: list[dict]) -> list[str]:
                 f"{name.capitalize()} ({names.count(name)}):"
                 + (f" {waiting}" if waiting else "")
             )
+            if name == NEEDS_INPUT:
+                grouped.extend(
+                    f"  {line}" for line in contention_lines(records)
+                )
         grouped.append(lines[index + 1])
         if note := recap_note(records[index]):
             grouped.append(f"  {note}")
@@ -910,8 +1002,12 @@ class StatusMixin(BridgeCore):
             not. The `approvals` component names each lane
             `supervision.opt_in_missing` reports as a setup gap, and each
             lane whose recorded opt-in `supervision.opt_in_unsupported` says
-            its CLI cannot carry; it is the operator's choice, so it leaves
-            the set consistent. The
+            its CLI cannot carry, each with the opt-in remedy its adapter
+            accepts; it is the operator's choice, so it leaves the set
+            consistent. A recorded opt-in its adapter carries reads as
+            approved even where `supervision.opt_in_shell_gap` names a
+            bridge command no MCP tool covers, because no operator setup
+            closes that adapter's gap; the launch names it instead. The
             `dialogs` component names each lane `dialogs.drift` reports,
             a client newer than its recorded dialog matchers or a dialog
             none of them read, as a matcher drift that also leaves the set
@@ -1102,13 +1198,15 @@ class StatusMixin(BridgeCore):
                 ),
             }
         )
-        unapproved = sorted(
-            f"{manifest['root']} {name}"
-            for manifest in manifests
-            if manifest.get("root")
-            for name in manifest.get("participants") or {}
-            if supervision.opt_in_missing(self.home, manifest, name)
-        )
+        unapproved: dict[str, list[str]] = {}
+        for manifest in manifests:
+            if not manifest.get("root"):
+                continue
+            for name in manifest.get("participants") or {}:
+                if gap := supervision.opt_in_adapter(self.home, manifest, name):
+                    unapproved.setdefault(
+                        supervision.opt_in_remedy(gap), []
+                    ).append(f"{manifest['root']} {name}")
         unsupported = sorted(
             f"{manifest['root']} {name}"
             for manifest in manifests
@@ -1116,11 +1214,10 @@ class StatusMixin(BridgeCore):
             for name in manifest.get("participants") or {}
             if supervision.opt_in_unsupported(self.home, manifest, name)
         )
-        remedies = []
-        if unapproved:
-            remedies.append(
-                supervision.OPT_IN_REMEDY + ": " + ", ".join(unapproved)
-            )
+        remedies = [
+            remedy + ": " + ", ".join(sorted(lanes))
+            for remedy, lanes in sorted(unapproved.items())
+        ]
         if unsupported:
             remedies.append(
                 "the CLI cannot carry the recorded bridge tool approval, so "
@@ -1578,6 +1675,8 @@ class StatusMixin(BridgeCore):
                 self.home, directory, agent, participant["provider"]
             ),
             "credential": participant["credential"],
+            "model": participant.get("model", ""),
+            "effort": participant.get("effort", ""),
             "session": liveness,
             "condition": lanes.view(condition),
             "provenance": provenance,
@@ -1637,6 +1736,7 @@ class StatusMixin(BridgeCore):
                 frame["diffstats"].get(agent),
                 configuration["context_full_percent"],
             ),
+            "converging": [],
             "claims": [
                 {
                     "issue": int(number),
@@ -1757,6 +1857,12 @@ class StatusMixin(BridgeCore):
         record["awaiting_approval"] = (record["approval"] or {}).get(
             "state"
         ) in (approvals.AWAITING, "unreadable")
+        record["contention"] = contention_reading(
+            frame["usage"].get(name, {}).get("contention", []),
+            data,
+            ledger["issues"],
+            name,
+        )
         if wake:
             next_at = wake.get("next_at")
             record["wake"] = {
@@ -1845,7 +1951,7 @@ class StatusMixin(BridgeCore):
             dashboard does; one whose root is missing or whose lanes all
             stopped over `DORMANT_SECONDS` ago reads as dormant.
         """
-        from agent_parley import decisions, pool
+        from agent_parley import collisions, decisions, pool, stagnation
         from agent_parley.cli import (
             inbound_status,
             issues,
@@ -1897,8 +2003,19 @@ class StatusMixin(BridgeCore):
                     time.time() - metrics.OUTCOME_WINDOW,
                 )
                 waiting = decisions.list_open(path.parent)
+                converging = collisions.read(
+                    self.home,
+                    path.parent,
+                    data,
+                    {
+                        item["participant"]: item["branch"]
+                        for item in participants
+                    },
+                    db=db,
+                )
                 for record in participants:
                     agent = record["participant"]
+                    record["converging"] = collisions.peers(converging, agent)
                     record["decisions"] = [
                         {
                             "id": item.get("id", ""),
@@ -1921,6 +2038,7 @@ class StatusMixin(BridgeCore):
                         "directory": str(path.parent),
                         "root_missing": not Path(data["root"]).is_dir(),
                         "dormant": dormant(data["root"], participants),
+                        "converging": converging,
                         "reclaim": supervision.reclaim_summary(path.parent),
                         "spares": pool.reading(path.parent, data),
                         "accounting": self._project_accounting(
@@ -1939,6 +2057,9 @@ class StatusMixin(BridgeCore):
                         "supervision_poll": supervision.last_poll(path.parent),
                         "fold_after": context["configuration"]["fold_after"],
                         "pull_request_outcomes": outcomes,
+                        "stagnation": stagnation.reading(
+                            db, path.parent, data, context["ledger"]
+                        ),
                         **self._integration(path.parent, data, context),
                     }
                 )
@@ -2165,11 +2286,13 @@ class StatusMixin(BridgeCore):
             every_claim: Also list claims whose work ended on the forge and
                 lanes folded out as long dead.
         """
-        from agent_parley import metrics, supervision
+        from agent_parley import metrics, stagnation, supervision
         from agent_parley.cli import supervision_failure, tables
 
         dormancy = " (dormant)" if project["dormant"] else ""
         print(f"\nProject: {project['root']}{dormancy}")
+        if stalled := stagnation.line(project.get("stagnation") or {}):
+            print(stalled)
         if failing := project.get("supervision_error"):
             print(supervision_failure(failing))
         known = self.forge_issues(Path(project["directory"]), project["root"])
@@ -2284,7 +2407,7 @@ class StatusMixin(BridgeCore):
             The number of lanes reported, so a caller can gate on a filter
             having matched at least one lane.
         """
-        from agent_parley import pool
+        from agent_parley import collisions, pool, stagnation
         from agent_parley.cli import (
             Selection,
             describe,
@@ -2324,6 +2447,8 @@ class StatusMixin(BridgeCore):
             if selection.filtered() and not reported:
                 continue
             print(f"\nProject: {data['root']}")
+            if stalled := stagnation.line(project.get("stagnation") or {}):
+                print(stalled)
             if failing := project.get("supervision_error"):
                 print(supervision_failure(failing))
             polled = project.get("supervision_poll") or {}
@@ -2332,6 +2457,8 @@ class StatusMixin(BridgeCore):
             print(describe(snapshot(path.parent)))
             if line := landed_line(project.get("integration") or {}):
                 print(line)
+            for pair in project.get("converging") or []:
+                print(collisions.line(pair))
             if outcome := metrics.outcome_line(
                 project.get("pull_request_outcomes") or {},
                 tables.age(metrics.OUTCOME_WINDOW),

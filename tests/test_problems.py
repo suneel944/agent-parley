@@ -1,8 +1,10 @@
 """Checks the triage view that lists every condition needing an operator."""
 
+import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -1582,7 +1584,7 @@ def ready_estate(bridge, repo, monkeypatch, live=("gemini",)):
     bridge.add_participant(repo, "gemini", "gemini")
     directory = bridge.project(repo)[1]
     for name in ("claude", "codex", "gemini"):
-        stopped(directory, name)
+        alive(directory, name, session_ticks="recycled")
     original = cli.Bridge.status_snapshot
 
     def orphaned(self):
@@ -2171,3 +2173,376 @@ def test_one_unreadable_manifest_is_skipped_by_status_and_problems(
     assert len(bridge.status_snapshot()["projects"]) == 1
     assert isinstance(problems.derive(bridge.home, report), list)
     assert isinstance(bridge.problems(), list)
+
+
+def retire_action(tmp_path, monkeypatch, availability=GONE, dirty=()):
+    """Derives the action a ready-to-retire lane's row carries."""
+    monkeypatch.setattr(
+        supervision,
+        "dirty_paths",
+        lambda lane: None if dirty is None else list(dirty),
+    )
+    lane = tmp_path / "lane"
+    lane.mkdir()
+    found = problems._lane_rows(
+        lane_record(claims=ORPHANED, availability=availability),
+        {"lane": str(lane), "branch": "work"},
+        str(tmp_path),
+        {**supervision.DEFAULTS, "wake": False},
+        600,
+        time.time(),
+    )
+    [row] = [row for row in found if row["condition"] == problems.READY]
+    return row["action"]
+
+
+def test_a_clean_dead_lane_ready_to_retire_is_a_safe_remedy(
+    tmp_path, monkeypatch
+):
+    action = retire_action(tmp_path, monkeypatch)
+    assert action["kind"] == problems.RETIRE_ACTION
+    assert action["safe"] is True
+    assert action["reason"] == ""
+    assert action["lane"] == str(tmp_path / "lane")
+
+
+def test_a_dirty_worktree_keeps_retirement_out_of_apply(tmp_path, monkeypatch):
+    action = retire_action(tmp_path, monkeypatch, dirty=["a.txt"])
+    assert action["safe"] is False
+    assert action["reason"].startswith("uncommitted changes in ")
+    assert "a.txt" in action["reason"]
+
+
+def test_an_unknown_session_process_keeps_retirement_out_of_apply(
+    tmp_path, monkeypatch
+):
+    unknown = {**GONE, "process_alive": None}
+    action = retire_action(tmp_path, monkeypatch, availability=unknown)
+    assert action["safe"] is False
+    assert action["reason"] == "its session process may still be running"
+    assert not orphaned_lane(LIVE, monkeypatch, problems.READY)
+
+
+def test_ignored_files_keep_a_clean_lane_out_of_apply(tmp_path, monkeypatch):
+    monkeypatch.setattr(problems.retirement, "ignored_files", lambda lane: [])
+    row = {
+        "condition": problems.READY,
+        "participant": "claude",
+        "project": str(tmp_path),
+        "action": retire_action(tmp_path, monkeypatch),
+    }
+    [kept] = problems.remedies(tmp_path, [row])
+    assert kept["action"]["safe"] is True
+    monkeypatch.setattr(
+        problems.retirement, "ignored_files", lambda lane: [".env"]
+    )
+    [skipped] = problems.remedies(tmp_path, [row])
+    assert skipped["action"]["safe"] is False
+    assert ".env" in skipped["action"]["reason"]
+    assert row["action"]["safe"] is True
+
+
+def test_an_unreadable_worktree_keeps_retirement_out_of_apply(
+    tmp_path, monkeypatch
+):
+    action = retire_action(tmp_path, monkeypatch, dirty=None)
+    assert action["safe"] is False
+    assert action["reason"] == (
+        f"Git could not read its worktree {tmp_path / 'lane'}"
+    )
+
+
+def test_an_unlistable_worktree_keeps_retirement_out_of_apply(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(problems.retirement, "ignored_files", lambda lane: None)
+    row = {
+        "condition": problems.READY,
+        "participant": "claude",
+        "project": str(tmp_path),
+        "action": retire_action(tmp_path, monkeypatch),
+    }
+    [skipped] = problems.remedies(tmp_path, [row])
+    assert skipped["action"]["safe"] is False
+    assert skipped["action"]["reason"] == (
+        f"Git could not list {tmp_path / 'lane'}"
+    )
+
+
+def retired_root(bridge, repo, paired, retired=True, live=()):
+    """Records the paired project's root as gone, retired or not yet."""
+    directory = bridge.project(repo)[1]
+    for name in ("claude", "codex"):
+        stopped(directory, name)
+    write_json(
+        directory / supervision.ROOT_PUBLICATION,
+        {
+            "since": time.time() - 7200,
+            "retired": time.time() if retired else None,
+            "state_directory": str(directory),
+            "lanes": [],
+            "live": list(live),
+        },
+    )
+    shutil.rmtree(repo)
+    return directory
+
+
+def test_a_project_whose_retired_root_is_gone_is_a_safe_collection(
+    bridge, repo, paired
+):
+    retired_root(bridge, repo, paired)
+    [row] = problems.remedies(bridge.home, bridge.problems())
+    assert row["condition"] == problems.ROOT
+    assert row["project"] == paired["root"]
+    assert row["action"]["kind"] == problems.COLLECT_ACTION
+    assert row["action"]["safe"] is True
+    assert row["command"] == protocol.FORGET_ROOT.format(
+        root=shlex.quote(paired["root"])
+    )
+
+
+def test_a_gone_root_with_a_live_lane_is_not_collected(bridge, repo, paired):
+    retired_root(bridge, repo, paired, retired=False, live=["claude"])
+    [row] = [
+        row
+        for row in problems.remedies(bridge.home, bridge.problems())
+        if row["condition"] == problems.ROOT
+    ]
+    assert row["action"]["safe"] is False
+    assert row["action"]["reason"] == "live lanes may still be running: claude"
+
+
+def test_a_retired_gone_root_forget_refuses_is_not_collected(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = retired_root(bridge, repo, paired)
+    alive(directory, "claude")
+    [row] = problems.remedies(bridge.home, bridge.problems())
+    assert row["action"]["safe"] is False
+    assert row["action"]["reason"] == "live lanes may still be running: claude"
+    stopped(directory, "claude")
+    monkeypatch.setattr(
+        supervision,
+        "root_refused",
+        lambda directory: [{"participant": "codex", "refused": "dirty"}],
+    )
+    [row] = problems.remedies(bridge.home, bridge.problems())
+    assert row["action"]["safe"] is False
+    assert row["action"]["reason"] == (
+        "lanes hold work their retirement refused to release"
+    )
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply", "--yes")
+
+    assert code == 0, out
+    assert "No safe remedy to run, so nothing was done." in out
+    assert directory.exists()
+
+
+def test_apply_collects_a_project_whose_retired_root_is_gone(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = retired_root(bridge, repo, paired)
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply", "--yes")
+
+    assert code == 0, out
+    assert f"- collect the state of {paired['root']}: Removed " in out
+    assert "Ran 1 of 1 safe remedy(s)." in out
+    assert not directory.exists()
+
+
+def test_without_apply_problems_prints_and_exits_as_before(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = ready_estate(bridge, repo, monkeypatch, live=())
+    found = bridge.problems()
+
+    code, out = run(monkeypatch, capsys, bridge)
+    assert code == 1
+    assert out == "\n".join(problems.lines(found)) + "\n"
+    assert "Plan:" not in out
+
+    code, out = run(monkeypatch, capsys, bridge, "--json")
+    assert code == 1
+    listed = json.loads(out)["problems"]
+    assert listed
+    assert not any("action" in row for row in listed)
+    assert len(roster.read(directory)["participants"]) == 3
+
+
+def test_yes_without_apply_is_a_usage_error(bridge, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), "problems", "--yes"],
+    )
+    with pytest.raises(SystemExit) as exited:
+        cli.main()
+    assert exited.value.code == 2
+
+
+def test_apply_with_json_is_a_usage_error(bridge, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "agent-parley",
+            "--home",
+            str(bridge.home),
+            "problems",
+            "--apply",
+            "--json",
+        ],
+    )
+    with pytest.raises(SystemExit) as exited:
+        cli.main()
+    assert exited.value.code == 2
+
+
+def test_apply_without_an_answer_declines_and_retires_nothing(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = ready_estate(bridge, repo, monkeypatch, live=())
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply")
+
+    assert code == 1
+    assert "Plan: run 3 safe remedy(s)." in out
+    assert "Proceed with retiring 3 lane(s)? [y/N]: " in out
+    assert "Declined: nothing was done." in out
+    assert len(roster.read(directory)["participants"]) == 3
+
+
+def test_apply_question_names_the_project_state_it_collects(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = retired_root(bridge, repo, paired)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply")
+
+    assert code == 1
+    assert "Proceed with collecting the state of 1 project(s)? [y/N]: " in out
+    assert "Declined: nothing was done." in out
+    assert directory.exists()
+
+
+def test_apply_question_names_both_retirements_and_collections(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    rows = [
+        {
+            "participant": "claude",
+            "project": "/a",
+            "action": problems._action(kind),
+        }
+        for kind in (problems.RETIRE_ACTION, problems.COLLECT_ACTION)
+    ]
+    monkeypatch.setattr(problems, "remedies", lambda home, found: rows)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+    assert cli.applied_remedies(bridge, [], assume_yes=False) == 1
+
+    out = capsys.readouterr().out
+    assert (
+        "Proceed with retiring 1 lane(s) and collecting the state of "
+        "1 project(s)? [y/N]: "
+    ) in out
+
+
+def test_apply_skips_a_lane_whose_session_started_after_the_listing(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = ready_estate(bridge, repo, monkeypatch, live=())
+    listed = problems.remedies
+
+    def listing(home, found):
+        remedies = listed(home, found)
+        alive(directory, "claude")
+        return remedies
+
+    monkeypatch.setattr(problems, "remedies", listing)
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply", "--yes")
+
+    root = paired["root"]
+    assert code == 0, out
+    assert "Plan: run 3 safe remedy(s)." in out
+    assert f"- retire claude in {root}: skipped. Its session process" in out
+    assert (
+        f"Ran 2 of 3 safe remedy(s). Skipped: retire claude in {root}."
+    ) in out
+    participants = roster.read(directory)["participants"]
+    assert set(participants) == {"claude"}
+    assert not roster.retired(participants["claude"])
+
+
+def test_apply_skips_a_lane_holding_a_real_ignored_file(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    directory = ready_estate(bridge, repo, monkeypatch, live=())
+    lane = Path(roster.read(directory)["participants"]["claude"]["lane"])
+    with (repo / ".git" / "info" / "exclude").open("a") as exclude:
+        exclude.write("secret.env\n")
+    (lane / "secret.env").write_text("TOKEN=1\n")
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply", "--yes")
+
+    root = paired["root"]
+    assert code == 0, out
+    assert "Plan: run 2 safe remedy(s)." in out
+    assert "Skipped 1, each with its reason:" in out
+    assert f"- retire claude in {root}: removing {lane} deletes ignored" in out
+    assert "secret.env" in out
+    assert "Ran 2 of 2 safe remedy(s)." in out
+    assert set(roster.read(directory)["participants"]) == {"claude"}
+    assert (lane / "secret.env").read_text() == "TOKEN=1\n"
+
+
+def test_apply_reports_a_failed_remedy_and_exits_one(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    ready_estate(bridge, repo, monkeypatch, live=())
+    original = cli.Bridge.retire
+
+    def refusing(self, repo, name, **extra):
+        if name == "claude":
+            raise cli.BridgeError("claude refused")
+        return original(self, repo, name, **extra)
+
+    monkeypatch.setattr(cli.Bridge, "retire", refusing)
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply", "--yes")
+
+    root = paired["root"]
+    assert code == 1, out
+    assert f"- retire claude in {root}: failed. claude refused" in out
+    assert f"- retire codex in {root}: " in out
+    assert f"Ran 2 of 3 safe remedy(s). Failed: retire claude in {root}." in out
+
+
+def test_apply_retires_three_clean_dead_lanes_and_reports_the_dirty_one(
+    bridge, repo, paired, monkeypatch, capsys
+):
+    bridge.add_participant(repo, "claude-2", "claude")
+    directory = ready_estate(bridge, repo, monkeypatch, live=())
+    stopped(directory, "claude-2")
+    lane = Path(roster.read(directory)["participants"]["claude-2"]["lane"])
+    (lane / "unsaved.txt").write_text("work in progress\n")
+
+    code, out = run(monkeypatch, capsys, bridge, "--apply", "--yes")
+
+    assert code == 0, out
+    root = paired["root"]
+    assert "Plan: run 3 safe remedy(s)." in out
+    assert "Skipped 1, each with its reason:" in out
+    assert f"- retire claude-2 in {root}: uncommitted changes in" in out
+    assert "unsaved.txt" in out
+    assert "Ran 3 of 3 safe remedy(s)." in out
+    participants = roster.read(directory)["participants"]
+    assert set(participants) == {"claude-2"}
+    assert not roster.retired(participants["claude-2"])
+    assert (lane / "unsaved.txt").exists()
