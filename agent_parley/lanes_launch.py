@@ -170,6 +170,43 @@ def _refusal(bridge: Bridge, directory: Path) -> str:
     return ""
 
 
+def _provider_refusal(
+    bridge: Bridge, name: str, data: dict, checked: dict[tuple[str, str], str]
+) -> str:
+    """Names the provider gate that would refuse one lane's run.
+
+    `run` refuses a provider whose plugin speaks another protocol or whose
+    adapter cannot deliver a required hook, for every lane of it, so a
+    claim taken for such a lane would outlive its window. The answer
+    depends only on the provider and credential, so it is kept per pair.
+
+    Args:
+        bridge: Command object holding the private state root.
+        name: Participant that owns the lane.
+        data: Project manifest with the lane registered.
+        checked: Refusals already read, by provider and credential.
+
+    Returns:
+        The refusal, or empty text when the lane's run may start.
+    """
+    from agent_parley import roster
+
+    participant = data["participants"][name]
+    key = (participant["provider"], participant["credential"] or "")
+    if key not in checked:
+        try:
+            entry = roster.provider(bridge.home, participant["provider"])
+            account = roster.launch_environment(
+                bridge.home, entry, participant["credential"]
+            )
+            bridge.provider_gate(name, entry, account)
+        except BridgeError as exc:
+            checked[key] = f"run would refuse this lane: {exc}"
+        else:
+            checked[key] = ""
+    return checked[key]
+
+
 def _live(lane: Path, name: str) -> bool:
     """Reports whether a session holds the lane's session lock now.
 
@@ -258,7 +295,10 @@ def open_lanes(
     budget and a host past its load threshold, and refuses before anything
     is registered or claimed. Each lane is then registered the way `run`
     registers it, after its native CLI is found on ``PATH``, so a missing
-    client refuses before any lane is added.
+    client refuses before any lane is added. A registered lane whose
+    provider `run` would refuse, for a plugin speaking another protocol or
+    a required hook its adapter cannot deliver, fails with that reason,
+    claims nothing and opens no window; the other lanes still open.
 
     A rerun is idempotent. A lane whose session lock is held, or whose
     window already exists in the session, is skipped and claims nothing.
@@ -276,7 +316,9 @@ def open_lanes(
     only its own lane's process, so attaching, detaching or closing it
     leaves the other lanes running. A window tmux fails to open releases
     the claim this launch took for it and the remaining lanes still open.
-    Without tmux nothing is opened.
+    A window whose claim this launch took also carries `LANES_CLAIM_ENV`
+    naming that issue, so its `run` releases the claim when a gate refuses
+    it before the session starts. Without tmux nothing is opened.
 
     Args:
         bridge: Command object holding the private state root.
@@ -300,7 +342,7 @@ def open_lanes(
             missing, or tmux cannot report the session before any claim.
     """
     from agent_parley import forge, issues, roster
-    from agent_parley.launch import native_executable
+    from agent_parley.launch import LANES_CLAIM_ENV, native_executable
 
     if not names or len(set(names)) != len(names):
         raise BridgeError("run --lanes needs distinct participant names.")
@@ -339,6 +381,7 @@ def open_lanes(
     members = forge.milestone_issues(Path(root), milestone)
     owned = issues.holders(issues.snapshot(directory))
     lanes: list[dict] = []
+    checked: dict[tuple[str, str], str] = {}
     for name in names:
         lane = Path(data["participants"][name]["lane"])
         state, reason = "", ""
@@ -346,6 +389,8 @@ def open_lanes(
             state, reason = LIVE, "a session already runs in this lane"
         elif name in windows:
             state, reason = OPEN, f"window {name} is already open"
+        elif reason := _provider_refusal(bridge, name, data, checked):
+            state = FAILED
         kept = next(
             (
                 number
@@ -404,9 +449,14 @@ def open_lanes(
             if exists
             else ["new-session", "-d", "-s", session]
         )
+        marker = (
+            ["-e", f"{LANES_CLAIM_ENV}={entry['issue']}"]
+            if entry["claimed"]
+            else []
+        )
         try:
             _tmux(
-                [*place, *environment, "-n", entry["participant"]]
+                [*place, *environment, *marker, "-n", entry["participant"]]
                 + ["-c", root, *entry["argv"]]
             )
         except BridgeError as exc:

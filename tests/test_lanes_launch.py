@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent_parley import cli, forge, issues, lanes_launch, process, roster
+from agent_parley.launch import LANES_CLAIM_ENV
 from agent_parley.state import BridgeError, lock
 
 FAKE_TMUX = """#!{python}
@@ -407,3 +408,54 @@ def test_status_names_the_running_session(tmux, monkeypatch):
     )
     monkeypatch.setenv("FAKE_TMUX_SESSION", "1")
     assert lanes_launch.attach_line("/work/my.repo") == ""
+
+
+REFUSED_HOOK = "cannot deliver PreToolUse"
+
+
+def without_guard_hook(monkeypatch):
+    """Makes the codex adapter unable to deliver its PreToolUse guard."""
+    monkeypatch.setattr(
+        roster,
+        "unavailable_hooks",
+        lambda adapter: ["PreToolUse"] if adapter == "codex" else [],
+    )
+
+
+def test_a_provider_gate_refusal_fails_its_lane_before_any_claim(
+    bridge, seeded, tmux, monkeypatch
+):
+    without_guard_hook(monkeypatch)
+    opened = lanes_launch.open_lanes(
+        bridge, seeded, ["claude", "codex"], "0.23.0"
+    )
+    lanes = {lane["participant"]: lane for lane in opened["lanes"]}
+    assert lanes["codex"]["state"] == lanes_launch.FAILED
+    assert not lanes["codex"]["issue"]
+    assert not lanes["codex"]["claimed"]
+    assert REFUSED_HOOK in lanes["codex"]["reason"]
+    assert lanes["claude"]["state"] == lanes_launch.STARTED
+    assert "codex" not in owners(bridge, seeded).values()
+    assert owner(bridge, seeded, lanes["claude"]["issue"]) == "claude"
+    windows = opened_windows(tmux)
+    assert [call[call.index("-n") + 1] for call in windows] == ["claude"]
+    marker = f"{LANES_CLAIM_ENV}={lanes['claude']['issue']}"
+    assert marker in windows[0]
+    assert lanes_launch.lines(opened)[-2] == "Started: claude; failed: codex"
+
+
+@pytest.mark.parametrize("marked", [True, False])
+def test_a_run_refused_by_a_gate_releases_only_a_lanes_claim(
+    bridge, seeded, paired, monkeypatch, marked
+):
+    codex = Path(paired["lanes"]["codex"])
+    bridge.issue(codex, "claim", "43")
+    if marked:
+        monkeypatch.setenv(LANES_CLAIM_ENV, "43")
+    else:
+        monkeypatch.delenv(LANES_CLAIM_ENV, raising=False)
+    without_guard_hook(monkeypatch)
+    with pytest.raises(BridgeError, match=REFUSED_HOOK) as refused:
+        bridge.launch("codex", seeded, "", issue="43")
+    assert ("Released #43" in str(refused.value)) is marked
+    assert (owner(bridge, seeded, "43") == "codex") is not marked
