@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         checkpoints,
         completion,
         convergence,
+        criteria,
         evidence,
         followups,
         forge,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
         metrics,
         notify,
         plan,
+        polling,
         problems,
         process,
         protocol,
@@ -144,6 +146,7 @@ DEFERRED_MODULES = (
     "completion",
     "convergence",
     "copilot",
+    "criteria",
     "delivery",
     "dialogs",
     "evidence",
@@ -161,6 +164,7 @@ DEFERRED_MODULES = (
     "notify",
     "opencode",
     "plan",
+    "polling",
     "problems",
     "process",
     "protocol",
@@ -1033,7 +1037,7 @@ def lane_detail(record: dict, data: dict) -> None:
         )
     if timing := launch_line(data["participants"][agent].get("launch")):
         print(f"    {timing}")
-    if record["idle"]["stalled"]:
+    if record["idle"]["marker"]:
         print(f"    {record['idle']['marker']}")
     if record["budget"]["marker"]:
         print(f"    {record['budget']['marker']}")
@@ -1600,12 +1604,17 @@ def selection_plan(
     return "\n".join(lines)
 
 
-def confirmed(proposal: str, assume_yes: bool) -> bool:
+def confirmed(
+    proposal: str,
+    assume_yes: bool,
+    question: str = "Proceed with these lanes?",
+) -> bool:
     """Prints one plan and asks once for the whole selected set.
 
     Args:
         proposal: The plan the operator reads before answering.
         assume_yes: Whether `--yes` already confirmed the whole set.
+        question: What the prompt asks, naming everything the plan changes.
 
     Returns:
         Whether the operator confirmed. A closed or empty answer declines.
@@ -1614,7 +1623,7 @@ def confirmed(proposal: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
     try:
-        answer = input("Proceed with these lanes? [y/N]: ")
+        answer = input(f"{question} [y/N]: ")
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes")
@@ -1721,6 +1730,150 @@ def retired_ready(bridge: Bridge, repo: Path, assume_yes: bool) -> int:
         lambda name: retired_lane(bridge, repo, name, assume_yes),
         assume_yes=True,
     )
+
+
+def remedy_label(row: dict) -> str:
+    """Names one remedy `problems --apply` lists.
+
+    Args:
+        row: A row `problems.remedies` returned.
+
+    Returns:
+        What the remedy does and to which lane or project.
+    """
+    if row["action"]["kind"] == problems.RETIRE_ACTION:
+        return f"retire {row['participant']} in {row['project']}"
+    return f"collect the state of {row['project']}"
+
+
+def applied_remedy(bridge: Bridge, row: dict) -> str:
+    """Runs one safe remedy through the command that owns it.
+
+    A retirement takes `Bridge.retire` without discarding any ignored file,
+    so it still refuses a lane that is busy, has a running session or
+    holds uncommitted changes when the apply reaches it. A collection takes
+    `supervision.forget`, which keeps the recovery checkpoints.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        row: A row `problems.remedies` classed safe.
+
+    Returns:
+        The account the remedy produced.
+
+    Raises:
+        BridgeError: If the owning command refuses the remedy.
+    """
+    if row["action"]["kind"] == problems.RETIRE_ACTION:
+        return bridge.retire(Path(row["project"]), row["participant"])
+    removed = supervision.forget(bridge.home, row["project"], apply=True)
+    return " ".join(supervision.forgotten_lines(removed))
+
+
+def session_returned(bridge: Bridge, row: dict) -> bool:
+    """Tells whether a retirement's lane may have a session again.
+
+    The listing read the session process before the prompt, and the
+    operator may answer much later. A native session started in the
+    worktree since then holds no session lock, so the process is read once
+    more right before the retirement, which runs only while it is known to
+    be gone.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        row: A row `problems.remedies` classed safe.
+
+    Returns:
+        True when the row retires a lane whose session process is now alive
+        or unreadable; False for a gone process or a collection.
+
+    Raises:
+        BridgeError: If the row's project is no longer registered.
+    """
+    if row["action"]["kind"] != problems.RETIRE_ACTION:
+        return False
+    directory = bridge.project(Path(row["project"]), create=False)[1]
+    reading = supervision.presence(directory, row["participant"])
+    return reading["process_alive"] is not False
+
+
+def applied_remedies(bridge: Bridge, rows: list[dict], assume_yes: bool) -> int:
+    """Runs every remedy `problems` classes safe, after one confirmation.
+
+    The plan names each safe remedy and each skipped one with its reason,
+    and one question covers the whole safe set, naming the lanes it retires
+    and the projects whose state it collects. A remedy that refuses or
+    fails is reported beside its label while the rest are still run. A
+    retirement whose session process `session_returned` finds again is
+    reported skipped, not failed.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        rows: Rows `problems.derive` produced.
+        assume_yes: Whether `--yes` already confirmed the safe set.
+
+    Returns:
+        0 when every safe remedy ran or none was safe; 1 when the operator
+        declined or left the question unanswered, or any remedy failed.
+    """
+    found = problems.remedies(bridge.home, rows)
+    safe = [row for row in found if row["action"]["safe"]]
+    skipped = [row for row in found if not row["action"]["safe"]]
+    plan = ["", f"Plan: run {len(safe)} safe remedy(s)."]
+    plan += [f"- {remedy_label(row)}" for row in safe]
+    if skipped:
+        plan.append(f"Skipped {len(skipped)}, each with its reason:")
+        plan += [
+            f"- {remedy_label(row)}: {row['action']['reason']}"
+            for row in skipped
+        ]
+    if not safe:
+        plan.append("No safe remedy to run, so nothing was done.")
+        print("\n".join(plan))
+        return 0
+    retiring = sum(
+        row["action"]["kind"] == problems.RETIRE_ACTION for row in safe
+    )
+    changes = []
+    if retiring:
+        changes.append(f"retiring {retiring} lane(s)")
+    if len(safe) > retiring:
+        changes.append(
+            f"collecting the state of {len(safe) - retiring} project(s)"
+        )
+    question = f"Proceed with {' and '.join(changes)}?"
+    if not confirmed("\n".join(plan), assume_yes, question):
+        print("Declined: nothing was done.")
+        return 1
+    failed = []
+    late = []
+    for row in safe:
+        label = remedy_label(row)
+        try:
+            if session_returned(bridge, row):
+                print(
+                    f"- {label}: skipped. Its session process may be "
+                    "running again, so the lane is kept."
+                )
+                late.append(label)
+                continue
+            print(f"- {label}: {applied_remedy(bridge, row)}")
+        except (
+            BridgeError,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+        ) as failure:
+            print(f"- {label}: failed. {failure}")
+            failed.append(label)
+    ran = len(safe) - len(failed) - len(late)
+    tally = f"Ran {ran} of {len(safe)} safe remedy(s)"
+    if late:
+        tally += f". Skipped: {'; '.join(late)}"
+    if failed:
+        tally += f". Failed: {'; '.join(failed)}"
+    print(f"{tally}.")
+    return 1 if failed else 0
 
 
 def bulk_lanes(
@@ -3010,8 +3163,8 @@ class Bridge(
         if not claimed:
             raise BridgeError(
                 f"{name} claims no issue, so the pull request would carry no "
-                "issue reference. Run `agent-parley issue claim NUMBER` in "
-                "the lane first."
+                f"issue reference. Run `{protocol.cli_command()} issue claim "
+                "NUMBER` in the lane first."
             )
         policy = data.get("pull_request", {})
         labels, milestone = hygiene_metadata(root, claimed, policy)
@@ -3293,6 +3446,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "milestone",
             "followup",
             "mail",
             "say",
@@ -3335,6 +3489,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "metrics",
             "history",
             "events",
+            "audit",
             "problems",
             "doctor",
             "notify",
@@ -3411,6 +3566,41 @@ class Absorbed:
 
 
 WHOLE_PARSER = frozenset({"completion", "__complete"})
+SHOW_BY_DEFAULT = frozenset(
+    {"unattended", "verify", "init", "pool", "approval", "timeout"}
+)
+
+
+def with_default_action(arguments: Sequence[str]) -> list[str]:
+    """Adds ``show`` to a policy command typed without an action.
+
+    Only a command in `SHOW_BY_DEFAULT` that is followed by nothing, or by an
+    option other than a help flag, gains the action, so a command that
+    changes state still demands its own action.
+
+    Args:
+        arguments: Arguments as typed, without the program name.
+
+    Returns:
+        The arguments, with ``show`` after the command when it was omitted.
+    """
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token in ("-V", "--version"):
+            index += 1
+        elif token == "--home":
+            index += 2
+        elif token.startswith("--home="):
+            index += 1
+        else:
+            break
+    if index >= len(arguments) or arguments[index] not in SHOW_BY_DEFAULT:
+        return list(arguments)
+    rest = arguments[index + 1 :]
+    if rest and (not rest[0].startswith("-") or rest[0] in ("-h", "--help")):
+        return list(arguments)
+    return [*arguments[: index + 1], "show", *rest]
 
 
 class CommandIndex:
@@ -3748,7 +3938,7 @@ def lane_reading(bridge: Bridge, repo: Path, name: str) -> tuple[dict, dict]:
 
 
 def issue_lines(reading: dict) -> str:
-    """Renders one issue's ownership, blockers, reservations and history.
+    """Renders an issue's ownership, blockers, criteria and history.
 
     Args:
         reading: Reading produced by the issue show command.
@@ -3790,8 +3980,19 @@ def issue_lines(reading: dict) -> str:
         "Reservations held: "
         + (", ".join(reading["reservations"]) or "none recorded")
     )
+    for flagged in reading.get("contention") or []:
+        lines.append(
+            f"Contention with {flagged['peer']} on {flagged['path']}: "
+            f"{flagged['count']} refusals; {flagged['peer']} holds "
+            + (
+                ", ".join(f"#{held}" for held in flagged["issues"])
+                or "no issue"
+            )
+            + "; the operator hands off or releases one"
+        )
     if reading.get("convergence"):
         lines.append(convergence.describe(reading["convergence"]))
+    lines.extend(criteria.lines(record))
     reported = reading["history"]
     lines.append(
         history.describe(
@@ -4273,6 +4474,26 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     delivered.add_argument("--json", action="store_true", help=JSON_HELP)
+    spent = readings.add_parser(
+        "cost",
+        help=(
+            "Estimate the cost per merged issue, merged pull request and "
+            "review finding by lane and provider, from client token counts "
+            "and the operator's recorded prices."
+        ),
+    )
+    spent.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        required=True,
+        metavar="TIME",
+        help=(
+            "Start of the window, such as 2026-10-15T09:01:00Z, or a window "
+            "counted back from now, such as 7d."
+        ),
+    )
+    spent.add_argument("--json", action="store_true", help=JSON_HELP)
     follow = commands.add_parser(
         "watch",
         help=(
@@ -4421,6 +4642,74 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     "otherwise."
                 ),
             )
+    audited = commands.add_parser(
+        "audit",
+        help="Export or verify a hash-chained, signable audit bundle.",
+    )
+    audits = audited.add_subparsers(dest="action", required=True)
+    exported = audits.add_parser(
+        "export",
+        help=(
+            "Write one JSON bundle of the lanes, resolved issues, claims, "
+            "handoffs, ready reports, review rounds, pull requests and "
+            "commits inside a window."
+        ),
+    )
+    exported.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    exported.add_argument(
+        "--since",
+        required=True,
+        metavar="REF",
+        help=(
+            "Window start: an instant such as 2026-10-15T09:01:00Z, a "
+            "window such as 7d, or a commit such as a tag, standing for "
+            "its committer time."
+        ),
+    )
+    exported.add_argument(
+        "--until",
+        metavar="REF",
+        help="Window end, in the same forms as --since; now by default.",
+    )
+    exported.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="FILE",
+        help="The bundle file to write.",
+    )
+    exported.add_argument(
+        "--sign",
+        type=Path,
+        metavar="KEY",
+        help=(
+            "Sign the bundle with this SSH key through ssh-keygen -Y sign; "
+            "unsigned by default."
+        ),
+    )
+    checked = audits.add_parser(
+        "verify",
+        help=(
+            "Check a bundle's hash chain and, when present, its SSH signature."
+        ),
+    )
+    checked.add_argument("bundle", type=Path, help="The bundle file.")
+    checked.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="Fail when the bundle carries no signature.",
+    )
+    checked.add_argument(
+        "--signer",
+        type=Path,
+        metavar="PUBKEY_FILE",
+        help=(
+            "Require a signature by this SSH public key; another key's "
+            "signature fails."
+        ),
+    )
     archived = commands.add_parser(
         "state",
         help="Export, inspect or import the coordination state as one archive.",
@@ -4635,8 +4924,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     report.add_argument(
         "--evidence",
-        default="",
-        help="What was checked; longer evidence is attached to the report.",
+        action="append",
+        default=[],
+        help=(
+            "What was checked; repeatable, one line each. A ready report on "
+            "an issue with acceptance criteria needs one line per criterion, "
+            "written `N: <evidence>`. Longer evidence is attached to the "
+            "report."
+        ),
     )
     report.add_argument(
         "--issue",
@@ -4874,6 +5169,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "because nothing was integrated."
         ),
     )
+    resolving.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="N: TEXT",
+        help=(
+            "Evidence for one acceptance criterion of the claim; repeatable, "
+            "one per criterion. Without it the holder's ready report evidence "
+            "stands, or the forge outcome is recorded for every criterion."
+        ),
+    )
     resolving.add_argument("--json", action="store_true", help=JSON_HELP)
     choosing = actions.add_parser(
         "next",
@@ -5040,6 +5346,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Also list the rows of lanes dead past the project's fold_after "
             "that are older than it, which one line otherwise counts."
         ),
+    )
+    triaging.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "After the list, run every remedy classed safe (retiring a lane "
+            "ready to retire whose worktree is clean, collecting a project "
+            "whose root is gone) after one question; remedies that could "
+            "drop work are listed and skipped with the reason. Exit 1 if "
+            "any remedy failed."
+        ),
+    )
+    triaging.add_argument(
+        "--yes",
+        action="store_true",
+        help="With --apply, run the safe remedies without asking.",
     )
     triage = triaging.add_subparsers(dest="action")
     acking = triage.add_parser(
@@ -6006,6 +6328,31 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     naming_base.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
+    milestoning = commands.add_parser(
+        "milestone",
+        help="Read how a milestone's open issues depend on one another.",
+    )
+    milestone_actions = milestoning.add_subparsers(dest="action", required=True)
+    milestone_path = milestone_actions.add_parser(
+        "path",
+        help=(
+            "Print the critical path of a milestone with each issue's state "
+            "and holder; it claims nothing."
+        ),
+    )
+    milestone_path.add_argument(
+        "--milestone",
+        default=None,
+        metavar="TITLE",
+        help=(
+            "Milestone to read; the forge's active milestone when omitted, "
+            "every cached open issue when the forge names none."
+        ),
+    )
+    milestone_path.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    milestone_path.add_argument("--json", action="store_true", help=JSON_HELP)
     tracker = commands.add_parser(
         "forge",
         help="Show or set the issue tracker this project coordinates over.",
@@ -6243,6 +6590,21 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "fetched, and refused from a lane."
         ),
     )
+    pricing.add_argument(
+        "--model",
+        metavar="NAME",
+        help=(
+            "Record this model's rates for `metrics cost`; needs --input, "
+            "--output and --cache-read."
+        ),
+    )
+    for rate in ("input", "output", "cache-read"):
+        pricing.add_argument(
+            f"--{rate}",
+            type=float,
+            metavar="AMOUNT",
+            help=f"Price per million {rate} tokens of --model.",
+        )
     accounts = commands.add_parser(
         "credentials", help="Inspect or define per-account profiles."
     )
@@ -6407,6 +6769,71 @@ def root_parser(
     return parser, commands
 
 
+def _audit(bridge: Bridge, args: argparse.Namespace) -> str:
+    """Exports or verifies an audit bundle and words the outcome.
+
+    A reference is read first as an instant or a window, as every other
+    `--since` reads it, and otherwise as a commit of the project, which
+    stands for its committer time.
+
+    Args:
+        bridge: Command object holding the state root.
+        args: Parsed `audit` command line.
+
+    Returns:
+        One account of what was written or checked.
+
+    Raises:
+        BridgeError: If a reference names nothing, signing fails, or the
+            bundle fails verification.
+    """
+    from agent_parley import audit
+
+    if args.action == "verify":
+        checked = audit.verify(
+            args.bundle,
+            require_signature=args.require_signature,
+            signer=args.signer,
+        )
+        signed = (
+            f" {checked['signer']}"
+            if checked["signed"]
+            else " No signature; the chain alone does not show who exported it."
+        )
+        return (
+            f"Chain intact: {checked['records']} records, head "
+            f"{checked['head']}.{signed}"
+        )
+    root, directory = bridge.project(args.repo.resolve(), create=False)
+    bounds = []
+    for ref in (args.since, args.until):
+        if ref is None:
+            bounds.append(("now", time.time()))
+            continue
+        try:
+            bounds.append((ref, instant(ref)))
+        except ValueError:
+            bounds.append((ref, audit.commit_time(root, ref)))
+    bundle = audit.export(
+        bridge.home,
+        directory,
+        roster.read(directory),
+        args.output,
+        since=bounds[0],
+        until=bounds[1],
+        key=args.sign,
+    )
+    tally = ", ".join(
+        f"{count} {kind}" for kind, count in audit.counts(bundle).items()
+    )
+    return (
+        f"Exported {len(bundle['records'])} records ({tally or 'none'}) "
+        f"to {args.output}, "
+        + ("signed" if "signature" in bundle else "unsigned")
+        + "; credentials, tokens and transcripts excluded."
+    )
+
+
 def _plain_status() -> int:
     """Runs the bare status command without building its parser.
 
@@ -6418,6 +6845,7 @@ def _plain_status() -> int:
     )
     try:
         bridge = Bridge(home)
+        polling.record(bridge.home, "cli:status")
         bridge.board(
             Selection(project=bridge.project_at(Path.cwd())), terminal_width()
         )
@@ -6455,7 +6883,7 @@ def main() -> int:
     parser, commands = root_parser(typed)
     if typed is not None and typed not in commands.declared:
         parser, commands = root_parser(None)
-    args = parser.parse_args()
+    args = parser.parse_args(with_default_action(sys.argv[1:]))
     home = args.home.expanduser()
     if args.version:
         print(protocol.launcher_version())
@@ -6648,6 +7076,12 @@ def main() -> int:
                 print(json.dumps(reading, indent=2))
             else:
                 print(metrics.describe_throughput(reading), end="")
+        elif args.command == "metrics" and args.reading == "cost":
+            reading = metrics.cost(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_cost(reading), end="")
         elif args.command == "metrics":
             from agent_parley import dashboard
 
@@ -6727,6 +7161,8 @@ def main() -> int:
                 message,
                 file=sys.stdout if output else sys.stderr,
             )
+        elif args.command == "audit":
+            print(_audit(bridge, args))
         elif args.command == "state" and args.action == "show" and args.json:
             print(
                 views.render(
@@ -6856,7 +7292,7 @@ def main() -> int:
                 args.state,
                 args.summary,
                 args.remaining,
-                args.evidence,
+                "\n".join(args.evidence),
                 key=args.idempotency_key,
                 issue=args.issue,
                 resume_on=args.resume_on,
@@ -6910,6 +7346,7 @@ def main() -> int:
         ):
             return assigned_selection(bridge, args.repo.resolve(), args)
         elif args.command == "issue" and args.action == "next":
+            polling.record(bridge.home, "cli:issue-next")
             ranked = bridge.issue_next(args.repo.resolve(), args.limit)
             print(
                 views.render("issue_next", ranked)
@@ -6966,6 +7403,7 @@ def main() -> int:
                 args.number,
                 reason=args.reason,
                 release=args.release,
+                proof="\n".join(args.evidence),
             )
             print(
                 views.render("issue_resolve", views.resolution(ended))
@@ -7020,12 +7458,18 @@ def main() -> int:
                 + "."
             )
         elif args.command == "problems":
+            if args.yes and not args.apply:
+                parser.error("--yes needs --apply.")
+            if args.apply and args.json:
+                parser.error("--apply prints text; drop --json.")
             found = bridge.problems(args.ack_after)
             print(
                 views.render("problems", problems.rendered(found, args.all))
                 if args.json
                 else "\n".join(problems.lines(found, args.all))
             )
+            if args.apply:
+                return applied_remedies(bridge, found, args.yes)
             return 1 if problems.shown(found, args.all) else 0
         elif args.command in ("gc", "reclaim"):
             if args.force and not args.apply:
@@ -7221,6 +7665,7 @@ def main() -> int:
                     else plan.render_diff(applied)
                 )
         elif args.command == "mail":
+            polling.record(bridge.home, "cli:mail")
             page = bridge.mail(
                 args.repo.resolve(),
                 args.action,
@@ -7314,7 +7759,9 @@ def main() -> int:
                 ):
                     print(
                         supervision.OPT_IN_WARNING.format(
-                            name=args.name, adapter=gap
+                            name=args.name,
+                            adapter=gap,
+                            remedy=supervision.opt_in_remedy(gap),
                         ),
                         file=sys.stderr,
                     )
@@ -7391,6 +7838,13 @@ def main() -> int:
                         repository, getattr(args, "prefix", None)
                     )
                 )
+        elif args.command == "milestone":
+            reading = bridge.milestone_path(args.repo.resolve(), args.milestone)
+            print(
+                views.render("milestone_path", reading)
+                if args.json
+                else recommend.render_path(reading)
+            )
         elif args.command == "forge":
             repository = args.repo.resolve()
             if getattr(args, "json", False):
@@ -7770,7 +8224,28 @@ def main() -> int:
                     )
                 return 0
             elif args.action == "price":
-                print(bridge.price(Path.cwd(), args.name, args.per_mtok))
+                rates = {
+                    "input": args.input,
+                    "output": args.output,
+                    "cache_read": args.cache_read,
+                }
+                if args.model and None in rates.values():
+                    parser.error(
+                        "--model needs --input, --output and --cache-read."
+                    )
+                if not args.model and set(rates.values()) != {None}:
+                    parser.error(
+                        "--input, --output and --cache-read need --model."
+                    )
+                print(
+                    bridge.price(
+                        Path.cwd(),
+                        args.name,
+                        args.per_mtok,
+                        args.model or "",
+                        rates,
+                    )
+                )
                 return 0
             defined = roster.inspect(bridge.home)
             print(
@@ -7823,6 +8298,7 @@ def main() -> int:
                 else json.dumps(registered, indent=2)
             )
         else:
+            polling.record(bridge.home, "cli:status")
             selection = selected_status(args)
             workspace = getattr(args, "workspace", "")
             if workspace:

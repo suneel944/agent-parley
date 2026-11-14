@@ -2477,8 +2477,8 @@ def test_issue_claim_records_and_renders_the_forge_title(
 ):
     claude = Path(paired["lanes"]["claude"])
     monkeypatch.setattr(
-        "agent_parley.cli.forge.issue_title",
-        lambda directory, number: f"Title for issue {number}",
+        "agent_parley.cli.forge.issue_text",
+        lambda directory, number: (f"Title for issue {number}", None),
     )
     assert bridge.issue(claude, "claim", "#432")["title"] == (
         "Title for issue 432"
@@ -2494,11 +2494,13 @@ def test_issue_claim_survives_an_unavailable_forge(
 ):
     claude = Path(paired["lanes"]["claude"])
     monkeypatch.setattr(
-        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+        "agent_parley.cli.forge.issue_text",
+        lambda directory, number: (None, None),
     )
     assert "title" not in bridge.issue(claude, "claim", "432")
     monkeypatch.setattr(
-        "agent_parley.cli.forge.issue_title", lambda directory, number: ""
+        "agent_parley.cli.forge.issue_text",
+        lambda directory, number: ("", None),
     )
     assert "title" not in bridge.issue(claude, "claim", "433")
     assert listed(bridge.issue(repo, "list")) == (
@@ -2513,8 +2515,8 @@ def test_recorded_issue_title_survives_later_transitions(
         Path(paired["lanes"][name]) for name in ("claude", "codex")
     )
     monkeypatch.setattr(
-        "agent_parley.cli.forge.issue_title",
-        lambda directory, number: "Resolved from the forge",
+        "agent_parley.cli.forge.issue_text",
+        lambda directory, number: ("Resolved from the forge", None),
     )
     recorded(bridge, repo, "77")
     bridge.issue(claude, "claim", "432")
@@ -2522,7 +2524,8 @@ def test_recorded_issue_title_survives_later_transitions(
     assert blocked["title"] == "Resolved from the forge"
     bridge.issue(claude, "release", "432")
     monkeypatch.setattr(
-        "agent_parley.cli.forge.issue_title", lambda directory, number: None
+        "agent_parley.cli.forge.issue_text",
+        lambda directory, number: (None, None),
     )
     reclaimed = bridge.issue(codex, "claim", "432")
     assert reclaimed["title"] == "Resolved from the forge"

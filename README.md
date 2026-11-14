@@ -346,7 +346,10 @@ lane setup.
   setting the CLI cannot honour, an empty value or a repeated line refuses
   the spawn with the reason. Without them the child runs on the provider
   default. `top`, `participant show` and the child report name the tier,
-  and `quota show` splits a Claude credential's window use by model.
+  and `quota show` splits a Claude credential's window use by model. A
+  worktree the lane's own client makes is recorded, never created, and
+  `top` lists it with its branch and base, flagged when it lies outside
+  `.claude/worktrees/`.
 - **Lanes sharing a credential park before its quota runs out.**
   `agent-parley quota set NAME --hours H --tokens N [--threshold F]` records
   the plan's window; `quota show` prints the remaining headroom. Near the
