@@ -400,8 +400,9 @@ def _test(
     ``MAX_MERGES`` Git calls per pass, counting each ``merge-tree`` and each
     conflicted file's ``cat-file``; a merge runs only while its worst case
     of one plus ``MAX_FILES`` calls fits. The first merge Git cannot answer
-    ends the pass's merging, since a Git older than 2.38 fails every one,
-    and every pair it leaves untested is recorded as failed with it.
+    ends the pass's merging, since a Git older than 2.38 fails every one.
+    Only that pair is recorded as failed; the pairs it leaves untested are
+    tried on a later pass.
 
     Args:
         root: Base checkout.
@@ -428,8 +429,12 @@ def _test(
             continue
         key = f"{one['head']}..{two['head']}"
         files = cache.get(key)
-        if files is None and key not in failed and not stopped:
-            env = None if spent + 1 + MAX_FILES > MAX_MERGES else objects()
+        if files is None and key not in failed:
+            env = (
+                None
+                if stopped or spent + 1 + MAX_FILES > MAX_MERGES
+                else objects()
+            )
             if env is None:
                 untested.add((first, second))
                 continue

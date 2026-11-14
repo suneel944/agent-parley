@@ -461,7 +461,7 @@ def test_an_untested_pair_keeps_its_prediction_and_is_not_mailed_again(
             assert inbox(bridge, holder, subject) == (peer != name)
 
 
-def test_a_merge_git_cannot_answer_ends_the_pass_and_is_not_retried(
+def test_a_merge_git_cannot_answer_ends_the_pass_and_only_it_is_failed(
     bridge, repo, paired, monkeypatch
 ):
     manifest, directory = conflicting(bridge, repo, paired, "gemini")
@@ -471,16 +471,17 @@ def test_a_merge_git_cannot_answer_ends_the_pass_and_is_not_retried(
         "merge",
         lambda root, ours, theirs, env: attempts.append(ours),
     )
+    for count in (1, 2, 3):
+        forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
+        assert len(attempts) == count
+        published = forecast.read(directory)
+        assert published["pairs"] == [] and published["merges"] == {}
+        assert len(published["failed"]) == count
     forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
-    assert len(attempts) == 1
-    published = forecast.read(directory)
-    assert published["pairs"] == [] and published["merges"] == {}
-    assert len(published["failed"]) == 3
-    forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
-    assert len(attempts) == 1
+    assert len(attempts) == 3
     commit(repo, "base moves", "other.txt")
     forecast.supervise(bridge.home, directory, manifest, {"prompts": False})
-    assert len(attempts) == 2
+    assert len(attempts) == 4
 
 
 def test_a_moved_base_rereads_every_lane_and_keeps_merges(

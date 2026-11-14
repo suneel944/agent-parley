@@ -34,11 +34,12 @@ each `merge-tree` and each `cat-file`; a merge starts only while its worst
 case, one merge and eight files, still fits. A pair over that bound is
 tested on a later cycle and keeps the conflict an earlier cycle predicted
 for it, so its lanes are not mailed again. The first merge Git cannot
-answer ends the cycle's merging, and that pair and every pair after it are
-recorded as failed: they are not retried until either head or the base
-moves, so a Git older than 2.38, which has no `--write-tree`, costs one
-failed call per change rather than one per pair per cycle. The forecast
-then predicts no new conflict and `merge plan` refuses.
+answer ends the cycle's merging. Only that pair is recorded as failed, and
+it is not retried until either head or the base moves; the pairs after it
+stay untested and are tried on the next cycle. A Git older than 2.38, which
+has no `--write-tree`, therefore costs one failed call per cycle until every
+overlapping pair has failed once, rather than one per pair per cycle. The
+forecast then predicts no new conflict and `merge plan` refuses.
 
 `git merge-tree --write-tree` needs no checkout and moves no reference,
 index or worktree. The tree and blob objects it writes, and the scratch
