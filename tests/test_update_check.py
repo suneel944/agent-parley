@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+import threading
+import time
 import urllib.error
 
 import pytest
@@ -113,6 +115,43 @@ def test_the_environment_switch_disables_the_check(tmp_path, value):
     assert not (tmp_path / updates.CACHE).exists()
 
 
+def test_a_lane_process_gets_no_notice_and_never_asks(tmp_path):
+    index = Index("0.23.0")
+    environ = {updates.PARTICIPANT_ENV: "claude-3"}
+    assert notice(tmp_path, index, environ=environ) == ""
+    assert index.calls == 0
+    assert not (tmp_path / updates.CACHE).exists()
+
+
+def test_a_stalled_index_is_abandoned_after_the_timeout(tmp_path, monkeypatch):
+    release = threading.Event()
+
+    def urlopen(request, timeout):
+        release.wait(30)
+        raise OSError("released")
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    monkeypatch.setattr(updates, "TIMEOUT", 0.2)
+    started = time.monotonic()
+    try:
+        assert (
+            updates.notice(
+                tmp_path,
+                installed="0.22.0",
+                now=1000.0,
+                environ={},
+                command=UV,
+            )
+            == ""
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert elapsed < 2.0
+    cached = json.loads((tmp_path / updates.CACHE).read_text())
+    assert cached == {"checked": 1000.0, "latest": ""}
+
+
 @pytest.mark.parametrize(
     ("installed", "latest", "result"),
     [
@@ -202,6 +241,7 @@ def test_doctor_prints_the_notice_on_standard_error(
     bridge, repo, paired, monkeypatch, capsys
 ):
     monkeypatch.delenv(updates.DISABLE)
+    monkeypatch.delenv(updates.PARTICIPANT_ENV, raising=False)
     monkeypatch.setattr(updates, "fetch_latest", Index("999.0.0"))
     monkeypatch.setattr(
         sys, "argv", ["agent-parley", "--home", str(bridge.home), "doctor"]
@@ -216,6 +256,7 @@ def test_bare_status_prints_the_notice_on_standard_error(
     bridge, repo, paired, monkeypatch, capsys
 ):
     monkeypatch.delenv(updates.DISABLE)
+    monkeypatch.delenv(updates.PARTICIPANT_ENV, raising=False)
     monkeypatch.setattr(updates, "fetch_latest", Index("999.0.0"))
     monkeypatch.setenv("AGENT_PARLEY_HOME", str(bridge.home))
     monkeypatch.setattr(sys, "argv", ["agent-parley", "status"])
@@ -229,6 +270,7 @@ def test_parsed_status_prints_the_notice_once_a_day(
 ):
     index = Index("999.0.0")
     monkeypatch.delenv(updates.DISABLE)
+    monkeypatch.delenv(updates.PARTICIPANT_ENV, raising=False)
     monkeypatch.setattr(updates, "fetch_latest", index)
     monkeypatch.setattr(
         sys,

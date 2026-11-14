@@ -5,17 +5,22 @@ service poll does, so a lane's tool calls and the supervision loop never wait
 on the package index. The answer, a failed attempt included, is cached in the
 state root for a day, so an unreachable index costs at most one bounded
 attempt a day. Setting ``AGENT_PARLEY_NO_UPDATE_CHECK=1`` turns the check off.
+A lane's own process, which carries ``AGENT_PARLEY_PARTICIPANT``, never sees
+the notice, so a lane agent running ``status`` is not invited to upgrade the
+launcher mid-milestone; only the operator is told.
 """
 
 import http.client
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from agent_parley import protocol, state
+from agent_parley.hook import PARTICIPANT_ENV
 
 INDEX = "https://pypi.org/pypi/agent-parley/json"
 CACHE = "update-check.json"
@@ -25,8 +30,50 @@ DISABLE = "AGENT_PARLEY_NO_UPDATE_CHECK"
 FAILURES = (OSError, ValueError, http.client.HTTPException)
 
 
-def fetch_latest(timeout: float = TIMEOUT) -> str:
-    """Reads the latest published version from the package index.
+def fetch_latest(timeout: float | None = None) -> str:
+    """Reads the latest published version, waiting at most `timeout`.
+
+    The socket timeout bounds the connection and each read, but not name
+    resolution or a body that trickles in, so the request runs in a daemon
+    thread and the caller waits for it no longer than `timeout` in total. A
+    request still running then is abandoned and reported as a timeout.
+
+    Args:
+        timeout: Seconds allowed for the whole request, `TIMEOUT` if omitted.
+
+    Returns:
+        The index's ``info.version`` value.
+
+    Raises:
+        OSError: If the index is unreachable or the request times out.
+        ValueError: If the answer is not JSON naming a version.
+        http.client.HTTPException: If the HTTP exchange breaks off.
+    """
+    limit = TIMEOUT if timeout is None else timeout
+    answers: list[str] = []
+    failures: list[Exception] = []
+
+    def ask() -> None:
+        """Runs one request, keeping its answer or its failure."""
+        try:
+            answers.append(_request(limit))
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(
+        target=ask, name="agent-parley-update-check", daemon=True
+    )
+    worker.start()
+    worker.join(limit)
+    if failures:
+        raise failures[0]
+    if not answers:
+        raise TimeoutError(f"the package index gave no answer in {limit}s")
+    return answers[0]
+
+
+def _request(timeout: float) -> str:
+    """Asks the package index for the latest version.
 
     Args:
         timeout: Seconds allowed for the connection and each read.
@@ -179,13 +226,16 @@ def notice(
 ) -> str:
     """Builds the one-line upgrade notice, or nothing.
 
+    A lane's process carries `PARTICIPANT_ENV`; it gets no notice and never
+    asks the index, so only the operator is told to upgrade.
+
     Args:
         home: The private state root holding the cache.
         installed: The running version, `protocol.launcher_version` if empty.
         now: The current time in epoch seconds, `time.time` when omitted.
         fetch: Reads the latest version, `fetch_latest` when omitted.
-        environ: The environment to read `DISABLE` from, `os.environ` if
-            omitted.
+        environ: The environment to read `DISABLE` and `PARTICIPANT_ENV`
+            from, `os.environ` if omitted.
         command: The upgrade command, `upgrade_command` when empty.
 
     Returns:
@@ -193,6 +243,8 @@ def notice(
     """
     settings = os.environ if environ is None else environ
     if settings.get(DISABLE, "").strip() not in ("", "0"):
+        return ""
+    if settings.get(PARTICIPANT_ENV, "").strip():
         return ""
     running = installed or protocol.launcher_version()
     newest = latest(home, now=now, fetch=fetch)

@@ -166,7 +166,9 @@ completion, upgrades and the supported platforms are in
 release at most once a day and, when the installed launcher is older, print
 one line on standard error with both versions and the upgrade command for your
 installer (`uv tool upgrade agent-parley`, `pipx upgrade agent-parley` or
-`pip install -U agent-parley`). An unreachable index prints nothing.
+`pip install -U agent-parley`). An unreachable index prints nothing, and the
+request gives up after two seconds. A lane agent running `status` never sees
+the line, so only you decide when to upgrade.
 `AGENT_PARLEY_NO_UPDATE_CHECK=1` turns the check off.
 
 ## Run it
