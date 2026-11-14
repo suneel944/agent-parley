@@ -70,6 +70,9 @@ def native_config_homes(tmp_path, monkeypatch, git_config):
 
     Each test starts with no recorded forge failure, so a refusal one test
     records never puts a later test's poll into the forge backoff.
+
+    The update check is off, so `doctor` and `status` never reach the
+    package index from the suite.
     """
     for variable in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "AGENT_PARLEY_HOME"):
         monkeypatch.setenv(variable, str(tmp_path / variable.lower()))
@@ -85,6 +88,7 @@ def native_config_homes(tmp_path, monkeypatch, git_config):
         )
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     monkeypatch.setenv("AGENT_PARLEY_PLUGIN_REPAIR", "off")
+    monkeypatch.setenv("AGENT_PARLEY_NO_UPDATE_CHECK", "1")
     monkeypatch.delenv("OPENCODE_DB", raising=False)
     monkeypatch.delenv("AGENT_PARLEY_TOKEN", raising=False)
     monkeypatch.delenv("FORCE_COLOR", raising=False)

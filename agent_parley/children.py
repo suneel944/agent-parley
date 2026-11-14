@@ -55,7 +55,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent_parley import roster, worktrees
+from agent_parley import protocol, roster, worktrees
 from agent_parley.state import BridgeError, lock, write_json
 
 TOOL = "spawn_child"
@@ -571,9 +571,10 @@ def brief(parent: str, branch: str, paths: list[str], task: str) -> str:
         f"You are a child lane of {parent}, on branch {branch}, cut from "
         f"{parent}'s branch. Reserve and change only: {', '.join(paths)}. "
         "Commit your work on your branch. When the task is done, file "
-        "exactly one result report and stop: `agent-parley report --state "
-        "ready --summary '<what changed>' --evidence '<checks run and their "
-        "results>'`, or `--state blocked --remaining '<what is left>'`. "
+        "exactly one result report and stop: "
+        f"`{protocol.cli_command()} report --state ready --summary '<what "
+        "changed>' --evidence '<checks run and their results>'`, or "
+        "`--state blocked --remaining '<what is left>'`. "
         f"{parent} receives only that report and merges your branch.\n\n"
         f"Task from {parent}:\n{task}"
     )
@@ -808,6 +809,15 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
     outcome, so the parent receives the real result once and is woken by
     it. The child stays retired.
 
+    A relayed result is also a verification outcome: one finding per
+    bulleted or numbered line of its summary, counted the way review
+    findings are, on the issue the parent holds, appended through
+    ``verification.record``. The remaining work is not counted, because it
+    lists what the child left undone rather than what it found, and no child
+    record marks a review or verification role that would narrow the count
+    further. An unreadable issue ledger records the outcome with no issue
+    rather than failing the relay. No transcript is read.
+
     Args:
         home: Private bridge state root.
         directory: Private project state directory.
@@ -821,7 +831,7 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
     Raises:
         BridgeError: If the store refuses the message.
     """
-    from agent_parley import store
+    from agent_parley import issues, reviews, store, verification
 
     with lock(directory / "setup.lock", timeout=LOCK_SECONDS):
         manifest = roster.read(directory)
@@ -848,6 +858,20 @@ def deliver(home: Path, directory: Path, name: str, report: dict) -> bool:
         }
         entry["retired"] = at
         write_json(directory / "project.json", manifest)
+        try:
+            held = issues.holders(issues.snapshot(directory))
+        except (OSError, ValueError):
+            held = {}
+        owned = held.get(parent["display"]) or held.get(entry["parent"])
+        verification.record(
+            directory,
+            manifest,
+            kind=verification.CHILD,
+            issue=(owned or [""])[0],
+            lane=name,
+            findings=reviews.count(str(report.get("summary") or "")),
+            now=at,
+        )
     return True
 
 

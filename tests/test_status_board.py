@@ -318,13 +318,14 @@ def test_orphaned_and_overdue_claims_name_the_resolving_command(
     lines = capsys.readouterr().out.splitlines()
     start = lines.index("Needs action:")
     at = f"--repo {shlex.quote(str(repo))}"
+    take = f"`{protocol.cli_command()} issue claim 42 --take-orphaned`"
     assert lines[start + 1] == (
         "  #42 orphaned from claude (worktree missing); a peer lane runs "
-        "agent-parley issue claim 42 --take-orphaned"
+        f"{take}"
         if peer
         else "  #42 orphaned from claude (worktree missing); no live lane can "
         f"take it: start one with agent-parley run NAME {at} and have it "
-        "run agent-parley issue claim 42 --take-orphaned, or run "
+        f"run {take}, or run "
         f"agent-parley issue release 42 {at}"
     )
     assert lines[start + 2].startswith("  #43 overdue 2m with codex; ")
