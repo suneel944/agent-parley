@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_parley import attachments, lifecycle, retries
+from agent_parley import attachments, lifecycle, protocol, retries
 from agent_parley.state import BridgeError, Transient, lock, write_json
 
 MAX_BLOCKERS = 10
@@ -1574,9 +1574,11 @@ def _change(
                             else ""
                         ),
                         next_command=(
-                            f"agent-parley issue claim {issue} --take-orphaned"
+                            f"{protocol.cli_command()} issue claim {issue} "
+                            "--take-orphaned"
                             if orphan
-                            else f"agent-parley issue request {issue}"
+                            else f"{protocol.cli_command()} issue request "
+                            f"{issue}"
                         ),
                     )
             elif taken := _released_take(directory, issue, record):
@@ -1596,10 +1598,10 @@ def _change(
                     f"{recipient} answers the offer, or the operator "
                     "withdraws it with issue assign --unassign, first.",
                     next_command=(
-                        f"agent-parley issue accept {issue} "
+                        f"{protocol.cli_command()} issue accept {issue} "
                         f"--offer-id {pending['id']}"
                         if recipient == agent
-                        else f"agent-parley issue show {issue}"
+                        else f"{protocol.cli_command()} issue show {issue}"
                     ),
                 )
             if not record or record["owner"] != agent:
@@ -2143,9 +2145,9 @@ def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
                 + (f"; {holder} owns it." if holder else "; it is unclaimed.")
                 + (f" {name} owns {held}." if held else ""),
                 next_command=(
-                    f"agent-parley issue request {number}"
+                    f"{protocol.cli_command()} issue request {number}"
                     if holder
-                    else f"agent-parley issue claim {number}"
+                    else f"{protocol.cli_command()} issue claim {number}"
                 ),
             )
     elif len(owned) > 1:
