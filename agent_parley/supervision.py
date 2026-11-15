@@ -31,6 +31,7 @@ from agent_parley import (
     denials,
     dialogs,
     flaky,
+    forecast,
     forge,
     issues,
     lanes,
@@ -9539,6 +9540,14 @@ def _poll(home: Path, directory: Path) -> None:
     stage("reboot", settle_reboot, home, directory, manifest)
     stage("launches", launches, directory, manifest, config)
     stage("readings", refresh_readings, home, manifest, 2 * config["interval"])
+    stage(
+        "merge forecast",
+        forecast.supervise,
+        home,
+        directory,
+        manifest,
+        config,
+    )
     stage("lane evidence", settle_evidence, home, directory, manifest)
     stage("sessions", rebind_sessions, home, directory, manifest)
     read_at = time.time()
