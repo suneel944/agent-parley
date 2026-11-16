@@ -24,6 +24,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `mail` | Operator mail: steering a lane, acknowledgements, the mailbox, and recorded decisions |
 | `reports` | Ready reports, their review, the event export, the state archive and ownership history |
 | `status` | The `status`, `problems` and `doctor` readings, lane liveness and the per-lane status rows |
+| `updates` | The once-a-day newer-release check `doctor` and `status` print on standard error: PyPI's `info.version` read in a daemon thread the caller waits on for at most 2 seconds in total, name resolution included, numeric release comparison, the upgrade command for the detected installer (uv tool, pipx or pip) and the `AGENT_PARLEY_NO_UPDATE_CHECK` opt-out; silent in a lane's own process (`AGENT_PARLEY_PARTICIPANT` set), so only the operator is told to upgrade; never called from a hook or the service poll |
 | `problems` | Every condition an operator should act on, derived from one status reading, each with a command to paste or the actor already handling it |
 | `launch` | Native launch of a lane: registration, the coordination protocol, the lane hooks and the supervised native client; with `run --issue`, the claim and the opening digest of that issue, its quoted text held to `ISSUE_BUDGET` (6000 bytes) from `forge.issue_details` |
 | `terminal` | The launcher-owned native pseudo-terminal, its private wake control socket, removal of wake sockets no launcher listens on, and the lane-first tab title |
@@ -48,12 +49,13 @@ when that policy records `auto`, and never on an agent's own authority.
 | `pool` | The spare worktrees a project keeps prepared from its base with `init` already run: their record and lock in the project state directory, the fill that prepares them, the hand-out to a new lane, and the condition that marks one stale for the fill or `gc` to remove |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null`, the ready-report comment posted there, and one bounded reading of the check, review and merge state of up to `MAX_PULL_REQUESTS` (30) open pull requests on GitHub, and of the issues the newest `MAX_LANDINGS` (100) pull requests merged into the recorded integration base close by keyword |
-| `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
+| `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries; the merge forecast that tests overlapping lane pairs with `git merge-tree --write-tree` and the landing order `merge plan` recommends, both reading Git objects only |
 | `critical` | Pure dependency graph of the open issues of a milestone from `Blocked by` and `Depends on` lines, forge relationships and the ledger: the issues each one transitively unblocks, the longest chain it starts, the critical path and the cycles whose edges are ignored |
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
 | `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
 | `trials` | Side-by-side trials of one issue across provider lanes: the running trial on the issue's ledger record, the one recorded exception to one owner per issue, its per-lane ready figures (diff since the recorded base, tests stated in the evidence, client-reported tokens, wall time), the comparison `trial show` prints, `trial keep` turning one lane into the ordinary owner and releasing the rest without touching a branch, and the ended-trial record `metrics trials` aggregates per provider |
+| `verification` | One outcome per returned review round and relayed child report, clean or a finding count, with the issue's cached forge labels and the verifying lane's provider and model, in `verification.jsonl`; the find rate per label and per provider and model that `metrics verification` prints and `issue next` cites; it reads no transcript and skips or adds no verification |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `observed` | The Git worktrees a lane's native client works in beside the lane, recorded from hook events on the lane's roster entry and reserved for it; never created, moved or pruned, and flagged outside `<lane>/.claude/worktrees/` |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
@@ -1049,6 +1051,7 @@ Files at the state root, grouped by the module that owns them:
 | `quota` | `quotas.json` (the quota window recorded per credential profile) under `quotas.lock` |
 | `supervision`, `terminal` | `supervision.json` (global supervision settings, including the wake opt-out) |
 | `terminal` | `wake-<digest>.sock`, one control socket per project lane |
+| `updates` | `update-check.json` (when the package index was last asked and its answer, empty after a failure) |
 
 Files in `projects/<key>/`, grouped the same way:
 
@@ -1061,6 +1064,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `followups` | `followups.json` under `followups.lock` |
 | `reviews` | `reviews.json` under `reviews.lock` |
 | `trials` | the running trial on its issue's `issues.json` record; ended trials in `trials.json`, both under `issues.lock` |
+| `verification` | `verification.jsonl`, a line log bounded by `state.trim_log`, under `verification.lock` |
 | `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
 | `quota` | `quota-ledger.json` under `quota.lock` |
@@ -1072,7 +1076,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `status` | `forge-issues.json` (forge issue cache) |
 | `blueprints` | `blueprint-runs.json` under `blueprint-runs.json.lock`; `blueprint-<issue>.lock` per running blueprint |
 | `merges`, `integration`, `unattended` | `integration.json`; `merge.lock` |
-| `forecast` | `cochanges.json` (co-change cache) |
+| `forecast` | `cochanges.json` (co-change cache), `merge-forecast.json` (merge forecast) |
 | `lanes` | `lane-evidence.jsonl`, drained through `lane-evidence.draining.jsonl`, under `lane-evidence.lock` |
 | `evidence` | `review-<head>.json`, naming its `review-<head>-events.jsonl` export by file and SHA-256, both written atomically with mode `0600`; each push keeps only the newest `REVIEW_RETAINED` (20) pairs |
 | `pool` | `spares.json` under `pool.lock`; `pool.log` |

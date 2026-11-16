@@ -16,10 +16,18 @@ below the issues nobody was pointed at.
 """
 
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 
-from agent_parley import critical, forecast, forge, issues, protocol
+from agent_parley import (
+    critical,
+    forecast,
+    forge,
+    issues,
+    protocol,
+    verification,
+)
 
 MAX_SHORTLIST = 5
 MAX_LOOKUPS = 3
@@ -499,6 +507,12 @@ def shortlist(
     comes from the same cached `forecast.history` reading the collision
     forecast uses. Nothing is claimed, offered or written.
 
+    A candidate whose cached forge labels have enough recorded review and
+    child-report outcomes gets one more reason, their find rate, read from
+    `verification.reason`, so a lane can judge whether a review round is
+    worth asking for. The outcome log is read once per shortlist, not once
+    per candidate. It changes no position and schedules nothing.
+
     The recorded plan is read through a deferred import, because the hook path
     imports this module through the store and must not pay for a TOML parser
     it never uses.
@@ -536,22 +550,36 @@ def shortlist(
         number: conflicts(found, held, commits, overlap)
         for number, found in looked.items()
     }
+    candidates = rank(
+        state,
+        plan.groups(directory),
+        risks,
+        forge.issue_providers(repo) if free else {},
+        provider,
+        limit,
+        named,
+        own,
+        sharing(state, looked, commits, repo, overlap, lane),
+        lane,
+        found,
+    )
+    outcomes = (
+        verification.outcomes(directory, time.time() - verification.WINDOW)
+        if candidates
+        else []
+    )
+    for record in candidates:
+        said = verification.reason(
+            directory,
+            verification.labels(directory, record["issue"]),
+            rows=outcomes,
+        )
+        if said:
+            record["reasons"].append(said)
     return {
         "provider": provider,
         "forge_paths": bool(looked),
-        "candidates": rank(
-            state,
-            plan.groups(directory),
-            risks,
-            forge.issue_providers(repo) if free else {},
-            provider,
-            limit,
-            named,
-            own,
-            sharing(state, looked, commits, repo, overlap, lane),
-            lane,
-            found,
-        ),
+        "candidates": candidates,
         "cycles": found["cycles"],
     }
 

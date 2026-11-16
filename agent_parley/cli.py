@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         store,
         supervision,
         terminal,
+        verification,
         views,
         worktrees,
     )
@@ -179,6 +180,7 @@ DEFERRED_MODULES = (
     "supervision",
     "tables",
     "terminal",
+    "verification",
     "views",
     "watch",
     "worktrees",
@@ -1157,6 +1159,8 @@ def lane_detail(record: dict, data: dict) -> None:
         print("    " + supervision.operator_edit_marker(edited))
     if record["base_advance_paths"]:
         print("    " + record["base_advance"])
+    if conflicts := record.get("merge_conflicts"):
+        print("    " + forecast.marker(conflicts))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
     if topics := mail.get("unread_topics"):
@@ -3492,6 +3496,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "problems",
             "doctor",
             "notify",
+            "merge",
         ),
     ),
     (
@@ -4488,6 +4493,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help="Count only trials that ended at or after this instant or window.",
     )
     compared.add_argument("--json", action="store_true", help=JSON_HELP)
+    verified = readings.add_parser(
+        "verification",
+        help=(
+            "Report the find rate of review rounds and child reports by "
+            "issue label and by provider and model."
+        ),
+    )
+    verified.add_argument(
+        "--since",
+        dest="window",
+        type=duration,
+        default=verification.WINDOW,
+        metavar="WINDOW",
+        help="Count outcomes inside this window, such as 7d; 30d by default.",
+    )
+    verified.add_argument("--json", action="store_true", help=JSON_HELP)
     spent = readings.add_parser(
         "cost",
         help=(
@@ -5554,6 +5575,18 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "with --inbound for a group chat."
         ),
     )
+    merging = commands.add_parser(
+        "merge", help="Forecast merge conflicts between lanes."
+    )
+    merge_steps = merging.add_subparsers(dest="action", required=True)
+    landing = merge_steps.add_parser(
+        "plan",
+        help="Recommend a landing order that minimises predicted conflicts.",
+    )
+    landing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    landing.add_argument("--json", action="store_true", help=JSON_HELP)
     planning = commands.add_parser(
         "plan", help="Apply, compare or show the recorded work-order plan."
     )
@@ -6887,7 +6920,25 @@ def _plain_status() -> int:
     except (BridgeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(f"agent-parley: {refusal(exc)}", file=sys.stderr)
         return 1
+    _update_notice(home)
     return 0
+
+
+def _update_notice(home: Path) -> None:
+    """Prints the newer-release notice on standard error, if there is one.
+
+    Only `doctor` and `status` call this, so no hook and no service poll
+    waits on the package index; standard error keeps ``--json`` output
+    parseable.
+
+    Args:
+        home: The private state root holding the update check cache.
+    """
+    from agent_parley import updates
+
+    line = updates.notice(home.expanduser())
+    if line:
+        print(line, file=sys.stderr)
 
 
 def _title() -> int:
@@ -7117,6 +7168,12 @@ def main() -> int:
                 print(json.dumps(reading, indent=2))
             else:
                 print(metrics.describe_trials(reading), end="")
+        elif args.command == "metrics" and args.reading == "verification":
+            outcomes = verification.reading(bridge.home, args.window)
+            if args.json:
+                print(json.dumps(outcomes, indent=2))
+            else:
+                print(verification.describe(outcomes), end="")
         elif args.command == "metrics" and args.reading == "cost":
             reading = metrics.cost(bridge.home, args.start)
             if args.json:
@@ -7540,6 +7597,7 @@ def main() -> int:
                 if args.json
                 else protocol.render(reported)
             )
+            _update_notice(bridge.home)
             return 0 if reported["consistent"] else 1
         elif args.command == "problems" and args.action == "ack":
             recorded = bridge.acknowledge(args.repo.resolve(), args.message_id)
@@ -7677,6 +7735,18 @@ def main() -> int:
                 else notification_report(probed)
             )
             return 0 if all(item["ok"] for item in probed["results"]) else 1
+        elif args.command == "merge":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            planned = forecast.project_plan(
+                directory,
+                reported_ready(directory),
+                directory / supervision.PULL_REQUEST_RECORD,
+            )
+            print(
+                views.render("merge_plan", planned)
+                if args.json
+                else forecast.render_plan(planned)
+            )
         elif args.command == "plan" and args.action == "update":
             recorded = bridge.task_plan(
                 args.repo.resolve(),
@@ -8412,6 +8482,7 @@ def main() -> int:
                         every_claim=getattr(args, "all", False),
                         every_project=every_project,
                     )
+            _update_notice(bridge.home)
             if matched and (
                 selection.drifted or selection.pending or selection.over_budget
             ):

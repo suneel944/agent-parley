@@ -31,6 +31,7 @@ import json
 import time
 from pathlib import Path
 
+from agent_parley import verification
 from agent_parley.children import REPORT_BYTES
 from agent_parley.state import BridgeError, lock, write_json
 
@@ -390,6 +391,10 @@ def returned(
 ) -> dict:
     """Records the findings a reviewer returned on its open round.
 
+    The round's outcome, clean or its finding count, is also appended to
+    the verification record for the find rate ``metrics verification``
+    reports.
+
     Args:
         directory: Private project state directory.
         ident: Round identifier.
@@ -413,6 +418,15 @@ def returned(
         entry["findings"] = count(findings)
         _tidy(record, now)
         write_json(directory / RECORD_NAME, record)
+    verification.record(
+        directory,
+        None,
+        kind=verification.REVIEW,
+        issue=str(entry.get("issue") or ""),
+        lane=reviewer,
+        findings=entry["findings"],
+        now=now,
+    )
     return entry
 
 
