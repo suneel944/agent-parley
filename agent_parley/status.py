@@ -1457,6 +1457,7 @@ class StatusMixin(BridgeCore):
 
         from agent_parley.cli import (
             convergence,
+            forecast,
             json,
             snapshot,
             store,
@@ -1483,6 +1484,7 @@ class StatusMixin(BridgeCore):
         return {
             "ledger": snapshot(directory),
             "convergence": convergence.read(directory),
+            "merge_forecast": forecast.read(directory),
             "configuration": supervision.configuration(self.home, data),
             "usage": usage,
             "diffstats": lane_diffstats(data),
@@ -1558,6 +1560,7 @@ class StatusMixin(BridgeCore):
             checkpoints,
             convergence,
             deadline_state,
+            forecast,
             handoff_fields,
             issues,
             lane_branch,
@@ -1823,6 +1826,9 @@ class StatusMixin(BridgeCore):
                 list(advanced), told
             ),
             "base_advance_told_at": views.timestamp(told),
+            "merge_conflicts": forecast.involving(
+                frame.get("merge_forecast") or {}, agent
+            ),
             "idle_seconds": idle["seconds"],
             "idle_complete": idle["complete"],
             "budget": {
