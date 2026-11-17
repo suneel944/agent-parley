@@ -11,6 +11,7 @@ from agent_parley import (
     context,
     forge,
     issues,
+    launch,
     roster,
     store,
     supervision,
@@ -282,6 +283,68 @@ def test_retire_deletes_linked_ignored_files_it_was_told_to(
     (worktree / "local.env").write_text("TOKEN=1\n")
     bridge.retire(repo, "claude", discard=["web//local.env"])
     assert not worktree.exists()
+
+
+def test_a_self_retire_removes_a_clean_linked_worktree(
+    bridge, paired, actors, sibling
+):
+    worktree = claim(bridge, paired)
+    result = store.call(bridge.home, actors["claude"], store.RETIRE, {})
+    assert result["linked"] == {"web": "pruned"}
+    assert not worktree.exists()
+    assert str(worktree) not in git(sibling, "worktree", "list")
+
+
+def test_a_self_retire_keeps_a_dirty_linked_worktree(
+    bridge, paired, actors, sibling
+):
+    worktree = claim(bridge, paired)
+    (worktree / "draft.txt").write_text("draft\n")
+    result = store.call(bridge.home, actors["claude"], store.RETIRE, {})
+    assert result["linked"] == {"web": "kept"}
+    assert "web//draft.txt" in result["dirty"]
+    assert (worktree / "draft.txt").is_file()
+
+
+def test_a_failed_link_still_records_the_worktrees_made_before_it(
+    bridge, repo, paired, actors, sibling, tmp_path
+):
+    other = tmp_path / "other repo"
+    other.mkdir()
+    git(other, "init")
+    (other / "api.txt").write_text("api\n")
+    git(other, "add", "api.txt")
+    git(other, "commit", "-m", "Other fixture")
+    bridge.link(repo, other, "wire")
+    git(other, "switch", "-c", participant(paired)["branch"])
+    with pytest.raises(BridgeError, match="already"):
+        bridge.issue(lane(paired), "claim", "1", links=["web", "wire"])
+    recorded = participant(paired)["linked"]
+    assert set(recorded) == {"web"}
+    assert recorded["web"]["lane"] in git(sibling, "worktree", "list")
+
+
+def test_a_launch_names_each_linked_worktree(bridge, paired, actors):
+    assert launch.linked_directories(participant(paired)) == []
+    worktree = claim(bridge, paired)
+    assert launch.linked_directories(participant(paired)) == [
+        "--add-dir",
+        str(worktree),
+    ]
+
+
+def test_a_new_linked_branch_starts_at_the_default_branch(
+    bridge, paired, actors, sibling
+):
+    default = git(sibling, "rev-parse", "HEAD")
+    git(sibling, "switch", "-c", "feature")
+    (sibling / "feature.txt").write_text("unrelated\n")
+    git(sibling, "add", "feature.txt")
+    git(sibling, "commit", "-m", "Unrelated feature")
+    worktree = claim(bridge, paired)
+    assert git(worktree, "rev-parse", "HEAD") == default
+    assert not (worktree / "feature.txt").exists()
+    assert participant(paired)["linked"]["web"]["base"] == default
 
 
 def test_a_later_claim_moves_each_linked_base(

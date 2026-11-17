@@ -18,8 +18,10 @@ from agent_parley import (
     budgets,
     collisions,
     decisions,
+    forecast,
     lanes,
     metrics,
+    observed,
     plan,
     process,
     protocol,
@@ -56,6 +58,8 @@ from agent_parley.status import (
     bucket_cell,
     bucket_of,
     bucket_order,
+    contention_lines,
+    contention_reading,
     lane_bucket,
     plan_cell,
     plan_reading,
@@ -613,6 +617,9 @@ def _row(
         "base_advance_paths": advanced,
         "base_advance": supervision.base_advance_marker(advanced, told),
         "base_advance_told_at": told,
+        "merge_conflict": forecast.marker(
+            forecast.involving(context.get("merge_forecast") or {}, agent)
+        ),
         "event_age": (
             tables.age(time.time() - events["last_ts"])
             if events["last_ts"]
@@ -621,6 +628,7 @@ def _row(
         "last_event_ts": events["last_ts"],
         "branch": branch,
         "drift": branch != participant["branch"],
+        "worktrees": observed.of(data, agent),
         "review": str(review.get("verdict", "")),
         "reviewer": str(review.get("reviewer", "")),
         "reviewed_report": str(review.get("report_id", "")),
@@ -648,6 +656,12 @@ def _row(
         "stale_lease_age": stats.get("stale_lease_age", 0),
         "queued": stats.get("queued", 0),
         "queued_by": list(stats.get("queued_by", [])),
+        "contention": contention_reading(
+            stats.get("contention", []),
+            data,
+            context["issues"]["issues"],
+            participant["display"],
+        ),
         "injected_bytes": events["injected_bytes"],
         "injected_per_hour": hourly_rate(state),
         "hook_events": events["events"],
@@ -911,6 +925,7 @@ def collect(
             "inactive_after": supervised["inactive_after"],
             "operator_edits": edits if operator_edits else {},
             "base_advances": advances,
+            "merge_forecast": forecast.read(path.parent),
             "context_full_percent": supervised["context_full_percent"],
             "diffstats": (
                 _cached(
@@ -1092,10 +1107,13 @@ def notes(row: dict) -> list[str]:
 
     Returns:
         The branch drift, rejected call, stall, operator edit, base
-        advance, orphan, budget, stale plugin, fitness, work offer, failed
+        advance, predicted merge conflict, orphan, budget, stale plugin,
+        fitness, work offer, failed
         review,
-        escalated dispatch and blueprint run markers the lane holds, in
-        that order. The note
+        escalated dispatch and blueprint run markers the lane holds, then
+        one line per open observed worktree with its path, branch, base
+        and a flag marker when it lies outside the CLI's worktree
+        directory, in that order. The note
         row already names the lane, so a fitness reason drops its own copy
         of the name. Drift, rejected calls, offers and failed reviews are
         noted because their columns can be dropped or left out of the
@@ -1113,6 +1131,7 @@ def notes(row: dict) -> list[str]:
         row["stall"],
         row["operator_edit"],
         row.get("base_advance", ""),
+        row.get("merge_conflict", ""),
         row.get("orphan", ""),
         row.get("budget_marker", ""),
         f"plugin {row['plugin_version']} stale; agent-parley run "
@@ -1130,6 +1149,14 @@ def notes(row: dict) -> list[str]:
     if row["work_dispatch"].get("state") == "escalated":
         found.append(row["work_dispatch"]["last_result"])
     found.append(row.get("blueprint", ""))
+    found.extend(contention_lines([row]))
+    found.extend(
+        f"worktree {tree['path']} on {tree['branch'] or 'no branch'} "
+        f"(base {tree['base']})"
+        + (", flagged: outside .claude/worktrees" if tree["flagged"] else "")
+        for tree in row.get("worktrees", [])
+        if not tree.get("closed")
+    )
     found.append(recap_note(row))
     return [str(note) for note in found if note]
 

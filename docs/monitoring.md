@@ -743,6 +743,83 @@ one `Pull requests` summary to its issues line and `status` one line per
 project over the last 7 days, each only when the window holds any, and `top --json` carries each lane's figures
 under `pull_requests`.
 
+### Verification find rate
+
+```bash
+agent-parley metrics verification
+agent-parley metrics verification --since 7d --json
+```
+
+Every review round whose findings come back and every child result relayed
+to its parent records one outcome in the project's `verification.jsonl`:
+clean, or findings with a count. The count is the one already taken from the
+capped report text, one finding per bulleted or numbered line; for a child it
+covers the report's summary only, because its remaining work lists what the
+child left undone rather than what it found. No transcript is read. Each
+outcome carries the issue's labels, copied from the cached forge reading when
+it is recorded, and the provider and model of the lane that verified: the
+reviewer of a round, or the child.
+
+`metrics verification` reads every project's outcomes over the window, 30 days
+by default, and prints two tables: one row per issue label, with `unlabelled`
+for issues that had none, and one row per `provider/model`, with `default` for
+a lane on its provider's default model. Each row counts the outcomes, those
+that found anything, and their findings. The find rate, the share of outcomes
+that found anything, is printed only for a group with at least five outcomes;
+smaller groups show `-`, and `--json` carries `null`. An empty store prints two
+lines: the header with a count of 0, then `No review round or child report
+recorded.`
+
+`issue next` adds one reason to a candidate whose labels reach five outcomes
+in its project over the last 30 days, such as `verification find rate bug 40%
+of 10`, so a lane can judge whether a review round is worth asking for. The
+reason moves no candidate, and the coordinator never skips or adds a review
+or a child report because of it.
+
+## Suspected flaky tests
+
+The supervision poll keeps the test failures and passes lanes record, and
+names a test suspected flaky only from those recorded occurrences. Two
+sources feed it:
+
+- report evidence (`agent-parley report --evidence ...`) recorded `clean`:
+  the worktree had no tracked change and no untracked file outside the
+  ignore rules, so the run tested exactly the reported commit; read from
+  the lane's report log;
+- a lane's pull request on the forge: the failed-step logs the poll already
+  quotes to the lane when checks fail, and checks that finish green, both
+  for the head commit the same reading names. Review bodies and inline
+  comments quoted beside the logs are never read.
+
+Test identifiers are pytest node ids (`tests/test_core.py::test_value`) read
+from `FAILED <id>`, `<id> FAILED`, the same forms with `ERROR`, and
+`PASSED <id>` or `<id> PASSED`. Report evidence passes only the tests it
+names as passed, since a report cannot show whether it ran the whole suite;
+a green forge run passes every test already tracked on that commit's tree.
+
+A test is suspected flaky when it:
+
+- failed and passed on the same Git tree, or
+- failed in two lanes forked from the same base commit whose diffs, each
+  against that fork from the base checkout's head, change neither the test
+  file nor a module it imports.
+
+A failure in a lane whose diff changes the test or one of its imports never
+counts towards two lanes, so a regression the change caused is not marked.
+Requiring one fork point means the two lanes ran the same base code: a
+regression merged into the base between their forks gives them different
+fork points and is not counted. A test the shared base itself breaks is
+still marked, which only labels it.
+Each lane that is not retired gets one update per suspicion, naming the test
+and up to six occurrences, and one `test:` issue is suggested to the
+operator, who sees it in `agent-parley followup list` and accepts it with
+`agent-parley followup accept`. The lanes file nothing, and no test is
+skipped or disabled: the flag is a label with evidence. More occurrences of
+a suspected test send nothing more. A later failure on a tree whose diff
+changes the test or its imports clears the suspicion; the test is suspected
+again only on new evidence, and then each lane is told again. The record is
+`flaky.json` in the project's state directory.
+
 ## Usage per issue
 
 A claim records what its lane had consumed when it began and again when it
@@ -779,6 +856,11 @@ token count gains an `estimated_spend` and the totals gain a sum. The text
 output labels the total as an estimate from recorded prices, not a bill. A lane
 cannot set or change a price: the command refuses a lane worktree and any
 process holding a lane's `AGENT_PARLEY_TOKEN`.
+
+Per-model rates for input, output and cache-read tokens are set with
+`provider price NAME --model MODEL --input A --output B --cache-read C` and
+feed `metrics cost` ([Operations](operations.md#estimated-cost-per-shipped-unit)).
+Removing the blended price leaves those rows in place.
 
 ## `watch`
 

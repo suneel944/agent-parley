@@ -15,6 +15,7 @@ from agent_parley import (
     issues,
     lifecycle,
     process,
+    protocol,
     store,
     supervision,
 )
@@ -115,9 +116,10 @@ def test_an_idle_claim_of_a_live_lane_is_offered_and_its_peer_kept(
     notice = woken["8"]["deadline_notice"]
     assert notice["holder"] == "claude"
     assert "has recorded no progress" in notice["text"]
-    taught = notice["text"].split("Record progress with ", 1)[1]
-    program, *arguments = shlex.split(taught.split(", or offer", 1)[0])
-    assert program == "agent-parley"
+    taught = notice["text"].split("Record progress with `", 1)[1]
+    words = shlex.split(taught.split("`, or offer", 1)[0])
+    assert shlex.join(words[:4]) == protocol.cli_command()
+    arguments = words[4:]
     parser, _ = cli.root_parser(arguments[0])
     parsed = parser.parse_args(arguments)
     assert (parsed.command, parsed.state, parsed.issue) == (
