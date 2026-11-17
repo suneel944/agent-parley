@@ -28,6 +28,7 @@ ISSUE_COMMENT_BYTES = 600
 QUOTE_START = "----- begin quoted issue text (untrusted) -----"
 QUOTE_END = "----- end quoted issue text -----"
 ROTATION_REPORT_BYTES = 1500
+LANES_CLAIM_ENV = "AGENT_PARLEY_LANES_CLAIM"
 
 
 def _clipped(text: str, limit: int) -> tuple[str, bool]:
@@ -731,6 +732,120 @@ reported.
         )
         return status
 
+    def provider_gate(
+        self, agent: str, entry: dict, account: dict[str, str]
+    ) -> tuple[str, bool]:
+        """Checks the plugin and hooks a lane's provider launches with.
+
+        The manifest read is the plugin installed in the account's
+        configuration home when the adapter loads one from there, else the
+        bundled one. A manifest whose protocol the launcher does not speak
+        refuses, and an installed one older than the launcher prints one
+        line on standard error. A required hook the adapter cannot deliver
+        refuses, unless the adapter delivers by polling and none of the
+        missing hooks are ones polling needs, which prints the degraded
+        warning instead. These refusals hold for every lane of the provider,
+        so `run --lanes` checks them before it claims.
+
+        Args:
+            agent: Participant name, named in the degraded warning.
+            entry: Provider definition of the lane.
+            account: Environment overrides of the lane's credential.
+
+        Returns:
+            The version the manifest declares, empty when none was read, and
+            whether the lane runs with degraded polled delivery.
+
+        Raises:
+            BridgeError: If the manifest's protocol mismatches the launcher
+                or the adapter cannot deliver a required hook.
+        """
+        from agent_parley import plugins, protocol, records, roster
+
+        loaded = None
+        if entry["adapter"] in plugins.HOME_ENV:
+            selected = account.get(entry.get("home_env", ""))
+            loaded = plugins.installed_manifest(
+                entry["adapter"],
+                Path(selected)
+                if selected
+                else Path(records.DEFAULT_HOMES[entry["adapter"]]).expanduser(),
+            )
+        manifest = loaded or protocol.manifests(protocol.plugin_root()).get(
+            entry["adapter"]
+        )
+        plugin_version = ""
+        if manifest is not None and manifest.exists():
+            reading = plugins.assessed(manifest)
+            plugin_version = str(reading["version"] or "")
+            if reading["state"] == protocol.MISMATCH:
+                raise BridgeError(
+                    protocol.mismatch("installed plugin", reading["protocol"]),
+                    next_command="agent-parley plugins install",
+                )
+            if loaded and reading["state"] == protocol.STALE:
+                print(
+                    f"The {entry['adapter']} plugin this lane loads is "
+                    f"{reading['version'] or 'of unknown version'}, the "
+                    f"launcher is {protocol.launcher_version()}. "
+                    f"{protocol.UPDATE}",
+                    file=sys.stderr,
+                )
+        missing = [
+            event
+            for event in roster.REQUIRED_HOOKS
+            if event in roster.unavailable_hooks(entry["adapter"])
+        ]
+        degraded = (
+            roster.delivery_path(entry["adapter"]) == roster.POLLED_DELIVERY
+            and bool(missing)
+            and not set(missing) & set(roster.POLLED_REQUIRED_HOOKS)
+        )
+        if degraded:
+            print(
+                roster.DEGRADED_WARNING.format(
+                    name=agent,
+                    adapter=entry["adapter"],
+                    missing=", ".join(missing),
+                ),
+                file=sys.stderr,
+            )
+        elif missing:
+            raise BridgeError(
+                f"The {entry['adapter']!r} adapter cannot deliver "
+                f"{', '.join(missing)}, so its lanes would run without the "
+                "coordination guards those events carry; launch refused "
+                "rather than claiming enforcement it cannot provide."
+            )
+        return plugin_version, degraded
+
+    def lanes_refusal(self, exc: BridgeError, lane: str, number: str) -> None:
+        """Releases the claim `run --lanes` took for a window refused early.
+
+        `run --lanes` names the issue it claimed for a window in
+        `LANES_CLAIM_ENV`. When a gate checked before the session starts
+        refuses that window's `run --issue N`, nothing else would release
+        the claim once the window closes, so it is released here and what
+        happened to it is appended to the refusal's message, keeping its
+        ``next_command``. A run without that variable, or naming another
+        issue, releases nothing.
+
+        Args:
+            exc: The refusal, which the caller raises afterwards.
+            lane: The lane's worktree as recorded before the launch, or
+                empty when it was not registered.
+            number: The issue the run was asked to claim, or empty.
+        """
+        if not (number and lane and os.environ.get(LANES_CLAIM_ENV) == number):
+            return
+        try:
+            self.issue(Path(lane), "release", number)
+        except BridgeError as failure:
+            outcome = f"The release of #{number} failed: {failure}"
+        else:
+            outcome = f"Released #{number}, claimed for this window."
+        exc.args = (f"{exc} {outcome}", *exc.args[1:])
+
     def launch(
         self,
         agent: str,
@@ -831,6 +946,12 @@ reported.
         thresholds are supervision settings. An unreadable reading is not
         judged, and on Windows the check is skipped with one line saying so.
 
+        A refusal raised before the session lock is taken, from the budget,
+        load and `provider_gate` checks or the lane's registration, releases
+        ``issue`` when `LANES_CLAIM_ENV` names it, because `run --lanes`
+        claimed it for this window and nothing else would release it once
+        the window closes; see `lanes_refusal`.
+
         Args:
             agent: Participant name within the project.
             repo: Target Git repository.
@@ -862,7 +983,6 @@ reported.
                 is unknown, or a ``copilot`` lane's profile already runs
                 another live lane's hooks.
         """
-        from agent_parley import plugins, records
         from agent_parley.cli import (
             COPILOT_EVENTS,
             LAUNCH_LOCK_SECONDS,
@@ -902,112 +1022,63 @@ reported.
             if (directory / "project.json").exists()
             else {}
         )
-        stopped = budgets.halted(directory, recorded) if recorded else None
-        if stopped:
-            raise BridgeError(
-                f"The run budget is exhausted ({stopped['cause']}), so no "
-                f"lane is launched or resumed; {budgets.RESUME}.",
-                next_command="agent-parley budget resume",
-            )
-        host = process.host_load()
-        if host.skipped:
-            print(host.skipped, file=sys.stderr)
-        limits = supervision.configuration(self.home, recorded)
-        if pressure := process.overloaded(
-            host, limits["max_load_ratio"], limits["min_available_mib"]
-        ):
-            raise BridgeError(
-                f"The host is past its launch threshold ({pressure}), so no "
-                "lane is launched or resumed; change that setting under "
-                "supervision in the project manifest or supervision.json, "
-                "or launch again once the host has headroom.",
-                next_command="agent-parley doctor",
-            )
         registered = (recorded or {}).get("participants", {}).get(agent, {})
-        known = roster.providers(self.home).get(
-            provider or registered.get("provider") or agent
-        )
-        if known is not None:
-            native_executable(known["command"], agent, provider, credential)
-        data = self.add_participant(repo, agent, provider, credential)
-        if gap := supervision.opt_in_adapter(self.home, data, agent):
-            print(
-                supervision.OPT_IN_WARNING.format(
-                    name=agent,
-                    adapter=gap,
-                    remedy=supervision.opt_in_remedy(gap),
-                ),
-                file=sys.stderr,
-            )
-        if number:
-            from agent_parley import blueprints
-
-            blueprint = blueprints.chosen(
-                cast("Bridge", self), repo, number, blueprint
-            )
-        participant = data["participants"][agent]
-        entry = roster.provider(self.home, participant["provider"])
-        account = roster.launch_environment(
-            self.home, entry, participant["credential"]
-        )
-        executable = native_executable(
-            entry["command"], agent, provider, credential
-        )
-        loaded = None
-        if entry["adapter"] in plugins.HOME_ENV:
-            selected = account.get(entry.get("home_env", ""))
-            loaded = plugins.installed_manifest(
-                entry["adapter"],
-                Path(selected)
-                if selected
-                else Path(records.DEFAULT_HOMES[entry["adapter"]]).expanduser(),
-            )
-        manifest = loaded or protocol.manifests(protocol.plugin_root()).get(
-            entry["adapter"]
-        )
-        plugin_version = ""
-        if manifest is not None and manifest.exists():
-            reading = plugins.assessed(manifest)
-            plugin_version = str(reading["version"] or "")
-            if reading["state"] == protocol.MISMATCH:
+        try:
+            stopped = budgets.halted(directory, recorded) if recorded else None
+            if stopped:
                 raise BridgeError(
-                    protocol.mismatch("installed plugin", reading["protocol"]),
-                    next_command="agent-parley plugins install",
+                    f"The run budget is exhausted ({stopped['cause']}), so "
+                    f"no lane is launched or resumed; {budgets.RESUME}.",
+                    next_command="agent-parley budget resume",
                 )
-            if loaded and reading["state"] == protocol.STALE:
+            host = process.host_load()
+            if host.skipped:
+                print(host.skipped, file=sys.stderr)
+            limits = supervision.configuration(self.home, recorded)
+            if pressure := process.overloaded(
+                host, limits["max_load_ratio"], limits["min_available_mib"]
+            ):
+                raise BridgeError(
+                    f"The host is past its launch threshold ({pressure}), so "
+                    "no lane is launched or resumed; change that setting "
+                    "under supervision in the project manifest or "
+                    "supervision.json, or launch again once the host has "
+                    "headroom.",
+                    next_command="agent-parley doctor",
+                )
+            known = roster.providers(self.home).get(
+                provider or registered.get("provider") or agent
+            )
+            if known is not None:
+                native_executable(known["command"], agent, provider, credential)
+            data = self.add_participant(repo, agent, provider, credential)
+            if gap := supervision.opt_in_adapter(self.home, data, agent):
                 print(
-                    f"The {entry['adapter']} plugin this lane loads is "
-                    f"{reading['version'] or 'of unknown version'}, the "
-                    f"launcher is {protocol.launcher_version()}. "
-                    f"{protocol.UPDATE}",
+                    supervision.OPT_IN_WARNING.format(
+                        name=agent,
+                        adapter=gap,
+                        remedy=supervision.opt_in_remedy(gap),
+                    ),
                     file=sys.stderr,
                 )
-        missing = [
-            event
-            for event in roster.REQUIRED_HOOKS
-            if event in roster.unavailable_hooks(entry["adapter"])
-        ]
-        degraded = (
-            roster.delivery_path(entry["adapter"]) == roster.POLLED_DELIVERY
-            and bool(missing)
-            and not set(missing) & set(roster.POLLED_REQUIRED_HOOKS)
-        )
-        if degraded:
-            print(
-                roster.DEGRADED_WARNING.format(
-                    name=agent,
-                    adapter=entry["adapter"],
-                    missing=", ".join(missing),
-                ),
-                file=sys.stderr,
+            if number:
+                from agent_parley import blueprints
+
+                blueprint = blueprints.chosen(
+                    cast("Bridge", self), repo, number, blueprint
+                )
+            participant = data["participants"][agent]
+            entry = roster.provider(self.home, participant["provider"])
+            account = roster.launch_environment(
+                self.home, entry, participant["credential"]
             )
-        elif missing:
-            raise BridgeError(
-                f"The {entry['adapter']!r} adapter cannot deliver "
-                f"{', '.join(missing)}, so its lanes would run without the "
-                "coordination guards those events carry; launch refused "
-                "rather than claiming enforcement it cannot provide."
+            executable = native_executable(
+                entry["command"], agent, provider, credential
             )
+            plugin_version, degraded = self.provider_gate(agent, entry, account)
+        except BridgeError as exc:
+            self.lanes_refusal(exc, registered.get("lane", ""), number)
+            raise
         import asyncio
 
         from agent_parley.merges import launch_busy
