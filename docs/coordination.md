@@ -406,7 +406,19 @@ cloned or initialized on a case-insensitive file system, such as default macOS).
 Then `README.md` and `readme.md` overlap, `src/` covers `SRC/x.py`, and a write
 through a lane path spelled in another case is still checked against
 reservations; named resources stay exact. A manifest written before the field
-existed keeps exact comparison. A granted reservation
+existed keeps exact comparison.
+
+A key can also name one Python function or class as `PATH::NAME`, such as
+`src/store.py::Store.claim`, so two lanes can work in one file. A path
+reservation covers every symbol in its file, a class covers its methods, and
+two different symbols in one file do not conflict. The edit hook parses the
+file before and after an `Edit`, `MultiEdit` or `Write` with the standard
+library `ast` module and compares the definitions the change touches; a change
+at module level touches the whole file. A file that does not parse is compared
+by path, and a parse failure never refuses the edit. Other languages use path
+reservations.
+
+A granted reservation
 also carries a `forecast`: the files that changed together with a reserved path
 in at least three of the base checkout's last 500 commits and that a peer holds
 right now, each with the peer and the count, so the lane can renegotiate or

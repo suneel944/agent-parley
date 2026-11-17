@@ -481,6 +481,42 @@ minutes between polls, a stopped service, is charged to nothing. `status
 time a lane's total crosses a whole minute an `accounting` event is added to
 its lane history.
 
+## Converging lanes
+
+Two live lanes can drift onto the same work without either holding a
+conflicting reservation. Each supervision poll flags a pair that uses one
+branch name, names one new file in both task plans, or reserves path sets
+that share at least three keys (`collisions.MIN_SHARED_PATHS`) which are also
+at least half of the smaller set. `status`, `top` and the web view print one
+line per pair:
+
+```text
+Converging: lane-1 and lane-2 share branch feat/login; one of them should rename or re-plan. Nothing was refused.
+```
+
+The flag is a reading and refuses nothing. The poll mails each lane of a new
+pair once, under a keyed message, and keeps the pairs it told in
+`collisions.json`, so a pair that stays converged is not mailed again.
+`status --json` carries each lane's peers under `converging`.
+
+## Polling without progress
+
+A lane that calls `status`, `issue next`, `mail`, `next_issues` or
+`fetch_inbox` in a loop looks busy while it moves no work. Each supervision
+poll counts a lane's coordination reads from the store's `events` table over
+the last 300 seconds (`polling.WINDOW`). A lane at 30 reads or more
+(`polling.THRESHOLD`) with no claim, report, reservation, message, handoff or
+commit in that window is marked polling in `status` and `top`, and receives
+one message naming the pattern. If it makes 30 more reads in the window after
+that message, it is parked like a usage-limit park: wakes, Stop-hook
+continuations and work offers wait, and a running turn is never stopped.
+
+The flag and the park end at the lane's first progress, or at the first
+message the operator sends the lane after the notice. A flag that never became
+a park also ends once the lane's reads fall under the threshold. A lane
+blocked in `wait_for_message` is waiting, not polling, so that call never
+counts.
+
 ## Stagnation: more mail than progress
 
 Lanes that talk instead of working keep sending mail while their commits stop.
