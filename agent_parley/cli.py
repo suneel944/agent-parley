@@ -956,6 +956,106 @@ def decision_lines(page: dict) -> list[str]:
     return lines
 
 
+def waiting_decisions(directory: Path) -> list[dict]:
+    """Reads the decisions one project holds open for the operator.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        One row per open decision, oldest first, with its identifier, lane,
+        kind, question, offered options, the options that take a
+        confirmation, and when it opened.
+    """
+    from agent_parley import decisions
+
+    return [
+        {
+            "id": record["id"],
+            "lane": record.get("lane") or "",
+            "kind": record.get("kind") or "",
+            "question": record.get("question") or "",
+            "options": decisions.options(record),
+            "confirm": [
+                option
+                for option in decisions.options(record)
+                if decisions.confirming(record, option)
+            ],
+            "created_at": views.timestamp(record.get("created")),
+        }
+        for record in decisions.list_open(directory)
+    ]
+
+
+def waiting_lines(rows: Sequence[dict]) -> list[str]:
+    """Formats the open decisions as an operator answers them.
+
+    Args:
+        rows: Open decisions as `waiting_decisions` reports them.
+
+    Returns:
+        A heading line and an options line per decision, or one sentence
+        saying none is open.
+    """
+    if not rows:
+        return ["No decision is waiting on the operator."]
+    lines = []
+    for row in rows:
+        lines.append(
+            f"Decision {row['id']}  {row['lane'] or '-'}  {row['question']}"
+        )
+        offered = ", ".join(
+            f"{option} (needs --yes)" if option in row["confirm"] else option
+            for option in row["options"]
+        )
+        lines.append(f"  options: {offered}")
+    lines.append("Answer one with: agent-parley decision answer ID OPTION")
+    return lines
+
+
+def answered_decision(home: Path, args: argparse.Namespace) -> str:
+    """Answers one open decision from the command line.
+
+    The answer takes the chat's own path, so it is refused, confirmed,
+    recorded and handed to the waiting lane exactly as a typed chat answer
+    is, with ``cli`` as the one who answered.
+
+    Args:
+        home: Private bridge state root.
+        args: Parsed `decision answer` arguments.
+
+    Returns:
+        The line or JSON document reporting the answer.
+
+    Raises:
+        BridgeError: If the decision is unknown, no longer open or does not
+            offer the option, or the option takes a confirmation that
+            ``--yes`` did not give.
+    """
+    outcome, record = inbound.decide(
+        home, args.id, args.option, "cli", " ".join(args.note), args.yes
+    )
+    if outcome == inbound.CONFIRMING:
+        raise BridgeError(
+            f"Decision {args.id} option {args.option!r} takes a "
+            "confirmation; nothing was answered. Rerun with --yes to "
+            "answer it."
+        )
+    if args.json:
+        return views.render(
+            "decision_answer",
+            {
+                "id": record["id"],
+                "lane": record.get("lane") or "",
+                "answer": record["answer"],
+                "answered_by": record["answered_by"],
+                "note": record.get("note") or "",
+            },
+        )
+    lane = record.get("lane") or "no lane"
+    return f"Decision {record['id']} for {lane} answered {record['answer']}."
+
+
 def reported_lanes(report: dict) -> int:
     """Counts the lanes a narrowed status reading still holds."""
     return sum(len(project["participants"]) for project in report["projects"])
@@ -5814,7 +5914,8 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     decision = commands.add_parser(
         "decision",
         help=(
-            "Read the decisions recorded for this project; `decide` records "
+            "Read the decisions recorded for this project, or list and "
+            "answer the ones waiting on the operator; `decide` records "
             "a new one."
         ),
     )
@@ -5848,6 +5949,38 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     decision_list.add_argument("--json", action="store_true", help=JSON_HELP)
+    decision_open = decision_actions.add_parser(
+        "open",
+        help=(
+            "List the decisions waiting on the operator in this project, "
+            "with the ID and options `decision answer` takes."
+        ),
+    )
+    decision_open.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    decision_open.add_argument("--json", action="store_true", help=JSON_HELP)
+    decision_answer = decision_actions.add_parser(
+        "answer",
+        help=(
+            "Answer one open decision as a chat answer would; the lane "
+            "waiting on it is told."
+        ),
+    )
+    decision_answer.add_argument("id", help="Decision ID, as `open` lists.")
+    decision_answer.add_argument("option", help="One option it offers.")
+    decision_answer.add_argument(
+        "note",
+        nargs="*",
+        default=[],
+        help="Note the lane receives quoted, never as an instruction.",
+    )
+    decision_answer.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm an option that takes a confirmation.",
+    )
+    decision_answer.add_argument("--json", action="store_true", help=JSON_HELP)
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
@@ -7939,6 +8072,16 @@ def main() -> int:
                 views.render("decide", recorded)
                 if args.json
                 else f"Recorded decision {recorded['id']}."
+            )
+        elif args.command == "decision" and args.action == "answer":
+            print(answered_decision(bridge.home, args))
+        elif args.command == "decision" and args.action == "open":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            waiting = waiting_decisions(directory)
+            print(
+                views.render("decision_open", {"decisions": waiting})
+                if args.json
+                else "\n".join(waiting_lines(waiting))
             )
         elif args.command == "decision":
             decisions = bridge.decisions(

@@ -197,6 +197,8 @@ on standard output and export to a file.
 | `mail send NAME TEXT` | Compatibility alias of `say`, the canonical spelling, kept under `mail` with the other mail verbs; every `say` flag applies. |
 | `decide TEXT` | Record one decision every registered lane can read; `--subject` names it and `--key` deduplicates it. |
 | `decision list [QUERY]` | List or search the decisions recorded for this project; `--since` bounds their age and `--limit` the page. |
+| `decision open` | List the decisions waiting on the operator in this project — ID, lane, question and options, with `(needs --yes)` on an option that takes a confirmation — so an operator without a chat channel finds the ID to answer. |
+| `decision answer ID OPTION [NOTE ...]` | Answer one open decision exactly as a chat answer does, recorded as answered by `cli`; the waiting lane gets it as supervisor mail, the note quoted. An option that takes a confirmation is refused, with nothing recorded, until it is rerun with `--yes`. An unknown, closed or already answered decision, or an option it does not offer, is refused and exits 1. |
 | `mail pending` | List operator messages and offers recorded but not delivered, and each orphan decision waiting on the operator. |
 | `mail cancel ID` | Remove one recorded operator item before it is delivered. |
 | `history issue N` | List every record that touched an issue, with each holding and the tokens, calls and hours a resolved claim used. |
@@ -219,7 +221,8 @@ document, so a script, a shell prompt or another agent reads coordination state
 without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
 `issue list`, `issue show`, `issue next`, `issue match`, `participant list`,
 `participant show`, `mail show`, `mail thread`, `mail search`, `mail list`,
-`mail pending`, `decision list`, `report show`, `report usage`,
+`mail pending`, `decision list`, `decision open`, `report show`,
+`report usage`,
 `history issue`,
 `history participant`, `history claim`, `plan diff`, `plan show`,
 `plan proposals`,
@@ -228,7 +231,8 @@ without parsing a table: `status`, `top`, `version`, `doctor`, `problems`,
 `provider list`, `provider show`, `credentials list`, `credentials show` and
 `projects`.
 The commands that change something print their outcome the same way with
-`--json`: `up`, `down`, `setup`, `run`, `say`, `decide`, `mail send`,
+`--json`: `up`, `down`, `setup`, `run`, `say`, `decide`,
+`decision answer`, `mail send`,
 `mail cancel`, `approve`, `reject`, `report review`, `problems ack`,
 `plan propose`, `plan approve`, `plan reject`, `issue resolve`,
 `issue recover`, `provider add`, `credentials add`,
