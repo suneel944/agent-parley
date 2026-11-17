@@ -58,7 +58,15 @@ import tempfile
 import time
 from pathlib import Path, PurePosixPath
 
-from agent_parley import forge, issues, pool, process, retirement, store
+from agent_parley import (
+    forge,
+    issues,
+    pool,
+    process,
+    retirement,
+    store,
+    trials,
+)
 from agent_parley.lanes import extras
 from agent_parley.state import BridgeError, LockBusy, lock
 
@@ -575,7 +583,11 @@ def plan(
                 manifest,
                 name,
                 registered=registered,
-                claimed=bool(owned.get(name)),
+                claimed=bool(owned.get(name))
+                or any(
+                    trials.member(record, name)
+                    for record in ledger["issues"].values()
+                ),
                 busy=_busy(directory, name),
                 held=held,
                 quiet=_quiet(directory, name, Path(participant["lane"]), after),

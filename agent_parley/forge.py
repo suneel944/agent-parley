@@ -1930,6 +1930,48 @@ def active_milestone(repo: Path) -> str | None:
     return str(ranked[0]["title"]) if ranked else None
 
 
+def milestone_issues(repo: Path, title: str) -> set[str] | None:
+    """Lists the open GitHub issues filed under one milestone.
+
+    Args:
+        repo: Repository or assigned worktree that selects the forge project.
+        title: Milestone title.
+
+    Returns:
+        The bare issue numbers, or None for any other forge, an unreachable
+        project or a failed read; `last_failure` then says why.
+    """
+    if _implementation(repo) != "github":
+        return None
+    project = _reachable(repo)
+    if project is None:
+        return None
+    output = _run(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--repo",
+            project,
+            "--milestone",
+            title,
+            "--state",
+            "open",
+            "--limit",
+            "500",
+            "--json",
+            "number",
+        ],
+        20,
+    )
+    if output is None:
+        return None
+    try:
+        return {str(int(item["number"])) for item in json.loads(output)}
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 def file_issue(
     repo: Path, title: str, body: str, milestone: str = ""
 ) -> str | None:

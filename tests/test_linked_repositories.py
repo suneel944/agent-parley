@@ -123,6 +123,20 @@ def test_reservations_are_per_repository(bridge, paired, actors):
     assert not reserve(bridge, actors["codex"], "*.md")
 
 
+def test_a_symbol_key_in_a_linked_repository_keeps_both_parts():
+    keys = store._keys({"paths": ["web//./src/app.py::App.run"]}, None)[0]
+    assert keys == ["web//src/app.py::App.run"]
+    assert store.repository(keys[0]) == "web"
+    assert store.overlapping(keys[0], "web//src/app.py::App")
+    assert not store.overlapping(keys[0], "web//src/app.py::Other")
+    assert not store.overlapping(keys[0], "src/app.py::App.run")
+    assert store.overlapping_paths(["web//src/app.py"], keys) == {
+        "web//src/app.py"
+    }
+    with pytest.raises(BridgeError, match="names no Python symbol"):
+        store._keys({"paths": ["web//src/app.py::1bad"]}, None)
+
+
 def test_hooks_guard_the_branch_in_each_worktree(bridge, paired, actors):
     worktree = claim(bridge, paired)
     directory = lane(paired).parent
