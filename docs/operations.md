@@ -688,6 +688,7 @@ condition, that count, its age and what clears it:
 | `reservation contention` | Two lanes were refused by each other, alternating, four times on one path inside 30 minutes of the first; one lane retrying against an idle holder does not count, and a refusal blocked by several leases of one holder counts once. Each lane was told once to finish or stash its edit on that path and wait. One row per pair and path names both claims, and the lanes sit in the needs-input group of `status` and `top`; `issue show` prints it for both issues. Reservations stay advisory and nothing locks the path. The pair is not flagged again for that path until the operator acts. | `agent-parley issue offer N --to LANE` then the other lane accepts, or `agent-parley issue release N`; an accept ends only the record between the two lanes, and a release ends the releasing lane's records only when it holds no other issue. Counting then restarts. A record naming a retired lane is no longer reported, and old records are pruned. |
 | `session outliving its claim` | The lane holds no claim, yet a native session in a worktree the lane made showed activity in the last 60 seconds. | `agent-parley status NAME`; Agent Parley never stops such a session. |
 | `forge refused` | The poll's last forge read failed after its last good one because the forge refused the signed-in account, or rate-limited it. Poll forge reads back off for 60 seconds after such a refusal. | `gh auth status`, then `gh auth switch --user OWNER`; for a rate limit, none: the row names when the supervisor retries. |
+| `blueprint blocked` | A blueprint run for an open claim stopped at a blocked node. The row names the node and is listed on the run's lane. | Fix the cause, then `agent-parley blueprint run LANE BLUEPRINT --issue N --repo REPO`; `blueprint progress` shows each run's current node. |
 | `root missing` | The project root checkout is gone. Lanes retire only once it has been gone `root_gone_after` (an hour by default), and never while its parent directory cannot be listed; the row then says the root is unreachable. Past that, the row names the live lanes kept from retirement because their session process is alive or their activity record cannot be read. | Restore the root checkout, or end the named sessions so the next poll retires them. |
 | `root returned` | The project root came back after lanes retired for its absence. The row names those lanes until each is re-admitted. | `agent-parley participant add NAME --repo ROOT` for each lane named |
 | `plugin stale` | These live lanes run an old plugin: the service refreshed it after their sessions started, or their recorded `plugin_version` differs from the launcher. One row per project names them all. A refresh that failed is named with the CLI's error instead; the service retries it. | End the oldest named session, then `agent-parley run NAME --repo ROOT --resume`; for a failed refresh, `agent-parley plugins install` |
@@ -3085,8 +3086,8 @@ never seen, and a profile is the supported way to say the same thing.
 ### Notifications
 
 The service and the launcher can forward the coordination changes an absent
-operator waits on to a Telegram bot, an email address, or both. Email is
-outbound only. The Telegram bot also carries status queries and decision
+operator waits on to a Telegram bot, an email address, an HTTPS webhook, or
+any mix. Email and the webhook are outbound only. The Telegram bot also carries status queries and decision
 answers back once inbound is on, as described below; with inbound off, no
 command arrives over the channel and a native permission prompt is answered
 only in the lane's terminal. Settings come from the
@@ -3109,7 +3110,7 @@ outbound and inbound are on and, when off, why.
 
 | Variable | Meaning |
 | --- | --- |
-| `AGENT_PARLEY_NOTIFY` | Comma-separated transports: `telegram`, `email`, or both. Unset means notifications are off. |
+| `AGENT_PARLEY_NOTIFY` | Comma-separated transports: `telegram`, `email`, `webhook`, or any mix. Unset means notifications are off. |
 | `AGENT_PARLEY_TELEGRAM_TOKEN` | Bot token. |
 | `AGENT_PARLEY_TELEGRAM_CHAT` | Chat identifier the bot posts to. |
 | `AGENT_PARLEY_SMTP_HOST` | SMTP server host. |
@@ -3119,6 +3120,8 @@ outbound and inbound are on and, when off, why.
 | `AGENT_PARLEY_SMTP_PASSWORD` | SMTP password. |
 | `AGENT_PARLEY_SMTP_FROM` | Sender address. |
 | `AGENT_PARLEY_SMTP_TO` | Comma-separated recipients. |
+| `AGENT_PARLEY_WEBHOOK_URL` | Webhook URL; `https://`, or `http://` to `127.0.0.1` or `localhost` for a local relay. Treat it as a secret. |
+| `AGENT_PARLEY_WEBHOOK_SECRET` | Optional; signs each request with an `X-Agent-Parley-Signature: sha256=<HMAC of the body>` header. |
 
 ```sh
 export AGENT_PARLEY_NOTIFY=telegram,email
@@ -3171,9 +3174,9 @@ supervision poll with a backoff that doubles from 30 seconds to an hour, so a
 hook that exits before its send finishes still reaches the operator. A retry
 goes only to the transports that have not accepted the decision yet, so a
 healthy Telegram bot does not repeat a decision while SMTP keeps failing.
-Retries stop after eight failed attempts, and one `notification_failed` event
-on the lane, or a supervision note for a decision with no lane, records that
-the decision was given up. Decisions due together go out as one digest; on
+After eight failed attempts one `notification_failed` event on the lane, or a
+supervision note for a decision with no lane, records it, and retries continue
+hourly until the decision is answered or expires. Decisions due together go out as one digest; on
 Telegram
 it carries one row of buttons per decision, and every transport shows the text
 reply each takes. Decisions are recorded only while notifications are on, and
