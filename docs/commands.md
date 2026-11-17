@@ -168,6 +168,8 @@ on standard output and export to a file.
 | `timeout show` | List every decision kind with its class, recommended option and how long it waits; every current kind always asks. |
 | `timeout set KIND [--ask \| --after WINDOW]` | Record that a kind always asks, or that it waits longer than 30 minutes; neither flag removes the entry. Every current kind is irreversible and waits for the operator, so `--after` is refused. Base checkout only. |
 | `unattended run NAME` | Integrate one eligible lane under the policy on `participant merge` terms, recording the decision or the refusal; `--issue N` names the claim when the lane holds several ready ones. Base checkout only. |
+| `policy import PATH` | Validate a TOML project policy file and record it as `policy.toml` in the project's state directory; a malformed file, unknown key or missing key is refused with its line and key and nothing is recorded. Base checkout only ([Gating steps with a project policy](operations.md#gating-steps-with-a-project-policy)). |
+| `policy check` | Judge every rule against every held claim and print each rule as pass or FAIL with the evidence missing; it claims nothing and changes nothing. |
 | `init show` | Show the command every new lane runs before it starts. |
 | `init set COMMAND` | Set that command; an empty string removes it. |
 | `pool show` | Show how many prepared spare worktrees the project keeps and each spare's state; `--json` prints it for scripts. |

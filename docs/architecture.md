@@ -54,6 +54,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
 | `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
+| `rules` | The optional project policy file `policy.toml` in the private state directory: strict TOML parsing that refuses an unknown key, missing key or malformed file with its line, the `review`, `reviewer` and `test` rule kinds, the evidence they are judged on (the lane's diff since its fork from the base checkout's HEAD, its commit subjects, and returned review rounds), the gate `report` runs before a ready report and `issue resolve` before completing a claim, and the read-only `policy check`. A rule only refuses a coordination step; it never grants a permission, approves a native prompt or adds a bypass flag |
 | `verification` | One outcome per returned review round and relayed child report, clean or a finding count, with the issue's cached forge labels and the verifying lane's provider and model, in `verification.jsonl`; the find rate per label and per provider and model that `metrics verification` prints and `issue next` cites; it reads no transcript and skips or adds no verification |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
 | `observed` | The Git worktrees a lane's native client works in beside the lane, recorded from hook events on the lane's roster entry and reserved for it; never created, moved or pruned, and flagged outside `<lane>/.claude/worktrees/` |
@@ -1062,6 +1063,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `decisions` | `decisions.json` under `decisions.lock` |
 | `followups` | `followups.json` under `followups.lock` |
 | `reviews` | `reviews.json` under `reviews.lock` |
+| `rules` | `policy.toml`, written by `policy import` and only read otherwise |
 | `verification` | `verification.jsonl`, a line log bounded by `state.trim_log`, under `verification.lock` |
 | `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |

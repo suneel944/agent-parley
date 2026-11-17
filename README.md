@@ -56,6 +56,10 @@ https://github.com/user-attachments/assets/1de399fc-4078-49da-a4f9-116789bccb7d
   policy adds `--auto`, merges on the same gate as
   `participant merge`, and a failed integration holds every other merge until
   it is verified.
+- **Team rules as a shared policy.** `policy import` records a TOML file of
+  rules, such as a large diff needing a review round or a `fix:` commit
+  needing a changed test, that refuse a ready report or a resolve that breaks
+  them; `policy check` shows every rule as pass or fail.
 - **Churn is caught per issue.** An issue whose verification keeps failing is
   flagged in `issue show`, `problems` and a notification.
 - **Ownership stays explicit.** Atomic claims, accepted handoffs, advisory

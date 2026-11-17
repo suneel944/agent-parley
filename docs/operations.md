@@ -777,6 +777,63 @@ together form one. An edge to an issue that is already complete is skipped.
 Groups name issues that
 may proceed together, and `participant merge --group NAME` integrates one.
 
+### Gating steps with a project policy
+
+A project can declare the rules its lanes follow in a policy file instead of
+in one operator's private hooks. The file is TOML, holds only `[[rule]]`
+tables, and lives as `policy.toml` in the project's state directory, outside
+the target repository. Write it anywhere and record it from the base checkout:
+
+```toml
+[[rule]]
+name = "large-diff-review"
+kind = "review"
+lines = 400
+
+[[rule]]
+name = "migrations-need-codex"
+kind = "reviewer"
+paths = ["migrations/*"]
+lane = "codex"
+
+[[rule]]
+name = "fix-needs-test"
+kind = "test"
+title = "fix:"
+tests = ["tests/*"]
+on = ["ready", "resolve"]
+```
+
+```bash
+agent-parley policy import ~/team/policy.toml
+agent-parley policy check
+```
+
+Every rule takes `name`, `kind` and, optionally, `on`: the coordination steps
+it gates, `ready` (a lane's ready report) and `resolve` (an operator
+completing a claim with `issue resolve`), defaulting to `ready`. The kinds:
+
+- `review`: once the lane's diff changes more than `lines` lines, a review
+  round on the claim (mail to `@review`) must have returned findings.
+- `reviewer`: once a changed path matches a `paths` glob, the named `lane`
+  must have returned a review round on the claim.
+- `test`: once a commit subject on the lane's branch starts with `title`, a
+  changed file must match a `tests` glob.
+
+The diff is the lane's change since its branch forked from the base
+checkout's HEAD. Globs follow `fnmatch`, so `*` also crosses `/`. A rule that
+fails refuses the step with the rule name and the evidence missing; a
+released claim is never gated. `policy check` prints every rule as pass or
+FAIL for every held claim, and claims nothing and changes nothing.
+
+The policy only refuses coordination steps. It never grants a permission,
+never approves a native CLI prompt and never adds a bypass flag, and it is
+data, so a cloned repository cannot run code through it. Without a policy
+file nothing is gated. A malformed file, an unknown key, a missing key or a
+value of the wrong type is refused with its line and key, both by
+`policy import`, which then records nothing, and by every gated step while
+such a file sits in the state directory, so a typo never disables a rule.
+
 ### Integrating several lanes at once
 
 ```sh
