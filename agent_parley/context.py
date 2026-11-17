@@ -156,7 +156,7 @@ def context_full(use: float | None, threshold: float) -> bool:
     return use is not None and use >= threshold
 
 
-def lane_location(participant: dict) -> dict[str, str]:
+def lane_location(participant: dict) -> dict:
     """Names where a lane runs.
 
     Agent Parley coordinates lanes on one host, so every lane runs on the
@@ -166,11 +166,18 @@ def lane_location(participant: dict) -> dict[str, str]:
         participant: Manifest entry naming the lane.
 
     Returns:
-        The ``host`` name and the lane's ``worktree`` path.
+        The ``host`` name and the lane's ``worktree`` path, and the
+        ``linked_worktrees`` path per link name when the lane works in a
+        linked repository.
     """
+    linked = {
+        name: entry["lane"]
+        for name, entry in sorted(participant.get("linked", {}).items())
+    }
     return {
         "host": socket.gethostname(),
         "worktree": str(participant.get("lane", "")),
+        **({"linked_worktrees": linked} if linked else {}),
     }
 
 
@@ -338,7 +345,18 @@ def location_cell(row: dict) -> str:
         row: A row carrying the `lane_fields` keys.
 
     Returns:
-        ``host:worktree``, or ``-`` when the row names no worktree.
+        ``host:worktree``, followed by `` +NAME:path`` per linked
+        repository worktree, or ``-`` when the row names no worktree.
     """
     worktree = row.get("worktree")
-    return f"{row.get('host', '')}:{worktree}" if worktree else "-"
+    if not worktree:
+        return "-"
+    return " +".join(
+        [
+            f"{row.get('host', '')}:{worktree}",
+            *(
+                f"{name}:{path}"
+                for name, path in row.get("linked_worktrees", {}).items()
+            ),
+        ]
+    )

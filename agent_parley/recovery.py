@@ -17,6 +17,8 @@ from agent_parley.state import BridgeError, Transient, lock, write_json
 
 CAPTURE_INTERVAL = 30
 GIT_SECONDS = 30
+HISTORY_LIMIT = 50
+HISTORY_NAME = re.compile(r"[1-9][0-9]{0,17}")
 MAX_STEP_BYTES = 400
 RECOVERY_FOLDER = "recovery"
 TEMPORARY_REF_NAMESPACE = "refs/agent-parley-recovery/"
@@ -593,7 +595,122 @@ def _capture(
         }
         write_json(record_path, checkpoint)
         published.append(checkpoint)
+    _remember(directory, agent, head, branch, [number for number, _ in owned])
     return published
+
+
+def history_path(directory: Path, agent: str) -> Path:
+    """Returns the file holding one lane's checkpoint history.
+
+    Args:
+        directory: Private project state directory.
+        agent: Participant whose history the file holds.
+
+    Returns:
+        The `<lane>-checkpoints.json` path beside the lane's other records.
+    """
+    return directory / f"{agent}-checkpoints.json"
+
+
+def history(directory: Path, agent: str) -> list[dict]:
+    """Lists the commits a lane's recovery captures recorded, oldest first.
+
+    A claim checkpoint keeps only its latest capture, which an operator
+    cannot return to once the lane moves on. Each capture that finds the
+    lane on a commit or branch other than the last one recorded appends one
+    entry here, so the points a lane passed through stay listed after the
+    claim checkpoint is replaced. The newest `HISTORY_LIMIT` entries are
+    kept. An entry names the committed HEAD only: uncommitted work at that
+    moment lives in the claim's bundle while that capture is current.
+
+    Args:
+        directory: Private project state directory.
+        agent: Participant whose history is read.
+
+    Returns:
+        Entries carrying an ``id``, the ``head`` commit, the ``branch`` it
+        was on, the ``captured_at`` time and the ``issues`` claimed then. A
+        missing or unreadable history reads as empty.
+    """
+    try:
+        value = json.loads(history_path(directory, agent).read_text())
+    except (OSError, ValueError):
+        return []
+    entries = value.get("checkpoints") if isinstance(value, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("id"), str)
+        and HISTORY_NAME.fullmatch(entry["id"])
+        and isinstance(entry.get("head"), str)
+        and re.fullmatch(r"[0-9a-f]{40,64}", entry["head"])
+    ]
+
+
+def _remember(
+    directory: Path,
+    agent: str,
+    head: str,
+    branch: str,
+    issues: list[str],
+) -> None:
+    """Appends one capture to a lane's checkpoint history when it moved.
+
+    The caller holds the lane's capture lock, so numbering never races.
+
+    Args:
+        directory: Private project state directory.
+        agent: Participant that was captured.
+        head: Commit the lane's HEAD named at the capture.
+        branch: Branch the lane was on, or empty when detached.
+        issues: Issue numbers the lane owned at the capture.
+    """
+    entries = history(directory, agent)
+    if entries and (entries[-1]["head"], entries[-1].get("branch")) == (
+        head,
+        branch,
+    ):
+        return
+    number = int(entries[-1]["id"]) + 1 if entries else 1
+    entries.append(
+        {
+            "id": str(number),
+            "head": head,
+            "branch": branch,
+            "captured_at": time.time(),
+            "issues": sorted(issues, key=int),
+        }
+    )
+    write_json(
+        history_path(directory, agent),
+        {"checkpoints": entries[-HISTORY_LIMIT:]},
+    )
+
+
+def recorded(directory: Path, agent: str, identifier: str) -> dict:
+    """Reads one entry of a lane's checkpoint history by its identifier.
+
+    Args:
+        directory: Private project state directory.
+        agent: Participant whose history is read.
+        identifier: Entry identifier as `history` lists it.
+
+    Returns:
+        The matching history entry.
+
+    Raises:
+        BridgeError: If the lane recorded no checkpoint with that identifier.
+    """
+    for entry in history(directory, agent):
+        if entry["id"] == identifier:
+            return entry
+    raise BridgeError(
+        f"{agent} has no recorded checkpoint {identifier}.",
+        next_command=f"agent-parley participant checkpoints {agent}",
+    )
 
 
 def preserve(directory: Path, worktree: Path) -> dict:

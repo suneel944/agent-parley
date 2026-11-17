@@ -950,9 +950,85 @@ def decision_lines(page: dict) -> list[str]:
             f"Decision {row['id']}  {row['created_ts']}  "
             f"{row['sender']}  {subject}"
         )
+        if row.get("superseded_ts"):
+            lines.append(
+                f"  Superseded {row['superseded_ts']}: "
+                f"{row.get('superseded_reason') or 'no reason recorded'}"
+            )
         lines.append("  " + " ".join(str(row["body_md"]).split()))
     if page["has_more"]:
         lines.append("More decisions match; raise --limit or narrow the query.")
+    return lines
+
+
+def checkpoint_lines(listed: dict) -> list[str]:
+    """Formats a lane's recorded checkpoints as compact rows.
+
+    Args:
+        listed: Reading as ``Bridge.lane_checkpoints`` reports it.
+
+    Returns:
+        One row per checkpoint, newest first, each followed by the decisions
+        the lane recorded since, or one sentence saying none was recorded.
+    """
+    name = listed["participant"]
+    if not listed["checkpoints"]:
+        return [
+            f"{name} has no recorded checkpoint. A checkpoint is recorded "
+            "while the lane holds a claim."
+        ]
+    lines = [f"{name} is on {listed['branch']}."]
+    for entry in listed["checkpoints"]:
+        captured = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.gmtime(float(entry.get("captured_at") or 0)),
+        )
+        claimed = " ".join(f"#{number}" for number in entry.get("issues", []))
+        decisions = entry["decisions"]
+        lines.append(
+            f"Checkpoint {entry['id']}  {captured}  {entry['head'][:12]}  "
+            f"{entry.get('branch') or 'detached'}  {claimed or '-'}  "
+            f"{len(decisions)} decision(s) since"
+        )
+        for row in decisions:
+            state = " (superseded)" if row["superseded_ts"] else ""
+            lines.append(
+                f"  Decision {row['id']}  {row['created_ts']}  "
+                f"{row['subject']}{state}"
+            )
+    return lines
+
+
+def rewind_lines(rewound: dict) -> list[str]:
+    """Formats the account of one lane rewind.
+
+    Args:
+        rewound: Result as ``Bridge.rewind`` reports it.
+
+    Returns:
+        The new and kept branches, the superseded decisions and whether the
+        lane was told.
+    """
+    name = rewound["participant"]
+    entry = rewound["checkpoint"]
+    lines = [
+        f"{name} rewound to checkpoint {entry['id']} at "
+        f"{entry['head'][:12]} on new branch {rewound['branch']}.",
+        f"Previous branch {rewound['previous_branch']} kept at "
+        f"{rewound['previous_head'][:12]}; nothing was deleted.",
+    ]
+    superseded = rewound["superseded"]
+    lines.append(
+        "Superseded decisions: "
+        + ", ".join(str(row["id"]) for row in superseded)
+        + "."
+        if superseded
+        else "No decision was superseded."
+    )
+    if "update_error" in rewound:
+        lines.append(f"The lane was not told: {rewound['update_error']}")
+    else:
+        lines.append(f"{name} was sent one update naming the checkpoint.")
     return lines
 
 
@@ -1774,6 +1850,73 @@ def shown_paths(paths: Sequence[str]) -> list[str]:
     return shown
 
 
+def lane_ignored(participant: dict) -> list[str]:
+    """Names the ignored paths removing every worktree of a lane deletes.
+
+    Args:
+        participant: Participant record from the manifest.
+
+    Returns:
+        Ignored paths of the lane's own worktree as they are, then those of
+        each existing linked worktree written ``NAME//path``.
+    """
+    return [
+        f"{name}//{path}" if name else path
+        for name, tree, _ in roster.worktrees(participant)
+        if tree.exists()
+        for path in ignored_paths(tree)
+    ]
+
+
+def removable(
+    tree: Path,
+    owner: str,
+    discard: Sequence[str],
+    *,
+    prefix: str = "",
+    action: str = "retire",
+    confirm: str = "",
+) -> None:
+    """Refuses removing a worktree that holds work its removal loses.
+
+    ``git worktree remove`` refuses uncommitted changes, but it deletes
+    ignored files, which ``git status`` never reports. Checking every
+    worktree of a removal before the first one is removed keeps a refusal
+    from leaving the removal half done.
+
+    Args:
+        tree: Existing worktree about to be removed.
+        owner: Name the refusal gives the worktree's lane.
+        discard: Ignored paths the operator agreed to delete.
+        prefix: ``NAME//`` for a linked worktree, so its ignored paths are
+            matched against ``discard`` as ``NAME//path``.
+        action: Command the refusal says never discards work.
+        confirm: Clause naming how to confirm deleting the ignored files,
+            or empty when nothing confirms it.
+
+    Raises:
+        BridgeError: If the worktree holds uncommitted changes or an
+            ignored path ``discard`` does not name.
+    """
+    if git(tree, "status", "--porcelain"):
+        raise BridgeError(
+            f"{owner} has uncommitted changes. Commit or preserve them "
+            f"first; {action} never discards work.",
+            next_command=worktrees.commit_all(tree),
+        )
+    kept = [
+        prefix + path
+        for path in ignored_paths(tree)
+        if prefix + path not in discard
+    ]
+    if kept:
+        raise BridgeError(
+            f"{owner}'s worktree holds ignored files that removing it "
+            f"deletes: {', '.join(shown_paths(kept))}. Move them first"
+            f"{confirm}."
+        )
+
+
 def retired_lane(
     bridge: Bridge, repo: Path, name: str, assume_yes: bool
 ) -> str:
@@ -1795,8 +1938,7 @@ def retired_lane(
     """
     _, data = lane_roster(bridge, repo)
     participant = data["participants"].get(name)
-    lane = Path(participant["lane"]) if participant else None
-    ignored = ignored_paths(lane) if lane and lane.exists() else []
+    ignored = lane_ignored(participant) if participant else []
     if ignored and not confirmed(
         f"Retiring {name} deletes these ignored files:\n"
         + "\n".join(f"- {path}" for path in shown_paths(ignored)),
@@ -2617,6 +2759,186 @@ class Bridge(
             git(lane, "switch", branch)
             return f"{name} restored to {branch} from {actual}."
 
+    def lane_checkpoints(self, repo: Path, name: str) -> dict:
+        """Lists the checkpoints a lane can be rewound to, newest first.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose checkpoints are listed.
+
+        Returns:
+            The lane's name and assigned branch, and each recorded
+            checkpoint with its commit, branch, capture time, the issues
+            the lane owned then and the decisions the lane recorded since.
+
+        Raises:
+            BridgeError: If the participant does not exist.
+        """
+        from agent_parley import recovery
+
+        directory, data, participant = self._lane(repo, name)
+        listed = [
+            {
+                **entry,
+                "decisions": store.lane_decisions(
+                    self.home,
+                    data["root"],
+                    participant["display"],
+                    float(entry.get("captured_at") or 0),
+                ),
+            }
+            for entry in reversed(recovery.history(directory, name))
+        ]
+        return {
+            "participant": name,
+            "branch": participant["branch"],
+            "checkpoints": listed,
+        }
+
+    def rewind(self, repo: Path, name: str, identifier: str) -> dict:
+        """Moves a lane onto a new branch at one of its recorded checkpoints.
+
+        Nothing is deleted or reset. The new branch starts at the
+        checkpoint's commit and becomes the lane's assigned branch; the
+        branch the lane was on keeps every commit and is named in the
+        update the lane receives. A worktree holding uncommitted or
+        untracked changes is refused with its paths and never stashed or
+        cleaned. A lane mid-turn is refused rather than stopped or waited
+        on: the rewind runs only when the lane's last native event says its
+        turn ended, or no session runs. The check is made under the lane's
+        checkpoint lock, which every native hook takes before it records a
+        new turn, so a turn cannot begin between the check and the switch.
+        Decisions the lane recorded after the checkpoint are marked
+        superseded and keep their text. Claims, reservations and the lane's
+        holder identity are left exactly as they were.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose lane is rewound.
+            identifier: Checkpoint identifier `lane_checkpoints` lists.
+
+        Returns:
+            The checkpoint, the new and previous branches, the decisions
+            superseded and the update sent to the lane.
+
+        Raises:
+            BridgeError: If the participant or checkpoint is unknown, the
+                lane is mid-turn, off its assigned branch or dirty, or the
+                checkpoint's commit is no longer in the repository.
+        """
+        from agent_parley import recovery
+
+        directory, _, _ = self._lane(repo, name)
+        busy = f"{name} is recording a checkpoint; retry in a moment."
+        with (
+            lock(directory / "setup.lock"),
+            lock(directory / f"{name}-checkpoint.lock", busy, timeout=1),
+            lock(directory / f"{name}-capture.lock", busy, timeout=1),
+        ):
+            data = roster.read(directory)
+            participant = data["participants"].get(name)
+            if participant is None:
+                raise BridgeError(
+                    f"{name} was retired while this command ran; nothing "
+                    "changed."
+                )
+            entry = recovery.recorded(directory, name, identifier)
+            lane = Path(participant["lane"])
+            previous = participant["branch"]
+            published = activity(directory, name)
+            reading = supervision.lane_state(published)
+            if reading["state"] != supervision.STOPPED and not (
+                reading["state"] == supervision.IDLE
+                and published.get("activity") == "idle"
+            ):
+                raise BridgeError(
+                    f"{name} is not between turns ({reading['evidence']}); "
+                    "rewind never stops a running turn. Retry once the lane "
+                    "is idle; nothing changed."
+                )
+            if not lane.exists():
+                raise BridgeError(f"{name} has no worktree at {lane}.")
+            if lane_branch(lane) != previous:
+                raise BridgeError(
+                    f"{name} is not on its assigned branch {previous}; run "
+                    f"agent-parley participant restore {name} first.",
+                    next_command=f"agent-parley participant restore {name}",
+                )
+            changed = supervision.dirty_paths(str(lane))
+            if changed is None:
+                raise BridgeError(
+                    f"Git could not read {name}'s worktree; nothing changed."
+                )
+            if changed:
+                raise BridgeError(
+                    f"{name} has uncommitted changes: "
+                    f"{', '.join(shown_paths(changed))}. Commit or preserve "
+                    "them first; rewind never stashes or discards work.",
+                    next_command=worktrees.commit_all(lane),
+                )
+            head = str(entry["head"])
+            try:
+                git(lane, "cat-file", "-e", f"{head}^{{commit}}")
+            except BridgeError:
+                raise BridgeError(
+                    f"Checkpoint {identifier} names commit {head[:12]}, "
+                    "which the repository no longer holds; nothing changed."
+                ) from None
+            previous_head = git(lane, "rev-parse", "HEAD")
+            target = f"{previous}-rewind-{identifier}"
+            suffix = 1
+            while has_branch(lane, target):
+                suffix += 1
+                target = f"{previous}-rewind-{identifier}-{suffix}"
+            git(lane, "switch", "-c", target, head)
+            participant["branch"] = target
+            write_json(directory / "project.json", data)
+        captured = float(entry.get("captured_at") or 0)
+        superseded = store.supersede_decisions(
+            self.home,
+            data["root"],
+            participant["display"],
+            captured,
+            f"{name} was rewound to checkpoint {identifier}",
+        )
+        when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(captured))
+        dropped = (
+            "Decisions you recorded after it are superseded and stay in the "
+            "log for reference: "
+            + "; ".join(
+                f"decision {row['id']} {row['subject']!r}" for row in superseded
+            )
+            + "."
+            if superseded
+            else "No decision you recorded after it was superseded."
+        )
+        text = (
+            f"The operator rewound your lane to checkpoint {identifier}, "
+            f"commit {head[:12]} captured {when}. Your worktree is now on "
+            f"the new branch {target}. The previous branch {previous} is "
+            f"kept untouched at {previous_head[:12]}; nothing was deleted. "
+            f"{dropped} Your claims and reservations are unchanged. "
+            "Continue from this commit."
+        )
+        result = {
+            "participant": name,
+            "checkpoint": entry,
+            "branch": target,
+            "previous_branch": previous,
+            "previous_head": previous_head,
+            "superseded": superseded,
+        }
+        try:
+            result["update"] = self.say(
+                repo,
+                name,
+                text,
+                f"Rewound to checkpoint {identifier}",
+            )
+        except BridgeError as exc:
+            result["update_error"] = str(exc)
+        return result
+
     def retire(self, repo: Path, name: str, discard: Sequence[str] = ()) -> str:
         """Removes a participant's lane while preserving any work it holds.
 
@@ -2629,6 +2951,9 @@ class Bridge(
         retirement before anything is removed. Removing the worktree deletes
         its ignored files, which `git status` never reports, so they are
         deleted only when every one of them was named in ``discard``. The
+        lane's worktrees in linked repositories are checked the same way,
+        their ignored paths written ``NAME//path``, and every worktree is
+        checked before the first one is removed. The
         lane's session and checkpoint locks are both taken before the first
         irreversible step, so a busy lane refuses the retirement with its
         worktree, branch, credential and record intact rather than failing
@@ -2669,25 +2994,25 @@ class Bridge(
                 ),
                 lock(directory / f"{name}-checkpoint.lock", timeout=1),
             ):
-                if lane.exists():
-                    if git(lane, "status", "--porcelain"):
-                        raise BridgeError(
-                            f"{name} has uncommitted changes. Commit or "
-                            "preserve them first; retire never discards work.",
-                            next_command=worktrees.commit_all(lane),
+                for link, tree, _ in roster.worktrees(participant):
+                    if tree.exists():
+                        removable(
+                            tree,
+                            f"{name} in {link}" if link else name,
+                            discard,
+                            prefix=f"{link}//" if link else "",
+                            confirm=(
+                                ", or run `agent-parley participant retire "
+                                f"{name}` to confirm deleting them"
+                            ),
                         )
-                    kept = [
-                        path
-                        for path in ignored_paths(lane)
-                        if path not in discard
-                    ]
-                    if kept:
-                        raise BridgeError(
-                            f"{name}'s worktree holds ignored files that "
-                            f"removing it deletes: "
-                            f"{', '.join(shown_paths(kept))}. Move "
-                            "them first, or run `agent-parley participant "
-                            f"retire {name}` to confirm deleting them."
+                for link, tree, _ in roster.worktrees(participant)[1:]:
+                    if tree.exists():
+                        git(
+                            Path(data["links"][link]),
+                            "worktree",
+                            "remove",
+                            str(tree),
                         )
                 retirement.return_work(directory, data, name)
                 if lane.exists():
@@ -2733,6 +3058,7 @@ class Bridge(
                 for suffix in (
                     "identity.json",
                     "activity.json",
+                    "checkpoints.json",
                     "mcp.json",
                     "events.jsonl",
                     "events.1.jsonl",
@@ -3451,12 +3777,13 @@ class Bridge(
         for row in rows:
             if not row["reclaim"]:
                 continue
-            lane = Path(manifest["participants"][row["participant"]]["lane"])
             try:
                 self.retire(
                     repo,
                     row["participant"],
-                    discard=ignored_paths(lane) if lane.exists() else (),
+                    discard=lane_ignored(
+                        manifest["participants"][row["participant"]]
+                    ),
                 )
             except BridgeError as exc:
                 row.update(reclaim=False, removed=False, reason=str(exc))
@@ -3576,6 +3903,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "pool",
             "blueprint",
             "branch",
+            "link",
             "forge",
             "deadlines",
             "budget",
@@ -5225,6 +5553,16 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     "lane that is merely idle is never orphaned."
                 ),
             )
+            command.add_argument(
+                "--link",
+                action="append",
+                default=[],
+                metavar="NAME",
+                help=(
+                    "Also work in this linked repository: the lane gains a "
+                    "worktree there on its own branch. Repeat for several."
+                ),
+            )
         if action == "offer":
             command.add_argument(
                 "--to", required=True, help="Lane the ownership is offered to."
@@ -5910,6 +6248,15 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "recording the same decision again records nothing further."
         ),
     )
+    deciding.add_argument(
+        "--link",
+        default="",
+        metavar="NAME",
+        help=(
+            "Linked repository the decision concerns, recorded as [NAME] "
+            "before the subject; without it the primary repository."
+        ),
+    )
     deciding.add_argument("--json", action="store_true", help=JSON_HELP)
     decision = commands.add_parser(
         "decision",
@@ -6004,6 +6351,38 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     reporting_lane.add_argument("--json", action="store_true", help=JSON_HELP)
+    listing_checkpoints = roles.add_parser(
+        "checkpoints",
+        help=(
+            "List a lane's recorded checkpoints with their commit, time and "
+            "the decisions recorded since."
+        ),
+    )
+    listing_checkpoints.add_argument("name", help="Lane to list.")
+    listing_checkpoints.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    listing_checkpoints.add_argument(
+        "--json", action="store_true", help=JSON_HELP
+    )
+    rewinding = roles.add_parser(
+        "rewind",
+        help=(
+            "Move an idle, clean lane onto a new branch at a recorded "
+            "checkpoint; keep the old branch."
+        ),
+    )
+    rewinding.add_argument("name", help="Lane to rewind.")
+    rewinding.add_argument(
+        "--to",
+        required=True,
+        metavar="ID",
+        help="Checkpoint identifier `participant checkpoints` lists.",
+    )
+    rewinding.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    rewinding.add_argument("--json", action="store_true", help=JSON_HELP)
     joining = roles.add_parser(
         "add", help="Create a lane with an optional provider and credentials."
     )
@@ -6548,6 +6927,48 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     naming_base.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    linking = commands.add_parser(
+        "link",
+        help="Show, add or remove sibling repositories lanes can work in.",
+    )
+    linkings = linking.add_subparsers(dest="action", required=True)
+    link_show = linkings.add_parser(
+        "show", help="List the repositories this project links."
+    )
+    link_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    link_add = linkings.add_parser(
+        "add", help="Link a sibling repository; operator-only."
+    )
+    link_add.add_argument(
+        "path",
+        metavar="PATH",
+        type=Path,
+        help="Any checkout of the repository to link.",
+    )
+    link_add.add_argument(
+        "--name",
+        default="",
+        help=(
+            "Link name used by issue claim --link and in reservation keys "
+            "NAME//path; defaults to the checkout directory's name."
+        ),
+    )
+    link_add.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    link_remove = linkings.add_parser(
+        "remove",
+        help=(
+            "Remove a link and its clean lane worktrees; branches remain. "
+            "Operator-only."
+        ),
+    )
+    link_remove.add_argument("name", metavar="NAME", help="Link name.")
+    link_remove.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     milestoning = commands.add_parser(
@@ -7774,6 +8195,7 @@ def main() -> int:
                 when_released=getattr(args, "when_released", ""),
                 remaining=getattr(args, "remaining", None),
                 take_orphaned=getattr(args, "take_orphaned", False),
+                links=getattr(args, "link", None),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))
@@ -8064,9 +8486,29 @@ def main() -> int:
                     lanes.lane_task_plan(directory, args.name)
                 ):
                     print(line)
+        elif args.command == "participant" and args.action == "checkpoints":
+            recorded_points = bridge.lane_checkpoints(
+                args.repo.resolve(), args.name
+            )
+            print(
+                views.render("participant_checkpoints", recorded_points)
+                if args.json
+                else "\n".join(checkpoint_lines(recorded_points))
+            )
+        elif args.command == "participant" and args.action == "rewind":
+            rewound = bridge.rewind(args.repo.resolve(), args.name, args.to)
+            print(
+                views.render("participant_rewind", rewound)
+                if args.json
+                else "\n".join(rewind_lines(rewound))
+            )
         elif args.command == "decide":
             recorded = bridge.decide(
-                args.repo.resolve(), args.text, args.subject, args.key
+                args.repo.resolve(),
+                args.text,
+                args.subject,
+                args.key,
+                args.link,
             )
             print(
                 views.render("decide", recorded)
@@ -8188,6 +8630,18 @@ def main() -> int:
                 print(
                     bridge.branch_naming(
                         repository, getattr(args, "prefix", None)
+                    )
+                )
+        elif args.command == "link":
+            repository = args.repo.resolve()
+            if args.action == "remove":
+                print(bridge.unlink(repository, args.name))
+            else:
+                print(
+                    bridge.link(
+                        repository,
+                        getattr(args, "path", None),
+                        getattr(args, "name", ""),
                     )
                 )
         elif args.command == "milestone":

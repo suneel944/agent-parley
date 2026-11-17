@@ -323,6 +323,34 @@ def lane_context(
     ]
 
 
+def linked_directories(participant: dict) -> list[str]:
+    """Builds the ``--add-dir`` arguments naming a lane's linked worktrees.
+
+    Claude Code and Codex both confine writes to the session's working
+    directory unless more directories are named, so a lane working in a
+    linked repository would meet a permission prompt or a sandbox refusal
+    on every write there. Each linked worktree that exists is named with
+    the client's own ``--add-dir`` flag, which widens the workspace by that
+    one directory and bypasses no approval or sandbox rule. A worktree a
+    claim adds while the session runs is named at the next launch.
+
+    Args:
+        participant: Participant record from the manifest.
+
+    Returns:
+        ``--add-dir`` and the path per existing linked worktree, in link
+        name order; empty for a lane that works in no linked repository.
+    """
+    from agent_parley import roster
+
+    return [
+        argument
+        for _, tree, _ in roster.worktrees(participant)[1:]
+        if tree.is_dir()
+        for argument in ("--add-dir", str(tree))
+    ]
+
+
 def ask_command(
     adapter: str, executable: str, prompt: str, lane: str, session: str = ""
 ) -> list[str]:
@@ -1211,6 +1239,7 @@ reported.
                     prompt,
                     "--settings",
                     json.dumps(native),
+                    *linked_directories(participant),
                     "--",
                     task,
                 ]
@@ -1353,6 +1382,7 @@ reported.
                         + ",timeout=3}]}]"
                     )
                     command.extend(["-c", f"hooks.{event}={value}"])
+                command += linked_directories(participant)
                 command.append(prompt + "\nUser task:\n" + task)
             from agent_parley import children
 
