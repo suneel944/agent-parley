@@ -284,7 +284,12 @@ class MailMixin(BridgeCore):
         ]
 
     def decide(
-        self, repo: Path, text: str, subject: str = "", key: str = ""
+        self,
+        repo: Path,
+        text: str,
+        subject: str = "",
+        key: str = "",
+        link: str = "",
     ) -> dict:
         """Records one decision every registered lane of the project can read.
 
@@ -299,20 +304,30 @@ class MailMixin(BridgeCore):
             subject: Subject line the decision is found under.
             key: Idempotency key. Without one the key follows the text, so
                 recording the same decision twice records it once.
+            link: Linked repository the decision concerns, written before
+                the subject as ``[NAME]``. Empty means the primary
+                repository.
 
         Returns:
             The recorded decision identifier, carrying ``duplicate`` when this
             key already named exactly this decision.
 
         Raises:
-            BridgeError: If the repository has no project or the decision
-                fails validation.
+            BridgeError: If the repository has no project, the link is
+                unknown or the decision fails validation.
         """
         from agent_parley.cli import operator_key, roster, store
 
         _, directory = self.project(repo)
         data = roster.read(directory)
-        heading = subject or "Operator decision"
+        if link and link not in data.get("links", {}):
+            raise BridgeError(
+                f"This project links no repository named {link}; run "
+                "agent-parley link show."
+            )
+        heading = (f"[{link}] " if link else "") + (
+            subject or "Operator decision"
+        )
         return store.decide(
             self.home,
             data["root"],
