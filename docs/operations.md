@@ -222,6 +222,44 @@ carrying `id`, `lane`, `lanes`, `reasons`, `title`, `why`, `paths`, `created`,
 `kind: followup_accept` with the same fields plus `issue`, `milestone`,
 `offered_to`, `offer_id` and `repeated`.
 
+### Working across linked repositories
+
+One change sometimes spans a sibling repository, such as an API and the web
+client that calls it. Link the sibling once from the project's checkout, then
+claim with `--link` so the same lane gets a worktree there:
+
+```bash
+agent-parley link add ../web --name web
+agent-parley issue claim 42 --link web
+```
+
+The worktree is created under the project state directory, never inside
+either repository, on the lane's own branch. A new lane branch starts at the
+sibling's copy of the project's integration branch when it has one, else at
+`origin/HEAD`, else at a local `main` or `master`, never at whatever branch
+the sibling checkout has checked out. The lane keeps its provider, credential
+and process; only its set of worktrees grows. A Claude Code or Codex lane is
+launched with `--add-dir` for each linked worktree, so writes there meet the
+client's usual rules rather than a prompt or sandbox refusal per write; no
+approval or sandbox setting is bypassed. A worktree a claim adds mid-session
+is named at the lane's next launch. `status` prints a `worktrees:` line for such a lane, and
+`top --json` and `participant show` carry `linked_worktrees`.
+
+Reservations stay advisory and per repository: a lane reserves
+`web//src/app.ts` for the sibling and `src/app.ts` for the primary
+repository, and the two never conflict. The lifecycle hooks enforce the lane
+branch in every worktree of the lane, including `git -C <worktree>` commands
+run from the primary one. `decide --link web` marks a decision as concerning
+the sibling.
+
+`issue resolve` reads the forge once per repository: a linked repository
+whose lane branch carries commits past its recorded base needs its own lane
+branch pull request. Releasing the claim keeps the worktree for the next
+claim; `link remove web` removes every lane's worktree there and keeps the
+branches. Retiring a lane, by the operator or by the lane itself, removes its
+linked worktrees under the same rule as its own: a clean one goes, and one
+with changes or ignored files stays with its paths reported as `web//path`.
+
 ### Reading status
 
 `status` answers who is working on which open issue and whether it moves. Run
