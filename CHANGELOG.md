@@ -57,46 +57,6 @@
 - Follow-ups no longer duplicate across lanes, wait when the forge is down and report expiry (#1411).
 - The operations, monitoring and coordination guides describe notification retries and the webhook transport as the code does, list `blueprint blocked` problems, and cover converging lanes, polling lanes and symbol reservations (#1465).
 
-Closes #1377
-Closes #1378
-Closes #1379
-Closes #1380
-Closes #1381
-Closes #1382
-Closes #1383
-Closes #1384
-Closes #1385
-Closes #1386
-Closes #1387
-Closes #1388
-Closes #1389
-Closes #1390
-Closes #1391
-Closes #1392
-Closes #1393
-Closes #1394
-Closes #1395
-Closes #1396
-Closes #1399
-Closes #1400
-Closes #1401
-Closes #1402
-Closes #1403
-Closes #1404
-Closes #1405
-Closes #1406
-Closes #1407
-Closes #1408
-Closes #1409
-Closes #1410
-Closes #1411
-Closes #1414
-Closes #1415
-Closes #1416
-Closes #1417
-Closes #1459
-Closes #1465
-
 Closed issues: [milestone 0.23.0](https://github.com/suneel944/agent-parley/issues?q=is%3Aissue%20is%3Aclosed%20milestone%3A0.23.0).
 
 ## [0.22.0](https://github.com/suneel944/agent-parley/compare/v0.21.0...v0.22.0) (2026-11-05)

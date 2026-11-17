@@ -857,6 +857,26 @@ def test_milestone_squash_renders_its_sections_and_upgrade_notes(
     assert notes.endswith(f"{release.REPOSITORY_URL}/issues?q={query}).\n")
 
 
+def test_closing_lines_inside_the_notes_section_are_left_out(
+    counted_repo, local
+):
+    product_commit(
+        counted_repo,
+        "feat: deliver the 0.19.0 milestone (#1230)",
+        body=MILESTONE_BODY.replace(
+            "## Verification",
+            "Closes #1157\nCloses #1162\n\nRefs #1204, Fixes #1157\n\n"
+            "## Verification",
+        ),
+    )
+    changelog = release.changelog_entry(counted_repo, TAG, VERSION, "0.1.2")
+    assert "Closes #" not in changelog
+    assert "Refs #" not in changelog
+    assert "Fixes #" not in changelog
+    assert "\n\n\n" not in changelog.split("### Security", 1)[1]
+    assert "medians are omitted (#1204).\n\n### Upgrade notes" in changelog
+
+
 def test_milestone_squash_beside_plain_commits_keeps_their_lines(
     counted_repo, local
 ):
