@@ -627,7 +627,7 @@ condition, that count, its age and what clears it:
 | `inactive` | A live lane published no native activity inside `inactive_after`. | Whatever the lane's state allows, from the remedy table below. |
 | `wake attention` | The service's last wake of the lane was refused because operator input is pending, the client is waiting for a native approval or the previous accepted wake produced no checkpoint, or the wake needs operator attention; or the wake was not delivered, which the row states as `wake attempted at T, not delivered:` and its reason, such as a client started outside `agent-parley run` with no wake socket. | Whatever the lane's state allows, from the remedy table below. |
 | `waiting on approval` | The lane's client has waited on a native tool approval prompt for longer than `--ack-after`, and its session process is not known to be gone. | Answer the prompt in the lane's own terminal. |
-| `held by a native dialog` | The launcher escalated a native dialog it could not answer and the lane's session process is not known to be gone; the row names the dialog and the options it offers. Once that process is gone the row disappears and the lane carries only the stopped remedy. | Answer its decision from the chat, or the prompt in the lane's own terminal. |
+| `held by a native dialog` | The launcher escalated a native dialog it could not answer and the lane's session process is not known to be gone; the row names the dialog and the options it offers. Once that process is gone the row disappears and the lane carries only the stopped remedy. | Answer its decision from the chat or with `agent-parley decision answer`, or the prompt in the lane's own terminal. |
 | `second session` | Another client process is sending hooks under the lane's identity; its events are ignored. The row names its session and process. | Stop that process, or run it outside the lane's worktree. |
 | `overdue claim` | One or more held issues are past their recorded deadline. A claim whose current generation reported ready or was verified complete is never overdue. | `agent-parley issue release NUMBER` for the oldest, named in the row. |
 | `claims over cap` | A lane holds more claims than `max_claims_per_lane`, from a ledger written before every ownership path was capped or a cap lowered after the claims were taken. The count is the excess. | `agent-parley issue release NUMBER` for the highest-numbered claim, named in the row, or an offer to a peer. |
@@ -2088,7 +2088,7 @@ Every document carries the same envelope:
 | Field | Meaning |
 | --- | --- |
 | `schema` | `agent-parley/read/v1`, the version of this contract. |
-| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `report_show`, `report_review`, `report_usage`, `plan`, `plan_diff`, `plan_proposals`, `plan_revision`, `approval`, `verify`, `init`, `pool`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials`, `credentials_show`, `issue_resolve`, `issue_recover` or `error`. |
+| `kind` | The command reported: `status`, `top`, `metrics`, `version`, `issues`, `issue`, `issue_next`, `issue_match`, `participants`, `participant`, `history`, `mail_thread`, `mail_show`, `mail_search`, `mail_list`, `mail_pending`, `mail_cancel`, `decide`, `decision_list`, `decision_open`, `decision_answer`, `report_show`, `report_review`, `report_usage`, `plan`, `plan_diff`, `plan_proposals`, `plan_revision`, `approval`, `verify`, `init`, `pool`, `branch`, `forge`, `deadlines`, `budget`, `state`, `setup`, `up`, `down`, `run`, `say`, `approve`, `reject`, `problems`, `problems_ack`, `doctor`, `notify`, `gc`, `resources`, `providers`, `provider`, `credentials`, `credentials_show`, `issue_resolve`, `issue_recover` or `error`. |
 | `generated_at` | RFC 3339 UTC instant the snapshot was taken. |
 
 Repeated rows are arrays rather than objects keyed by name, so a reader pages
@@ -3203,6 +3203,15 @@ of the passcode is held, compared in constant time, and never written to state
 or logs. The reader refuses to start when the passcode is unset or too short,
 and `status` prints that fault on its `Inbound:` line and under `inbound` in
 `status --json`.
+
+An operator without a chat channel answers from the command line.
+`agent-parley decision open` lists the project's open decisions with their
+IDs, lanes, questions and options, and `agent-parley decision answer ID
+OPTION [NOTE]` answers one through the same path as a typed chat answer,
+recorded as answered by `cli`: the same refusals, the same supervisor mail to
+the lane, the same quoted note. An option that takes a `confirm` tap in the
+chat takes `--yes` there; without it nothing is recorded and the command
+exits 1.
 
 A native dialog the launcher escalates, such as a tool permission prompt, a
 hook trust review or the client's question picker, is recorded as a decision

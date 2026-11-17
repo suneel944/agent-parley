@@ -370,6 +370,7 @@ REPO_HELP = (
     "Repository root or any of its worktrees; defaults to the current "
     "directory."
 )
+RUN_TASK = "Check shared coordination state and await my task."
 RETRY_HELP = (
     "Idempotency key. Retry a failed command with the key it first used and "
     "the repeat returns the first result without applying the change again. "
@@ -955,6 +956,106 @@ def decision_lines(page: dict) -> list[str]:
     return lines
 
 
+def waiting_decisions(directory: Path) -> list[dict]:
+    """Reads the decisions one project holds open for the operator.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        One row per open decision, oldest first, with its identifier, lane,
+        kind, question, offered options, the options that take a
+        confirmation, and when it opened.
+    """
+    from agent_parley import decisions
+
+    return [
+        {
+            "id": record["id"],
+            "lane": record.get("lane") or "",
+            "kind": record.get("kind") or "",
+            "question": record.get("question") or "",
+            "options": decisions.options(record),
+            "confirm": [
+                option
+                for option in decisions.options(record)
+                if decisions.confirming(record, option)
+            ],
+            "created_at": views.timestamp(record.get("created")),
+        }
+        for record in decisions.list_open(directory)
+    ]
+
+
+def waiting_lines(rows: Sequence[dict]) -> list[str]:
+    """Formats the open decisions as an operator answers them.
+
+    Args:
+        rows: Open decisions as `waiting_decisions` reports them.
+
+    Returns:
+        A heading line and an options line per decision, or one sentence
+        saying none is open.
+    """
+    if not rows:
+        return ["No decision is waiting on the operator."]
+    lines = []
+    for row in rows:
+        lines.append(
+            f"Decision {row['id']}  {row['lane'] or '-'}  {row['question']}"
+        )
+        offered = ", ".join(
+            f"{option} (needs --yes)" if option in row["confirm"] else option
+            for option in row["options"]
+        )
+        lines.append(f"  options: {offered}")
+    lines.append("Answer one with: agent-parley decision answer ID OPTION")
+    return lines
+
+
+def answered_decision(home: Path, args: argparse.Namespace) -> str:
+    """Answers one open decision from the command line.
+
+    The answer takes the chat's own path, so it is refused, confirmed,
+    recorded and handed to the waiting lane exactly as a typed chat answer
+    is, with ``cli`` as the one who answered.
+
+    Args:
+        home: Private bridge state root.
+        args: Parsed `decision answer` arguments.
+
+    Returns:
+        The line or JSON document reporting the answer.
+
+    Raises:
+        BridgeError: If the decision is unknown, no longer open or does not
+            offer the option, or the option takes a confirmation that
+            ``--yes`` did not give.
+    """
+    outcome, record = inbound.decide(
+        home, args.id, args.option, "cli", " ".join(args.note), args.yes
+    )
+    if outcome == inbound.CONFIRMING:
+        raise BridgeError(
+            f"Decision {args.id} option {args.option!r} takes a "
+            "confirmation; nothing was answered. Rerun with --yes to "
+            "answer it."
+        )
+    if args.json:
+        return views.render(
+            "decision_answer",
+            {
+                "id": record["id"],
+                "lane": record.get("lane") or "",
+                "answer": record["answer"],
+                "answered_by": record["answered_by"],
+                "note": record.get("note") or "",
+            },
+        )
+    lane = record.get("lane") or "no lane"
+    return f"Decision {record['id']} for {lane} answered {record['answer']}."
+
+
 def reported_lanes(report: dict) -> int:
     """Counts the lanes a narrowed status reading still holds."""
     return sum(len(project["participants"]) for project in report["projects"])
@@ -1163,6 +1264,8 @@ def lane_detail(record: dict, data: dict) -> None:
         print("    " + forecast.marker(conflicts))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
+    if mail.get("reserved_symbols"):
+        print("    Symbols reserved: " + ", ".join(mail["reserved_symbols"]))
     if topics := mail.get("unread_topics"):
         print(
             "    Unread by topic: "
@@ -3448,6 +3551,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "trial",
             "milestone",
             "followup",
             "mail",
@@ -4477,6 +4581,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     delivered.add_argument("--json", action="store_true", help=JSON_HELP)
+    compared = readings.add_parser(
+        "trials",
+        help=(
+            "Aggregate ended trial outcomes per provider: lanes kept and "
+            "released, wall time to ready and client-reported tokens."
+        ),
+    )
+    compared.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        default=0.0,
+        metavar="TIME",
+        help="Count only trials that ended at or after this instant or window.",
+    )
+    compared.add_argument("--json", action="store_true", help=JSON_HELP)
     verified = readings.add_parser(
         "verification",
         help=(
@@ -4814,7 +4934,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     run.add_argument(
         "participant",
+        nargs="?",
+        default="",
         help="Participant name; a new name creates its own worktree lane.",
+    )
+    run.add_argument(
+        "--lanes",
+        default="",
+        metavar="NAME[,NAME...]",
+        help=(
+            "Open each named lane in its own tmux window, each on a distinct "
+            "issue of --milestone; without tmux, print one run command per "
+            "lane."
+        ),
+    )
+    run.add_argument(
+        "--milestone",
+        default="",
+        metavar="TITLE",
+        help="Milestone whose issues --lanes claims, one per lane.",
     )
     run.add_argument(
         "--provider",
@@ -4844,7 +4982,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     run.add_argument(
         "--task",
-        default="Check shared coordination state and await my task.",
+        default=RUN_TASK,
         help=(
             "Opening prompt for the session, not an issue; use --issue to "
             "claim one."
@@ -5320,6 +5458,39 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         followup_parser.add_argument(
             "--json", action="store_true", help=JSON_HELP
         )
+    trying = commands.add_parser(
+        "trial",
+        help=(
+            "Run one issue side by side across provider lanes, compare them "
+            "with trial show ISSUE, keep one with trial keep ISSUE, or end "
+            "it keeping none with trial cancel ISSUE."
+        ),
+    )
+    trying.add_argument(
+        "target",
+        metavar="ISSUE|show|keep|cancel",
+        help="Issue number to start a trial of, or show, keep or cancel.",
+    )
+    trying.add_argument(
+        "issue",
+        nargs="?",
+        default="",
+        help="Issue number the show, keep or cancel reading names.",
+    )
+    trying.add_argument(
+        "--lanes",
+        default="",
+        metavar="A,B",
+        help="Comma-separated lanes to start the trial on, at least two.",
+    )
+    trying.add_argument(
+        "--lane",
+        default="",
+        metavar="NAME",
+        help="Lane whose branch trial keep keeps.",
+    )
+    trying.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    trying.add_argument("--json", action="store_true", help=JSON_HELP)
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -5744,7 +5915,8 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     decision = commands.add_parser(
         "decision",
         help=(
-            "Read the decisions recorded for this project; `decide` records "
+            "Read the decisions recorded for this project, or list and "
+            "answer the ones waiting on the operator; `decide` records "
             "a new one."
         ),
     )
@@ -5778,6 +5950,38 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     decision_list.add_argument("--json", action="store_true", help=JSON_HELP)
+    decision_open = decision_actions.add_parser(
+        "open",
+        help=(
+            "List the decisions waiting on the operator in this project, "
+            "with the ID and options `decision answer` takes."
+        ),
+    )
+    decision_open.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    decision_open.add_argument("--json", action="store_true", help=JSON_HELP)
+    decision_answer = decision_actions.add_parser(
+        "answer",
+        help=(
+            "Answer one open decision as a chat answer would; the lane "
+            "waiting on it is told."
+        ),
+    )
+    decision_answer.add_argument("id", help="Decision ID, as `open` lists.")
+    decision_answer.add_argument("option", help="One option it offers.")
+    decision_answer.add_argument(
+        "note",
+        nargs="*",
+        default=[],
+        help="Note the lane receives quoted, never as an instruction.",
+    )
+    decision_answer.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm an option that takes a confirmation.",
+    )
+    decision_answer.add_argument("--json", action="store_true", help=JSON_HELP)
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
@@ -7138,6 +7342,12 @@ def main() -> int:
                 print(json.dumps(reading, indent=2))
             else:
                 print(metrics.describe_throughput(reading), end="")
+        elif args.command == "metrics" and args.reading == "trials":
+            reading = metrics.trials(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_trials(reading), end="")
         elif args.command == "metrics" and args.reading == "verification":
             outcomes = verification.reading(bridge.home, args.window)
             if args.json:
@@ -7287,6 +7497,43 @@ def main() -> int:
             if used:
                 with contextlib.suppress(BridgeError, OSError):
                     projects.touch(bridge.home, used)
+            if args.lanes or args.milestone:
+                from agent_parley import lanes_launch
+
+                if args.participant or not (args.lanes and args.milestone):
+                    parser.error("run --lanes needs --milestone, no NAME.")
+                lane_names = [name.strip() for name in args.lanes.split(",")]
+                if not all(lane_names):
+                    parser.error("run --lanes needs a name between commas.")
+                ignored = [
+                    flag
+                    for flag, given in (
+                        ("--provider", args.provider),
+                        ("--credentials", args.credentials),
+                        ("--issue", args.issue),
+                        ("--task", args.task != RUN_TASK),
+                        ("--resume", args.resume),
+                        ("--blueprint", args.blueprint),
+                    )
+                    if given
+                ]
+                if ignored:
+                    parser.error(
+                        f"run --lanes cannot take {', '.join(ignored)}."
+                    )
+                opened = lanes_launch.open_lanes(
+                    bridge, args.repo.resolve(), lane_names, args.milestone
+                )
+                for lane in opened["lanes"]:
+                    if lane["reason"]:
+                        print(
+                            f"{lane['participant']}: {lane['reason']}",
+                            file=sys.stderr,
+                        )
+                print("\n".join(lanes_launch.lines(opened)))
+                return 1 if lanes_launch.failed(opened) else 0
+            if not args.participant:
+                parser.error("run needs a participant NAME, or --lanes.")
             status = bridge.launch(
                 args.participant,
                 args.repo.resolve(),
@@ -7446,6 +7693,58 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "trial":
+            from agent_parley import trials
+
+            repo = args.repo.resolve()
+            if args.target in ("show", "keep", "cancel") and not args.issue:
+                parser.error(f"trial {args.target} needs an ISSUE.")
+            if args.target == "show":
+                compared = bridge.trial_show(repo, args.issue)
+                print(
+                    json.dumps(compared, indent=2)
+                    if args.json
+                    else trials.render(compared),
+                    end="\n" if args.json else "",
+                )
+            elif args.target == "keep":
+                if not args.lane:
+                    parser.error("trial keep needs --lane NAME.")
+                ended = bridge.trial_keep(repo, args.issue, args.lane)
+                print(
+                    json.dumps(ended, indent=2)
+                    if args.json
+                    else f"Kept {args.lane}'s branch for #{ended['issue']}; "
+                    "released "
+                    + ", ".join(
+                        sorted(
+                            name for name in ended["lanes"] if name != args.lane
+                        )
+                    )
+                    + "; no branch was deleted."
+                )
+            elif args.target == "cancel":
+                ended = bridge.trial_cancel(repo, args.issue)
+                print(
+                    json.dumps(ended, indent=2)
+                    if args.json
+                    else f"Cancelled the trial of #{ended['issue']}; released "
+                    + ", ".join(sorted(ended["lanes"]))
+                    + "; no branch was deleted."
+                )
+            else:
+                if args.issue:
+                    parser.error("trial ISSUE takes no second issue.")
+                if not args.lanes:
+                    parser.error("trial ISSUE needs --lanes A,B.")
+                begun = bridge.trial_start(repo, args.target, args.lanes)
+                print(
+                    json.dumps(begun, indent=2)
+                    if args.json
+                    else f"Trial of #{begun['issue']} started on "
+                    + ", ".join(sorted(begun["lanes"]))
+                    + f" from base {begun['base'][:12]}."
+                )
         elif args.command == "followup" and args.action == "list":
             suggested = bridge.followup_list(args.repo.resolve())
             print(
@@ -7799,6 +8098,16 @@ def main() -> int:
                 views.render("decide", recorded)
                 if args.json
                 else f"Recorded decision {recorded['id']}."
+            )
+        elif args.command == "decision" and args.action == "answer":
+            print(answered_decision(bridge.home, args))
+        elif args.command == "decision" and args.action == "open":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            waiting = waiting_decisions(directory)
+            print(
+                views.render("decision_open", {"decisions": waiting})
+                if args.json
+                else "\n".join(waiting_lines(waiting))
             )
         elif args.command == "decision":
             decisions = bridge.decisions(

@@ -1553,7 +1553,7 @@ class StatusMixin(BridgeCore):
         """
         import sqlite3
 
-        from agent_parley import approvals, lifecycle, waits
+        from agent_parley import approvals, lifecycle, trials, waits
         from agent_parley.cli import (
             activity,
             budgets,
@@ -1793,6 +1793,11 @@ class StatusMixin(BridgeCore):
                 )
                 if record.get("owner") == agent
             ],
+            "trials": sorted(
+                int(number)
+                for number, record in ledger["issues"].items()
+                if trials.member(record, agent)
+            ),
             "idle": {
                 "stalled": stalled["stalled"],
                 "kind": stalled["kind"],
@@ -1904,6 +1909,7 @@ class StatusMixin(BridgeCore):
             "stale_reservations": mail.get("stale_reservations", 0),
             "stale_reservation_age": mail.get("stale_reservation_age", 0),
             "named_resources": list(mail.get("named_resources", [])),
+            "reserved_symbols": list(mail.get("reserved_symbols", [])),
             "queued_requests": frame["usage"].get(name, {}).get("queued", 0),
             "queued_by": list(
                 frame["usage"].get(name, {}).get("queued_by", [])
@@ -2287,11 +2293,13 @@ class StatusMixin(BridgeCore):
             every_claim: Also list claims whose work ended on the forge and
                 lanes folded out as long dead.
         """
-        from agent_parley import metrics, stagnation, supervision
+        from agent_parley import lanes_launch, metrics, stagnation, supervision
         from agent_parley.cli import supervision_failure, tables
 
         dormancy = " (dormant)" if project["dormant"] else ""
         print(f"\nProject: {project['root']}{dormancy}")
+        if attach := lanes_launch.attach_line(project["root"]):
+            print(attach)
         if stalled := stagnation.line(project.get("stagnation") or {}):
             print(stalled)
         if failing := project.get("supervision_error"):

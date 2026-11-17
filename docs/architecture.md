@@ -27,6 +27,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | `updates` | The once-a-day newer-release check `doctor` and `status` print on standard error: PyPI's `info.version` read in a daemon thread the caller waits on for at most 2 seconds in total, name resolution included, numeric release comparison, the upgrade command for the detected installer (uv tool, pipx or pip) and the `AGENT_PARLEY_NO_UPDATE_CHECK` opt-out; silent in a lane's own process (`AGENT_PARLEY_PARTICIPANT` set), so only the operator is told to upgrade; never called from a hook or the service poll |
 | `problems` | Every condition an operator should act on, derived from one status reading, each with a command to paste or the actor already handling it |
 | `launch` | Native launch of a lane: registration, the coordination protocol, the lane hooks and the supervised native client; with `run --issue`, the claim and the opening digest of that issue, its quoted text held to `ISSUE_BUDGET` (6000 bytes) from `forge.issue_details` |
+| `lanes_launch` | `run --lanes NAME,... --milestone TITLE`: registers each named lane as `run` does, claims one distinct open issue of the milestone per lane from its own `issue next` reading, and opens each lane's ordinary `run NAME --issue N` in its own detached tmux window of a session named after the project, or returns those commands for one terminal each when tmux is not on `PATH`; also the attach line `status` prints while that session runs |
 | `terminal` | The launcher-owned native pseudo-terminal, its private wake control socket, removal of wake sockets no launcher listens on, and the lane-first tab title |
 | `dialogs` | Recognition of the native dialogs held on that terminal, the answer the operator configured, capacity records and escalation, and the opt-in that carries approval of this bridge's own tools |
 | `worktrees` | Git in the base checkout, stashing its pending work before registration, lane initialization and the base verification gate |
@@ -55,8 +56,10 @@ when that policy records `auto`, and never on an agent's own authority.
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
 | `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
 | `rules` | The optional project policy file `policy.toml` in the private state directory: strict TOML parsing that refuses an unknown key, missing key or malformed file with its line, the `review`, `reviewer` and `test` rule kinds, the evidence they are judged on (the lane's diff since its fork from the base checkout's HEAD, its commit subjects, and returned review rounds), the gate `report` runs before a ready report and `issue resolve` before completing a claim, and the read-only `policy check`. A rule only refuses a coordination step; it never grants a permission, approves a native prompt or adds a bypass flag |
+| `trials` | Side-by-side trials of one issue across provider lanes: the running trial on the issue's ledger record, the one recorded exception to one owner per issue, its per-lane ready figures (diff since the recorded base, tests stated in the evidence, client-reported tokens, wall time), the comparison `trial show` prints, `trial keep` turning one lane into the ordinary owner and releasing the rest without touching a branch, and the ended-trial record `metrics trials` aggregates per provider |
 | `verification` | One outcome per returned review round and relayed child report, clean or a finding count, with the issue's cached forge labels and the verifying lane's provider and model, in `verification.jsonl`; the find rate per label and per provider and model that `metrics verification` prints and `issue next` cites; it reads no transcript and skips or adds no verification |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
+| `symbols` | The Python definitions an `Edit`, `MultiEdit` or `Write` changes, read with the standard library `ast` before and after the call, so the lane hook compares `path::Name` reservations by symbol; text that does not parse names nothing and the hook falls back to the path. Reservations stay advisory |
 | `observed` | The Git worktrees a lane's native client works in beside the lane, recorded from hook events on the lane's roster entry and reserved for it; never created, moved or pruned, and flagged outside `<lane>/.claude/worktrees/` |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
@@ -137,7 +140,8 @@ no webhook, and it carries two things. The `status` verb takes the filters
 answer to an open decision, given by a button tap, by `decide ID OPTION
 [NOTE]` or by a reply to a one-decision message, is written onto that
 decision's record and reaches the waiting lane as supervisor mail, which wakes
-it. An answer to a native dialog is not mailed: the launcher presses the
+it. `agent-parley decision answer` calls the same `inbound.decide` from the
+command line, so an operator without a chat answers through that one path. An answer to a native dialog is not mailed: the launcher presses the
 chosen option only while it still draws that same dialog. An irreversible
 option, or one that widens a permission, takes a confirming tap. No claim or
 handoff is made through it, a note reaches a lane only quoted, and no chat
@@ -1064,6 +1068,7 @@ Files in `projects/<key>/`, grouped the same way:
 | `followups` | `followups.json` under `followups.lock` |
 | `reviews` | `reviews.json` under `reviews.lock` |
 | `rules` | `policy.toml`, written by `policy import` and only read otherwise |
+| `trials` | the running trial on its issue's `issues.json` record; ended trials in `trials.json`, both under `issues.lock` |
 | `verification` | `verification.jsonl`, a line log bounded by `state.trim_log`, under `verification.lock` |
 | `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
