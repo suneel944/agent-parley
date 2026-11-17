@@ -189,7 +189,8 @@ CREATE TABLE IF NOT EXISTS messages (
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
  ack_deadline_ts TEXT, claim_id TEXT, decision INTEGER NOT NULL DEFAULT 0,
  topic TEXT NOT NULL DEFAULT '', feed INTEGER NOT NULL DEFAULT 0,
- ack_retired_ts TEXT, UNIQUE(sender_id,dedup_key));
+ ack_retired_ts TEXT, decision_superseded_ts TEXT,
+ decision_superseded_reason TEXT, UNIQUE(sender_id,dedup_key));
 CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
  message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -434,6 +435,10 @@ def initialize(home: Path) -> None:
     message as ordinary mail, so nothing a lane sent in private becomes
     project-wide by being upgraded.
 
+    Upgrading a store written before decisions could be superseded adds the
+    marker and its reason to each message, and every stored decision reads
+    as standing.
+
     Upgrading a store written before leases recorded their declared window
     backfills that window from the distance between a lease's creation and
     its deadline, so a renewal restores what its holder asked for rather
@@ -485,6 +490,7 @@ def initialize(home: Path) -> None:
                 _add_ack_deadline(db)
                 _add_ack_retirement(db)
                 _add_decision_flag(db)
+                _add_decision_supersession(db)
                 _add_reservation_created(db)
                 _rebuild_reservations(db)
                 _add_claim_correlation(db)
@@ -555,6 +561,28 @@ def _add_decision_flag(db: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS decisions ON messages(project_id,id) "
         "WHERE decision=1"
     )
+
+
+def _add_decision_supersession(db: sqlite3.Connection) -> None:
+    """Adds the time and reason a recorded decision was superseded.
+
+    Rewinding a lane to a checkpoint marks the decisions it recorded after
+    that checkpoint as superseded, keeping their text in the log. Both
+    columns are additive and nullable: a decision stored before the upgrade
+    reads as standing.
+
+    Args:
+        db: Open upgrade transaction owned by the caller.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+    if "decision_superseded_ts" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN decision_superseded_ts TEXT"
+        )
+    if "decision_superseded_reason" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN decision_superseded_reason TEXT"
+        )
 
 
 def _add_claim_correlation(db: sqlite3.Connection) -> None:
@@ -2051,6 +2079,15 @@ def _decisions(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         "index": index,
     }
     messages = _bounded(result, rows[:limit])
+    for message in messages:
+        marked = db.execute(
+            "SELECT decision_superseded_ts,decision_superseded_reason "
+            "FROM messages WHERE id=? AND decision_superseded_ts IS NOT NULL",
+            (message["id"],),
+        ).fetchone()
+        if marked:
+            message["superseded_ts"] = marked[0]
+            message["superseded_reason"] = marked[1] or ""
     result["messages"] = messages
     result["has_more"] = len(rows) > len(messages)
     return result
@@ -4705,6 +4742,91 @@ def search_decisions(
         return _decisions(
             db, actor, {"query": query, "limit": limit, "since": since}
         )
+
+
+LANE_DECISIONS = (
+    "SELECT m.id,substr(m.subject,1,160) AS subject,m.created_ts,"
+    "m.decision_superseded_ts,m.decision_superseded_reason FROM messages m "
+    "JOIN agents a ON a.id=m.sender_id JOIN projects p ON p.id=m.project_id "
+    "WHERE p.human_key=? AND a.name=? AND m.decision=1 "
+    "AND m.created_ts>datetime(?,'unixepoch') "
+)
+
+
+def _lane_decision(row: sqlite3.Row) -> dict:
+    """Shapes one decision a lane recorded for an operator reading."""
+    return {
+        "id": row["id"],
+        "subject": row["subject"],
+        "created_ts": row["created_ts"],
+        "superseded_ts": row["decision_superseded_ts"],
+        "superseded_reason": row["decision_superseded_reason"] or "",
+    }
+
+
+def lane_decisions(
+    home: Path, root: str, name: str, since: float
+) -> list[dict]:
+    """Lists the decisions one lane recorded after an instant, oldest first.
+
+    The store keeps creation times to the second, so a decision recorded
+    in the same second as ``since`` reads as recorded before it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own decisions are listed.
+        since: Unix time the decisions must follow.
+
+    Returns:
+        Each decision's identifier, subject, creation time and, where it
+        was superseded, the time and reason. No store reads as none.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home) as db:
+        rows = db.execute(
+            LANE_DECISIONS + "ORDER BY m.id", (root, name, int(since))
+        ).fetchall()
+    return [_lane_decision(row) for row in rows]
+
+
+def supersede_decisions(
+    home: Path, root: str, name: str, since: float, reason: str
+) -> list[dict]:
+    """Marks the decisions one lane recorded after an instant as superseded.
+
+    Only decisions still standing are marked, in the transaction that reads
+    them, so a repeated call marks nothing twice. Every decision keeps its
+    text and stays in the log; the mark tells a reader not to act on it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own decisions are marked.
+        since: Unix time the decisions must follow.
+        reason: Why the decisions stopped standing.
+
+    Returns:
+        The decisions this call marked, oldest first.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home, write=True) as db:
+        rows = db.execute(
+            LANE_DECISIONS
+            + "AND m.decision_superseded_ts IS NULL ORDER BY m.id",
+            (root, name, int(since)),
+        ).fetchall()
+        for row in rows:
+            db.execute(
+                "UPDATE messages SET decision_superseded_ts=CURRENT_TIMESTAMP,"
+                "decision_superseded_reason=? WHERE id=?",
+                (reason[:MAX_SUPERSEDE_REASON], row["id"]),
+            )
+    return [
+        {**_lane_decision(row), "superseded_reason": reason} for row in rows
+    ]
 
 
 def decide(home: Path, root: str, subject: str, body: str, key: str) -> dict:
