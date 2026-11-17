@@ -554,7 +554,10 @@ def body_sections(message: str) -> tuple[list[str], list[str]]:
     The subsections keep their `### ` level, which matches the typed
     sections of a changelog entry, and stop at the next `## ` heading so
     they can never split the entry. The template checklist is not an
-    upgrade note and is left out.
+    upgrade note and is left out. Lines holding only issue references,
+    such as `Closes #N`, close issues on the forge rather than describe a
+    change, so they are left out too, along with the blank lines they
+    leave behind.
 
     Args:
         message: Full commit message.
@@ -573,6 +576,10 @@ def body_sections(message: str) -> tuple[list[str], list[str]]:
         if text.startswith("## "):
             section = text[3:].strip().lower()
         elif section == "problem and result":
+            if text and not ISSUE_REFERENCE.sub("", text).strip(" ,"):
+                continue
+            if notes and not text and not notes[-1]:
+                continue
             if notes or text.startswith("### "):
                 notes.append(text)
         elif section == "compatibility and risks" and (
