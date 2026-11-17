@@ -162,6 +162,15 @@ For a pinned, checksummed install, take a wheel from
 completion, upgrades and the supported platforms are in
 [Operations](https://github.com/suneel944/agent-parley/blob/main/docs/operations.md#install-and-upgrade).
 
+`agent-parley doctor` and `agent-parley status` ask PyPI for the latest
+release at most once a day and, when the installed launcher is older, print
+one line on standard error with both versions and the upgrade command for your
+installer (`uv tool upgrade agent-parley`, `pipx upgrade agent-parley` or
+`pip install -U agent-parley`). An unreachable index prints nothing, and the
+request gives up after two seconds. A lane agent running `status` never sees
+the line, so only you decide when to upgrade.
+`AGENT_PARLEY_NO_UPDATE_CHECK=1` turns the check off.
+
 ## Run it
 
 Not sure where to start? Run `agent-parley` with no arguments in the
@@ -339,7 +348,17 @@ lane setup.
   the transcript, and merges the branch with Git. A child cannot spawn
   children; three per parent and eight per project at most. A child is
   retired once it reports, or after four hours without a report, and either
-  outcome wakes a parent that is waiting on it.
+  outcome wakes a parent that is waiting on it. To run a child
+  on another tier, open the body with `model: NAME` and `effort: LEVEL`
+  lines. Claude, Codex, Gemini, Copilot and OpenCode take `model:`; only
+  Claude (`low` to `max`) and Codex (`none` to `xhigh`) take `effort:`. A
+  setting the CLI cannot honour, an empty value or a repeated line refuses
+  the spawn with the reason. Without them the child runs on the provider
+  default. `top`, `participant show` and the child report name the tier,
+  and `quota show` splits a Claude credential's window use by model. A
+  worktree the lane's own client makes is recorded, never created, and
+  `top` lists it with its branch and base, flagged when it lies outside
+  `.claude/worktrees/`.
 - **Lanes sharing a credential park before its quota runs out.**
   `agent-parley quota set NAME --hours H --tokens N [--threshold F]` records
   the plan's window; `quota show` prints the remaining headroom. Near the
