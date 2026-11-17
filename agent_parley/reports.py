@@ -143,6 +143,10 @@ class ReportsMixin(BridgeCore):
         missing criterion, before any attachment is stored. The matched lines
         are recorded on the claim's execution as ``criteria_evidence``.
 
+        A ready report is also refused while a project policy rule that
+        applies to ``ready`` fails (`rules.gate`), naming each failed rule
+        and the evidence it lacks. A project without a policy is unaffected.
+
         Args:
             repo: Assigned agent worktree.
             outcome: Partial, blocked, ready-for-review, or waiting state.
@@ -249,6 +253,18 @@ class ReportsMixin(BridgeCore):
                 + (f" and {more} more" if more > 0 else "")
                 + ". Commit or revert them first, so the evidence describes "
                 "the recorded commit."
+            )
+        if outcome == "ready":
+            from agent_parley import rules
+
+            rules.gate(
+                directory,
+                Path(data["root"]),
+                lane,
+                event=rules.READY,
+                builder=agent,
+                issue=str(claim["issue"] or ""),
+                claim=claim["claim_id"] or "",
             )
         stated = (
             issues.snapshot(directory)["issues"]
