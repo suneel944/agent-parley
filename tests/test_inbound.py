@@ -2,6 +2,7 @@
 
 import io
 import json
+import sys
 import threading
 import time
 from pathlib import Path
@@ -561,6 +562,119 @@ def test_a_malformed_or_closed_typed_answer_is_refused_in_the_reply(
         message(f"{PASSCODE} decide {record['id']} accept"),
     )
     assert "already closed" in replies(calls)[-1]
+    assert mail == []
+
+
+def deciding(bridge, monkeypatch, capsys, *arguments):
+    """Runs one ``decision`` command and returns its exit and both streams."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agent-parley", "--home", str(bridge.home), "decision", *arguments],
+    )
+    status = cli.main()
+    printed = capsys.readouterr()
+    return status, printed.out, printed.err
+
+
+def test_the_command_line_lists_and_answers_a_decision_like_the_chat(
+    bridge, paired, monkeypatch, capsys, mail
+):
+    record = waiting(paired)
+    status, out, _ = deciding(
+        bridge, monkeypatch, capsys, "open", "--repo", paired["lanes"]["codex"]
+    )
+    assert status == 0
+    assert out.splitlines()[:2] == [
+        f"Decision {record['id']}  codex  A handoff offer is waiting",
+        "  options: accept, decline",
+    ]
+    status, out, _ = deciding(
+        bridge,
+        monkeypatch,
+        capsys,
+        "answer",
+        record["id"],
+        "decline",
+        "not",
+        "now",
+    )
+    assert status == 0
+    assert out == f"Decision {record['id']} for codex answered decline.\n"
+    stored = decisions.find(bridge.home, record["id"])[1]
+    assert stored["state"] == decisions.ANSWERED
+    assert stored["answered_by"] == "cli"
+    assert stored["note"] == "not now"
+    assert mail[0]["name"] == "codex"
+    assert mail[0]["key"] == f"decision:{record['id']}"
+    assert "by cli" in mail[0]["body"]
+    assert "> not now" in mail[0]["body"]
+    status, out, _ = deciding(
+        bridge, monkeypatch, capsys, "open", "--repo", paired["lanes"]["codex"]
+    )
+    assert out == "No decision is waiting on the operator.\n"
+
+
+def test_the_command_line_answers_an_irreversible_option_only_with_yes(
+    bridge, paired, monkeypatch, capsys, mail
+):
+    record = waiting(paired, decisions.IRREVERSIBLE)
+    status, out, _ = deciding(
+        bridge,
+        monkeypatch,
+        capsys,
+        "open",
+        "--repo",
+        paired["lanes"]["codex"],
+        "--json",
+    )
+    listed = json.loads(out)["decisions"][0]
+    assert listed["confirm"] == ["accept", "decline"]
+    status, _, err = deciding(
+        bridge, monkeypatch, capsys, "answer", record["id"], "accept"
+    )
+    assert status == 1
+    assert "takes a confirmation" in err
+    assert "--yes" in err
+    assert decisions.find(bridge.home, record["id"])[1]["state"] == (
+        decisions.OPEN
+    )
+    assert mail == []
+    status, out, _ = deciding(
+        bridge,
+        monkeypatch,
+        capsys,
+        "answer",
+        record["id"],
+        "accept",
+        "--yes",
+        "--json",
+    )
+    assert status == 0
+    document = json.loads(out)
+    assert document["kind"] == "decision_answer"
+    assert document["answer"] == "accept"
+    assert document["answered_by"] == "cli"
+    assert len(mail) == 1
+
+
+def test_the_command_line_refuses_an_unknown_decision_or_option(
+    bridge, paired, monkeypatch, capsys, mail
+):
+    record = waiting(paired)
+    status, _, err = deciding(
+        bridge, monkeypatch, capsys, "answer", "nope", "accept"
+    )
+    assert status == 1
+    assert "No decision nope." in err
+    status, _, err = deciding(
+        bridge, monkeypatch, capsys, "answer", record["id"], "maybe"
+    )
+    assert status == 1
+    assert "offers accept, decline; not 'maybe'" in err
+    assert decisions.find(bridge.home, record["id"])[1]["state"] == (
+        decisions.OPEN
+    )
     assert mail == []
 
 

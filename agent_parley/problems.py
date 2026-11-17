@@ -2441,8 +2441,9 @@ def _checks_failed_rows(directory: Path, root: str, now: float) -> list[dict]:
                     f"{reading.get('exhausted')} CI rounds: {failing}",
                     "operator took over the branch"
                     if reading.get("taken_over")
-                    else "answer the decision: grant one more round or "
-                    "take over; the lane stops pushing",
+                    else "answer the decision (agent-parley decision open): "
+                    "grant one more round or take over; the lane stops "
+                    "pushing",
                     _age(reading.get("red_since"), now),
                     str(reading.get("lane") or ""),
                     root,
