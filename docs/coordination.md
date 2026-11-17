@@ -63,6 +63,25 @@ agent-parley issue next --limit 3
 agent-parley issue claim 42
 ```
 
+What an issue unblocks counts too. The reading builds a dependency graph of
+the open issues of each milestone from `Blocked by #N` and `Depends on #N`
+lines in issue bodies (lines inside code blocks and inline code are ignored),
+from the forge's issue relationships where the forge reports them, and from
+the ledger's `issue block` records. An issue that transitively unblocks more
+open issues, then one that starts a longer chain, ranks ahead of one that does
+not, and its reason says `critical path: unblocks N open issues, longest chain
+M`. An issue that still waits on an open issue of the milestone is not offered,
+as one the ledger blocks is not. An issue with no edge ranks as it always did. Issues that wait on each
+other can never start: the cycle is named with its members, its edges are
+ignored in the ranking, and `issue next` prints a `Dependency cycle` line.
+`agent-parley milestone path` prints the longest chain of the active milestone
+(or `--milestone TITLE`), blocker first, with each issue's state and holder. Both
+read the ledger and the cached forge reading only and claim nothing.
+
+```sh
+agent-parley milestone path
+```
+
 The reading before that one is whether the work is recorded at all.
 `agent-parley issue match "GOAL"` lists the open issues whose recorded title or
 forge labels share subject words with what the lane intends to do, marks the
@@ -158,6 +177,15 @@ causes deny a tool call:
 Every other hazard is a notice. Otherwise a call that only reads, and Agent
 Parley's own commands, are never refused for coordination.
 
+Two lanes that refuse each other's reservation of one path four times inside
+30 minutes are escalated once. Each lane receives one message asking it to
+finish or stash its edit on that path and wait. The pair appears under needs
+input in `status` and `top` with both claims and the path, and the record is
+kept in the store and printed by `issue show` for both issues. It is not
+raised again for that path until the operator hands the work to one lane with
+`issue offer` or frees it with `issue release`. Reservations stay advisory:
+this adds a notice and a decision, never a lock.
+
 Overlap is shown before the work, not found as a merge conflict after it.
 A write to a file a peer reserves, even shared, or that a peer's open pull
 request changes, carries a notice naming that reservation or pull request and
@@ -189,7 +217,10 @@ it files no issue, offers nothing and starts no lane, so the lane keeps the
 work it holds and its scope does not grow. The result lists the open issues
 and claims the title may duplicate, matched on shared title words against the
 ledger's live claims and the open issues supervision last read from the forge.
-A repeat of the same title from the same lane returns the recorded suggestion.
+A repeat of a pending title, from the same lane or another, returns the
+recorded suggestion and adds the lane to its `lanes`. When the cached forge
+reading is missing or stale, the result says `forge_checked: false` with a
+note rather than reporting no duplicates silently.
 
 Only the operator turns a suggestion into work. `agent-parley followup list`
 shows the pending ones with their duplicates, and `agent-parley followup
@@ -375,7 +406,19 @@ cloned or initialized on a case-insensitive file system, such as default macOS).
 Then `README.md` and `readme.md` overlap, `src/` covers `SRC/x.py`, and a write
 through a lane path spelled in another case is still checked against
 reservations; named resources stay exact. A manifest written before the field
-existed keeps exact comparison. A granted reservation
+existed keeps exact comparison.
+
+A key can also name one Python function or class as `PATH::NAME`, such as
+`src/store.py::Store.claim`, so two lanes can work in one file. A path
+reservation covers every symbol in its file, a class covers its methods, and
+two different symbols in one file do not conflict. The edit hook parses the
+file before and after an `Edit`, `MultiEdit` or `Write` with the standard
+library `ast` module and compares the definitions the change touches; a change
+at module level touches the whole file. A file that does not parse is compared
+by path, and a parse failure never refuses the edit. Other languages use path
+reservations.
+
+A granted reservation
 also carries a `forecast`: the files that changed together with a reserved path
 in at least three of the base checkout's last 500 commits and that a peer holds
 right now, each with the peer and the count, so the lane can renegotiate or
@@ -530,10 +573,12 @@ merge or pull request.
 ## No lane waits for a human to give it something to do
 
 When a lane holds no claim, its next checkpoint carries the unclaimed work no
-dependency blocks — the issues other lanes wait on first — and names the peers
-holding more than one claim. When a lane holds several claims and a peer reads
-`idle` past the inactivity threshold, that lane is told which peer could take
-one. Every offer is checked first against what the host can read without asking
+dependency blocks and no pending offer reserves — the issues other lanes wait on
+first — and names the peers holding more than one claim. A lane whose session
+stopped or died and that holds no claim is offered the same work, and the wake
+resumes it on that offer. When a lane holds several claims and a peer reads
+`idle` past the stall interval (`stalled_after`), that lane is told which peer
+could take one. A retired lane is never named as that peer. Every offer is checked first against what the host can read without asking
 a vendor: the session process, the lane's own client records for a recent
 rate-limit or usage-window refusal, the worktree, and the acknowledgements it
 owes. Acknowledgement debt is suspended while the lane's state record has held

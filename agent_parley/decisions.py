@@ -14,7 +14,8 @@ did; a refused or abandoned send is retried with a growing backoff on the next
 supervision poll, on the transports still missing only, so a short-lived hook
 that records a decision and exits at once still reaches the operator and a
 healthy transport never repeats a decision while another one fails. Retries
-stop after `MAX_ATTEMPTS`, with one lane event saying so. A
+continue at the backoff ceiling until the decision is answered or expires;
+the send that reaches `MAX_ATTEMPTS` records one lane event saying so. A
 sender leases the decisions it is about to send, so two processes flushing at
 once do not both send them. The decisions one flush finds due go out
 together, as one digest message carrying one inline keyboard row per
@@ -214,6 +215,7 @@ def open_or_refresh(
     confirm: Sequence[str] = (),
     ttl: float = DEFAULT_TTL,
     now: float = 0.0,
+    keep_answered: bool = False,
 ) -> dict:
     """Opens the decision one situation asks for, or refreshes the open one.
 
@@ -223,6 +225,13 @@ def open_or_refresh(
     expired opens a fresh one under the same identifier with a new random
     occurrence nonce, so a button or reply posted for the earlier occurrence
     no longer answers it.
+
+    A caller that observes a lasting condition on every poll passes
+    ``keep_answered``: an answer not yet carried out then stays answered
+    while the condition lasts, and the caller closes it with `close` once
+    the condition clears, so a later recurrence asks afresh. A caller that
+    observes discrete events keeps the default, so each new event after an
+    answer is asked about again.
 
     Args:
         directory: Private project state directory.
@@ -240,9 +249,12 @@ def open_or_refresh(
             decision is reversible, such as one that widens a permission.
         ttl: Seconds the decision stays open unless observed again.
         now: Unix time; the clock when zero.
+        keep_answered: Keep an answered decision not yet carried out
+            instead of opening a fresh occurrence.
 
     Returns:
-        The open decision record.
+        The open decision record, or the answered one ``keep_answered``
+        kept.
 
     Raises:
         BridgeError: If no option is given, the recommendation is not one of
@@ -265,6 +277,13 @@ def open_or_refresh(
         if record and record.get("state") == OPEN:
             record["refreshed"] = stamp
             record["expires"] = stamp + ttl
+        elif (
+            record
+            and keep_answered
+            and record.get("state") == ANSWERED
+            and not record.get("applied")
+        ):
+            return dict(record)
         else:
             record = {
                 "id": name,
@@ -335,23 +354,43 @@ def find(home: Path, name: str) -> tuple[Path, dict]:
     raise BridgeError(f"No decision {name}.")
 
 
-def list_open(directory: Path, now: float = 0.0) -> list[dict]:
+def _held(record: Mapping[str, object]) -> bool:
+    """Reports whether an answered decision still waits to be carried out.
+
+    Args:
+        record: Decision record.
+
+    Returns:
+        True when the decision is answered and its answer was not applied.
+    """
+    return record.get("state") == ANSWERED and not record.get("applied")
+
+
+def list_open(
+    directory: Path, now: float = 0.0, answered: bool = False
+) -> list[dict]:
     """Lists the decisions still waiting on an answer, oldest first.
 
     Args:
         directory: Private project state directory.
         now: Unix time to judge expiry by; the clock when zero.
+        answered: Also list answered decisions not yet carried out, which a
+            poller that keeps them answered closes when its condition clears.
 
     Returns:
-        Every open record whose expiry has not passed.
+        Every open record whose expiry has not passed, and with ``answered``
+        every answered one not yet carried out.
     """
     stamp = now or time.time()
     return sorted(
         (
             dict(record)
             for record in _peek(directory).values()
-            if record.get("state") == OPEN
-            and record.get("expires", stamp) >= stamp
+            if (
+                record.get("state") == OPEN
+                and record.get("expires", stamp) >= stamp
+            )
+            or (answered and _held(record))
         ),
         key=lambda record: record.get("created", 0.0),
     )
@@ -458,7 +497,11 @@ def hold(directory: Path, name: str, note: str) -> None:
 
 
 def close(directory: Path, name: str, now: float = 0.0) -> bool:
-    """Closes an open decision whose situation cleared without an answer.
+    """Closes a decision whose situation cleared.
+
+    An open decision closes without an answer. An answered one not yet
+    carried out closes too, keeping its answer, so the situation recurring
+    later asks afresh rather than reading the old answer as current.
 
     Args:
         directory: Private project state directory.
@@ -466,13 +509,13 @@ def close(directory: Path, name: str, now: float = 0.0) -> bool:
         now: Unix time; the clock when zero.
 
     Returns:
-        True when an open decision was closed, False otherwise.
+        True when a decision was closed, False otherwise.
     """
     stamp = now or time.time()
     with lock(directory / LOCK_NAME, timeout=5):
         records = _read(directory)
         record = records.get(name)
-        if not record or record.get("state") != OPEN:
+        if not record or not (record.get("state") == OPEN or _held(record)):
             return False
         record.update(state=CLOSED, settled=stamp)
         _write(directory, records)
@@ -744,7 +787,8 @@ def _lease(directory: Path, now: float) -> list[dict]:
 
     Each one taken has its retry time pushed past the lease, so a second
     process flushing before this one finishes finds nothing due. A decision
-    whose sends failed `MAX_ATTEMPTS` times is no longer due.
+    whose sends keep failing stays due at the backoff ceiling until it is
+    answered or expires.
 
     Args:
         directory: Private project state directory.
@@ -763,7 +807,6 @@ def _lease(directory: Path, now: float) -> list[dict]:
                 if record.get("state") == OPEN
                 and not record.get("sent")
                 and record.get("retry_at", 0.0) <= now
-                and int(record.get("attempts", 0)) < MAX_ATTEMPTS
             ),
             key=lambda record: record.get("created", 0.0),
         )
@@ -775,17 +818,21 @@ def _lease(directory: Path, now: float) -> list[dict]:
 
 
 def _abandon(directory: Path, record: Mapping[str, object]) -> None:
-    """Records once that a decision's delivery stopped at the attempt cap.
+    """Records once that a decision's delivery reached the attempt mark.
+
+    Delivery continues at the backoff ceiling; this only makes the
+    persistent failure visible.
 
     Args:
         directory: Private project state directory.
-        record: Decision whose last allowed send failed.
+        record: Decision whose send failed for the `MAX_ATTEMPTS` time.
     """
     from agent_parley import checkpoints, issues
 
     text = (
-        f"Decision {record.get('id')} gave up after {MAX_ATTEMPTS} "
-        f"attempts: {record.get('error')}"
+        f"Decision {record.get('id')} failed {MAX_ATTEMPTS} sends: "
+        f"{record.get('error')}; still retrying every "
+        f"{int(BACKOFF_CEILING)}s until it is answered or expires"
     )
     if record.get("lane"):
         checkpoints.record(
@@ -810,7 +857,8 @@ def flush(directory: Path, config: dict, now: float = 0.0) -> dict:
     missing transports. A decision is marked sent once every configured
     transport accepted it. A refused send leaves it queued with a retry time
     that doubles per attempt up to an hour and records the failure text; the
-    send that reaches `MAX_ATTEMPTS` is the last, and `_abandon` records it.
+    send that reaches `MAX_ATTEMPTS` is recorded once by `_abandon`, and
+    later sends keep the hourly retry until the decision is settled.
     A record written before ``delivered`` existed reads as delivered on no
     transport.
 

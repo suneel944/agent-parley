@@ -19,7 +19,10 @@ single issue is released, rather than left half retired.
 The worktree leaves next, and only when Git reports it clean. A lane with
 uncommitted changes keeps its worktree and reports the paths, because
 retirement never discards work. A checkout Git cannot inspect is treated the
-same way: no opinion is not a clean reading.
+same way: no opinion is not a clean reading. Each worktree the lane holds in a
+linked repository follows the same rule, removed from that repository only
+when clean, so no sibling repository keeps a registered worktree with the lane
+branch checked out after a clean retirement.
 
 The manifest mark is last, and it is what makes the retirement durable. The
 participant stays in the roster carrying the time it retired, so status can
@@ -33,7 +36,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from agent_parley import issues, lifecycle, roster
+from agent_parley import issues, lifecycle, protocol, roster
 from agent_parley.state import BridgeError, lock, write_json
 
 GIT_SECONDS = 30
@@ -193,12 +196,13 @@ def return_work(directory: Path, manifest: dict, name: str) -> dict:
     ]
     if kept:
         listed = ", ".join(f"#{number}" for number in kept)
+        command = protocol.cli_command()
         raise BridgeError(
             f"{name} holds ready or operator-blocked work ({listed}) that "
-            "must stay claimed; land ready work with agent-parley "
-            f"participant merge {name}, hand it on with agent-parley issue "
-            "offer, or release blocked work on purpose with agent-parley "
-            "issue release, before retiring."
+            f"must stay claimed; land ready work with `{command} "
+            f"participant merge {name}`, hand it on with `{command} issue "
+            f"offer`, or release blocked work on purpose with `{command} "
+            "issue release`, before retiring."
         )
     participants = set(manifest["participants"])
     released: list[str] = []
@@ -272,7 +276,10 @@ def withdraw(directory: Path, name: str) -> dict:
         What the retirement did: the issues released and the handoffs
         declined, the lanes that had handed this one work, the state of the
         worktree with any paths that kept it, and the time recorded. A lane
-        already retired reports its recorded time and changes nothing.
+        working in linked repositories also reports each linked worktree's
+        state under ``linked`` by link name; the paths that kept one are
+        listed with the others, written ``NAME//path``. A lane already
+        retired reports its recorded time and changes nothing.
 
     Raises:
         BridgeError: If the manifest does not hold that participant.
@@ -304,10 +311,21 @@ def withdraw(directory: Path, name: str) -> dict:
             }
         work = return_work(directory, manifest, name)
         worktree = _prune(manifest["root"], Path(participant["lane"]))
+        linked: dict[str, str] = {}
+        for link, tree, _ in roster.worktrees(participant)[1:]:
+            kept = _prune(manifest["links"][link], tree)
+            linked[link] = kept["worktree"]
+            worktree["dirty"] += [f"{link}//{path}" for path in kept["dirty"]]
         at = time.time()
         mark(directory, name, at)
         (directory / f"{name}-identity.json").unlink(missing_ok=True)
-        return {"participant": name, "retired_at": at, **work, **worktree}
+        return {
+            "participant": name,
+            "retired_at": at,
+            **work,
+            **worktree,
+            **({"linked": linked} if linked else {}),
+        }
 
 
 def abandon(directory: Path, name: str, cap: int | None = None) -> dict:

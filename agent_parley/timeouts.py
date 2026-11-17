@@ -2,13 +2,15 @@
 
 `KINDS` is the one table of decision kinds. Each kind declares whether it is
 ``reversible`` or ``irreversible`` and the option the service recommends.
-Every declared kind is irreversible and never times out: a merge to the
-default branch, a release or tag, discarding uncommitted work, deleting a
-branch, every native permission prompt and every tool call a native
-permission layer denied always wait for an answer. A kind this table does
-not know is treated as irreversible, so a misspelled or newer kind fails
-closed. Nothing in the service answers an open decision on the operator's
-behalf.
+An irreversible kind never times out: a merge to the default branch, a
+release or tag, discarding uncommitted work, deleting a branch, every
+native permission prompt and every tool call a native permission layer
+denied always wait for an answer. The idle lane and idle blocker decisions
+are reversible, matching how notify records them, so a project can record
+a policy for them. A kind this table does not know is treated as
+irreversible, so a misspelled or newer kind fails closed. A policy is
+recorded only: nothing in the service answers an open decision on the
+operator's behalf.
 
 An orphan decision is not a table kind: the service cannot carry out any of
 its options for the operator, so it waits until the operator answers or the
@@ -67,6 +69,10 @@ KINDS: dict[str, Kind] = {
     "delete_branch": Kind(IRREVERSIBLE, WAIT, "delete a branch"),
     "native_permission": Kind(
         IRREVERSIBLE, WAIT, "answer a native permission prompt"
+    ),
+    "lane_idle": Kind(REVERSIBLE, "leave", "wake or retire an idle lane"),
+    "idle_blocker": Kind(
+        REVERSIBLE, "leave", "wake or release an idle blocking claim"
     ),
 }
 

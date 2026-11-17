@@ -18,6 +18,7 @@ from agent_parley import (
     issues,
     lanes,
     process,
+    protocol,
     roster,
     server,
     state,
@@ -499,6 +500,55 @@ def test_live_idle_wakes_back_off_without_acknowledging(
         ]
         == message["id"]
     )
+
+
+def test_new_mail_keeps_the_wake_attempt_count_and_backoff(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    lane = Path(paired["lanes"]["codex"])
+    write_json(
+        lane.parent / "codex-activity.json",
+        {
+            "activity": "idle",
+            "updated": time.time() - 500,
+            "session_pid": os.getpid(),
+            "session_ticks": process.start_ticks(os.getpid()),
+        },
+    )
+    monkeypatch.setattr(terminal, "request", lambda *args: "accepted")
+    config = {**supervision.DEFAULTS, "inactive_after": 1}
+    observed = sampled(bridge, paired, lane.parent, "codex")
+    for _ in range(3):
+        send(bridge, actors["claude"], "codex")
+        supervision.wake(
+            bridge.home, lane.parent, paired, "codex", observed, config
+        )
+        record = rewake(bridge, paired, lane.parent, "codex", at=0)
+    assert record["attempts"] == 3
+
+
+def test_only_a_running_turn_holds_an_overdue_claim_wake(bridge, paired):
+    directory = Path(paired["lanes"]["codex"]).parent
+    asked = time.time()
+    key = "overdue:7"
+
+    def answered(result, backlog=(key,), at=asked + 1):
+        supervision.store_wake(
+            bridge.home,
+            directory,
+            paired["root"],
+            "codex",
+            {"result": result, "backlog": list(backlog), "at": at},
+        )
+        return supervision.turn_in_flight(
+            bridge.home, directory, paired["root"], "codex", key, asked
+        )
+
+    assert answered(supervision.TURN_BUSY)
+    assert not answered("busy:input")
+    assert not answered(supervision.TURN_BUSY, backlog=("mail",))
+    assert not answered(supervision.TURN_BUSY, at=asked - 60)
 
 
 def test_a_busy_refusal_does_not_consume_a_bounded_attempt(
@@ -1327,6 +1377,58 @@ def test_dead_manual_session_resumes_from_its_recorded_session(
     assert record["result"] == "resume requested (launcher 4321)"
 
 
+def test_a_resume_launcher_that_exits_with_a_failure_is_recorded(
+    bridge, paired, monkeypatch
+):
+    actors = registered(bridge, paired)
+    directory = Path(paired["lanes"]["codex"]).parent
+    native = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    native_ticks = process.start_ticks(native.pid)
+    native.kill()
+    native.wait(timeout=5)
+    write_json(
+        directory / "codex-activity.json",
+        {
+            "activity": "working",
+            "session_id": "manual-session",
+            "session_pid": native.pid,
+            "session_ticks": native_ticks,
+        },
+    )
+    send(bridge, actors["claude"], "codex")
+
+    class Child:
+        pid = 4322
+        returncode = 2
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        supervision.subprocess, "Popen", lambda command, **kwargs: Child()
+    )
+    observed = sampled(
+        bridge, paired, directory, "codex", 300, session="manual-session"
+    )
+    paired.setdefault("supervision", {})[dialogs.PRE_APPROVE] = True
+    supervision.wake(
+        bridge.home,
+        directory,
+        paired,
+        "codex",
+        observed,
+        supervision.DEFAULTS,
+    )
+    supervision.reap_launchers()
+    record = json.loads((directory / "codex-wake.json").read_text())
+    assert record["result"] == (
+        "resume failed (launcher 4322 exited with status 2)"
+    )
+    assert "exited with status 2" in supervision.undelivered_wake(record)
+
+
 @pytest.mark.parametrize(
     ("reading", "deferred"),
     [
@@ -1485,11 +1587,45 @@ def test_a_recorded_opt_in_an_adapter_cannot_carry_is_named(bridge, adapter):
     assert not supervision.opt_in_unsupported(bridge.home, manifest, "lane")
     manifest["supervision"] = {dialogs.PRE_APPROVE: True}
     warning = supervision.opt_in_unsupported(bridge.home, manifest, "lane")
-    if roster.APPROVAL[adapter] is None:
+    if roster.APPROVAL[adapter] is not None:
+        assert warning == ""
+    else:
         assert warning.startswith(f"lane is a {adapter} lane with a bridge")
         assert "agent-parley run lane --resume" in warning
-    else:
-        assert warning == ""
+
+
+@pytest.mark.parametrize("adapter", roster.ADAPTERS)
+def test_a_shell_gap_is_named_only_where_no_cli_allow_reaches_the_lane(
+    bridge, adapter
+):
+    manifest = {"participants": {"lane": {"provider": adapter}}}
+    assert not supervision.opt_in_shell_gap(bridge.home, manifest, "lane")
+    manifest["supervision"] = {dialogs.PRE_APPROVE: True}
+    gap = supervision.opt_in_shell_gap(bridge.home, manifest, "lane")
+    carried = roster.APPROVAL[adapter] is not None
+    allowed = adapter in protocol.SHELL_ALLOW
+    assert bool(gap) is (carried and not allowed)
+    if gap:
+        assert gap.startswith(f"lane is a {adapter} lane with a bridge")
+        assert "name an MCP tool where one exists" in gap
+        assert "agent-parley run lane --resume" in gap
+    assert allowed is (adapter in {"claude", "copilot", "gemini", "opencode"})
+
+
+@pytest.mark.parametrize("adapter", roster.ADAPTERS)
+def test_the_opt_in_remedy_names_auto_mode_for_a_claude_lane_only(
+    bridge, adapter
+):
+    manifest = {"participants": {"lane": {"provider": adapter}}}
+    gap = supervision.opt_in_adapter(bridge.home, manifest, "lane")
+    if not gap:
+        assert roster.APPROVAL[adapter] is None
+        return
+    warning = supervision.OPT_IN_WARNING.format(
+        name="lane", adapter=gap, remedy=supervision.opt_in_remedy(gap)
+    )
+    assert supervision.OPT_IN_COMMAND in warning
+    assert ("--auto-mode on" in warning) is (adapter == "claude")
 
 
 @pytest.mark.parametrize(
@@ -1512,8 +1648,9 @@ def test_a_codex_release_without_the_server_approval_is_named(
         bridge.home, manifest, "lane", version
     )
     assert bool(warning) is named
-    if named:
-        assert "predates the per-server tool approval codex 0.153.0" in warning
+    assert (
+        "predates the per-server tool approval codex 0.153.0" in warning
+    ) is named
 
 
 def test_operator_stop_holds_until_the_next_launch(
@@ -2259,9 +2396,12 @@ def test_a_spent_budget_asks_the_operator_about_orphaned_claims(
     assert fields["issue"] == "#1"
     assert fields["since"] == int(record["exhausted_at"])
     assert "--take-orphaned" in fields["detail"]
+    for option in supervision.notify.ANSWERS[
+        supervision.notify.Event.ORPHAN_DECISION
+    ][0]:
+        assert option in fields["detail"]
     assert fields["detail"].endswith(
-        "returns its claims and reservations once it has been dead for "
-        "the orphan ceiling."
+        f"run codex --resume --repo {paired['root']} yourself."
     )
     assert issues.snapshot(directory)["issues"]["1"]["owner"] == "codex"
 

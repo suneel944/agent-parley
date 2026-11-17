@@ -137,6 +137,16 @@ class ReportsMixin(BridgeCore):
         reviewer and the integration gate never see. Untracked files are not
         considered, because lanes keep scratch state and build output there.
 
+        A ready report on a claim whose issue stated acceptance criteria must
+        carry one evidence line per criterion, written ``N: <evidence>``
+        (`criteria.matched`); a report missing one is refused, naming each
+        missing criterion, before any attachment is stored. The matched lines
+        are recorded on the claim's execution as ``criteria_evidence``.
+
+        A ready report is also refused while a project policy rule that
+        applies to ``ready`` fails (`rules.gate`), naming each failed rule
+        and the evidence it lacks. A project without a policy is unaffected.
+
         Args:
             repo: Assigned agent worktree.
             outcome: Partial, blocked, ready-for-review, or waiting state.
@@ -167,6 +177,7 @@ class ReportsMixin(BridgeCore):
             BridgeError: If the lane or required report fields are invalid, or
                 if the key already names a report with other content.
         """
+        from agent_parley import criteria as acceptance
         from agent_parley.cli import (
             attachments,
             change_attempt,
@@ -232,9 +243,8 @@ class ReportsMixin(BridgeCore):
         if key and (recorded := state.get("retries", {}).get(scope)):
             retries.replayed(recorded, "report", key, fingerprint)
             return ""
-        if outcome == "ready" and (
-            changed := git(lane, "diff", "--name-only", "HEAD").splitlines()
-        ):
+        changed = git(lane, "diff", "--name-only", "HEAD").splitlines()
+        if outcome == "ready" and changed:
             shown = ", ".join(changed[:READY_SHOWN_PATHS])
             more = len(changed) - READY_SHOWN_PATHS
             raise BridgeError(
@@ -244,6 +254,26 @@ class ReportsMixin(BridgeCore):
                 + ". Commit or revert them first, so the evidence describes "
                 "the recorded commit."
             )
+        if outcome == "ready":
+            from agent_parley import rules
+
+            rules.gate(
+                directory,
+                Path(data["root"]),
+                lane,
+                event=rules.READY,
+                builder=agent,
+                issue=str(claim["issue"] or ""),
+                claim=claim["claim_id"] or "",
+            )
+        stated = (
+            issues.snapshot(directory)["issues"]
+            .get(str(claim["issue"]), {})
+            .get("criteria")
+            if outcome == "ready" and claim["issue"] is not None
+            else None
+        )
+        proven = acceptance.matched(stated, evidence) if stated else None
         ceiling = (data.get("deadlines") or {}).get(
             "wait", supervision.DEFAULT_WAIT_CEILING
         )
@@ -257,6 +287,7 @@ class ReportsMixin(BridgeCore):
             state.get("session_pid"),
         )
         identifier = uuid.uuid4().hex[:16]
+        stated = evidence
         evidence, attached = attachments.spill(
             directory,
             "report",
@@ -272,7 +303,22 @@ class ReportsMixin(BridgeCore):
                 if key and (recorded := state.get("retries", {}).get(scope)):
                     retries.replayed(recorded, "report", key, fingerprint)
                     return ""
-            if outcome != "waiting":
+            if claim.get("trial"):
+                from agent_parley import budgets, trials
+
+                trials.reported(
+                    directory,
+                    data["participants"][agent],
+                    agent,
+                    str(claim["issue"]),
+                    outcome=outcome,
+                    commit=commit,
+                    evidence=stated,
+                    usage=budgets.claim_reading(
+                        self.home, directory, data, agent
+                    ),
+                )
+            elif outcome != "waiting":
                 lifecycle.record_report(
                     directory,
                     agent,
@@ -283,6 +329,7 @@ class ReportsMixin(BridgeCore):
                     claim["claim_id"] or "",
                     resume_on,
                     backlog,
+                    proven,
                 )
             with lock(directory / f"{agent}-checkpoint.lock", timeout=1):
                 state = json.loads(path.read_text()) if path.exists() else {}
@@ -328,6 +375,9 @@ class ReportsMixin(BridgeCore):
                 "issue": claim["issue"],
                 "claim_id": claim["claim_id"],
                 "commit": commit,
+                "clean": not git(
+                    lane, "status", "--porcelain", "--untracked-files=normal"
+                ),
                 "summary": summary,
                 "remaining": remaining,
                 "evidence": evidence,

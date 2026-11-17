@@ -459,6 +459,138 @@ class SettingsMixin(BridgeCore):
             "it that closes a claimed issue by keyword lands that claim."
         )
 
+    def link(self, repo: Path, path: Path | None = None, name: str = "") -> str:
+        """Reports or records a sibling repository this project links.
+
+        A lane that claims an issue with ``--link NAME`` also works in a
+        worktree of the linked repository, on the same branch, under the
+        same provider and credential. The link lives in the project
+        manifest, so the linked repository holds no coordination state.
+        Only the operator links a repository.
+
+        Args:
+            repo: Any checkout of the target repository.
+            path: Any checkout of the repository to link, or None to report
+                the current links.
+            name: Link name; the checkout directory's name when empty.
+
+        Returns:
+            An account of the links.
+
+        Raises:
+            BridgeError: If the repository has no project yet, the path is
+                not a non-bare Git checkout of another repository, the name
+                is malformed or taken, or the change comes from a lane.
+        """
+        import re
+
+        from agent_parley import unattended
+        from agent_parley.cli import lock, roster, write_json
+
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        if path is None:
+            return "\n".join(
+                [f"{root} links {len(data.get('links', {}))} repositories."]
+                + [
+                    f"  {key}  {value}"
+                    for key, value in sorted(data.get("links", {}).items())
+                ]
+            )
+        unattended.operator_only(repo, root, data, "A repository is linked")
+        linked, state = self.project(path, create=False)
+        if state == directory:
+            raise BridgeError(f"{linked} is this project's own repository.")
+        accepted = roster.identifier(
+            name or re.sub(r"[^a-z0-9_-]+", "-", linked.name.lower())[:39],
+            "Link name",
+        )
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            links = data.get("links", {})
+            if links.get(accepted, str(linked)) != str(linked):
+                raise BridgeError(
+                    f"Link {accepted} already names {links[accepted]}; "
+                    "choose another name with --name."
+                )
+            data["links"] = {**links, accepted: str(linked)}
+            write_json(directory / "project.json", data)
+        return (
+            f"{root} links {accepted} at {linked}; claim with "
+            f"--link {accepted} to add a lane worktree there."
+        )
+
+    def unlink(self, repo: Path, name: str) -> str:
+        """Removes a linked repository and every lane worktree in it.
+
+        Each lane's worktree in the linked repository is removed with
+        ``git worktree remove``. Removal deletes ignored files, which Git
+        never reports, so every worktree is first checked for uncommitted
+        changes and ignored files, and any one holding either refuses the
+        whole removal before a worktree is touched. Each affected lane's
+        session lock is held throughout, so a running lane refuses it too.
+        Lane branches stay in the linked repository. Only the operator
+        removes a link.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Link name.
+
+        Returns:
+            An account of the removal.
+
+        Raises:
+            BridgeError: If the link is unknown, a lane with a worktree there
+                is running, a worktree holds uncommitted changes or ignored
+                files, or the change comes from a lane.
+        """
+        from contextlib import ExitStack
+
+        from agent_parley import unattended
+        from agent_parley.cli import git, lock, removable, roster, write_json
+
+        root, directory = self.project(repo, create=False)
+        data = roster.read(directory)
+        unattended.operator_only(repo, root, data, "A link is removed")
+        with lock(directory / "setup.lock"), ExitStack() as held:
+            data = roster.read(directory)
+            if name not in data.get("links", {}):
+                raise BridgeError(f"{root} links no repository named {name}.")
+            trees = [
+                (agent, Path(participant["linked"][name]["lane"]))
+                for agent, participant in sorted(data["participants"].items())
+                if name in participant.get("linked", {})
+            ]
+            for agent, tree in trees:
+                held.enter_context(
+                    lock(
+                        directory / f"{agent}.session.lock",
+                        f"{agent} has a running session; stop that terminal "
+                        "first.",
+                    )
+                )
+                if tree.exists():
+                    removable(
+                        tree, f"{agent} in {name}", (), action="link remove"
+                    )
+            for _, tree in trees:
+                if tree.exists():
+                    git(
+                        Path(data["links"][name]),
+                        "worktree",
+                        "remove",
+                        str(tree),
+                    )
+            for participant in data["participants"].values():
+                participant.get("linked", {}).pop(name, None)
+                if not participant.get("linked", True):
+                    participant.pop("linked")
+            data["links"].pop(name)
+            if not data["links"]:
+                data.pop("links")
+            write_json(directory / "project.json", data)
+        return f"{root} no longer links {name}; its lane branches remain."
+
     def tracker(self, repo: Path, name: str | None = None) -> str:
         """Reports or records the forge a project coordinates over.
 
@@ -701,20 +833,31 @@ class SettingsMixin(BridgeCore):
             + f" Standing: {standing}. A budget informs and does not gate."
         )
 
-    def price(self, repo: Path, name: str, per_mtok: float | None) -> str:
+    def price(
+        self,
+        repo: Path,
+        name: str,
+        per_mtok: float | None,
+        model: str = "",
+        rates: dict | None = None,
+    ) -> str:
         """Reports or records the operator's price on one provider.
 
         A price turns a recorded token count into an estimated spend in
-        `report usage`; nothing is fetched from a vendor. Only the operator
-        records one: a process holding a lane's token is refused wherever
-        it runs, and so is a command run from a lane's worktree, the same
-        boundary every operator-only project setting keeps.
+        `report usage` and `metrics cost`; nothing is fetched from a vendor.
+        Only the operator records one: a process holding a lane's token is
+        refused wherever it runs, and so is a command run from a lane's
+        worktree, the same boundary every operator-only project setting
+        keeps.
 
         Args:
             repo: Directory the command runs from.
             name: Provider the price belongs to.
             per_mtok: Price per million tokens, 0 to remove it, or None to
-                report the recorded price.
+                leave it alone.
+            model: Model whose input, output and cache-read rates are
+                recorded, or empty to record none.
+            rates: Rates per million tokens of ``model``.
 
         Returns:
             An account of the recorded price.
@@ -729,7 +872,7 @@ class SettingsMixin(BridgeCore):
         from agent_parley import unattended
         from agent_parley.cli import roster
 
-        if per_mtok is not None:
+        if per_mtok is not None or model:
             if os.environ.get(roster.LANE_TOKEN):
                 raise BridgeError(
                     "A price is recorded from an operator shell, never from "
@@ -743,14 +886,25 @@ class SettingsMixin(BridgeCore):
                 unattended.operator_only(
                     repo, root, roster.read(directory), "A price is recorded"
                 )
-            roster.provider_price(self.home, name, per_mtok)
+            roster.provider_price(self.home, name, per_mtok, model, rates)
         recorded = roster.provider(self.home, name).get("price")
         if not recorded:
             return f"provider {name} has no price; report usage shows no spend."
-        return (
-            f"provider {name} price {recorded['per_mtok']:g} per million "
-            "tokens; report usage shows spend as an estimate."
-        )
+        parts = []
+        if "per_mtok" in recorded:
+            parts.append(
+                f"price {recorded['per_mtok']:g} per million tokens; "
+                "report usage shows spend as an estimate"
+            )
+        for each, row in sorted((recorded.get("models") or {}).items()):
+            parts.append(
+                f"model {each} per million tokens: "
+                + ", ".join(
+                    f"{field.replace('_', '-')} {row[field]:g}"
+                    for field in roster.RATE_FIELDS
+                )
+            )
+        return f"provider {name} " + "; ".join(parts) + "."
 
     def enforce(self, repo: Path, changes: dict | None = None) -> str:
         """Reports or records the run budget a project opted into enforcing.

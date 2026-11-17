@@ -9,7 +9,14 @@ import time
 from collections.abc import Collection, Iterator, Sequence
 from pathlib import Path
 
-from agent_parley import approvals, lifecycle, policy, process, roster
+from agent_parley import (
+    approvals,
+    lifecycle,
+    policy,
+    process,
+    protocol,
+    roster,
+)
 from agent_parley.checkpoints import (
     activity,
     branch_head,
@@ -751,7 +758,7 @@ def dependency_refusal(
     return (
         f"Issue #{issue} still waits on {', '.join(named)} to be verified "
         "complete; integrate those first or drop the edge with "
-        f"`agent-parley issue unblock {issue} --on {waits[0]}`."
+        f"`{protocol.cli_command()} issue unblock {issue} --on {waits[0]}`."
     )
 
 

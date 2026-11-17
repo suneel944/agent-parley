@@ -17,6 +17,12 @@ it, and an active lane is never told to complete or stop a session it is
 working in. A worktree holding uncommitted work names the worktree and the
 files it holds, because retiring the lane would drop its claims to clean one
 directory.
+
+A row whose remedy `problems --apply` can run carries a structured `action`
+classing it safe or naming the reason it is not, so the apply never parses
+a command string. Only two remedies exist: retiring a lane ready to retire
+and collecting a project whose root is gone. The view still runs neither;
+the CLI runs the safe ones after one confirmation.
 """
 
 import contextlib
@@ -37,9 +43,11 @@ from agent_parley import (
     lanes,
     merges,
     plan,
+    protocol,
     reclaim,
     records,
     recovery,
+    retirement,
     roster,
     store,
     supervision,
@@ -51,6 +59,7 @@ from agent_parley.status import (
     FORGE_ISSUES,
     FORGE_RETRY,
     FORGE_STALE,
+    FORGE_TTL,
     fold_line,
     folded,
     service_state,
@@ -84,6 +93,7 @@ ORPHANED = "orphaned claims"
 INTEGRATE = "ready to integrate"
 UNOPENED = "ready without a pull request"
 HOLDING = "holding a refused key"
+CONTENTION = "reservation contention"
 FOREIGN = "second session"
 REFUSED = "recovery refused"
 INTEGRATION = "integration unverified"
@@ -103,9 +113,17 @@ CI_ROUNDS_EXHAUSTED = "ci rounds exhausted"
 CHILD_SESSION = "session outliving its claim"
 CHILD_RECENT = 60
 FORGE_REFUSED = "forge refused"
+BLUEPRINT = "blueprint blocked"
 
 BY_OPERATOR = "operator"
 BY_SERVICE = "service"
+
+RETIRE_ACTION = "retire"
+COLLECT_ACTION = "collect"
+ROOT_COLLECTABLE = (
+    "project root is gone and the service retired its lanes; its private "
+    "state is kept until it is collected"
+)
 
 DIALOG = "busy:input"
 RETRY = "busy:repeat"
@@ -556,7 +574,8 @@ def _integrate_rows(
     anyone integrates it. Nothing merges on its own here; the row names the
     pull request and the integration step its approval policy allows,
     once the wait passes the same ceiling a declared wait uses. A pull
-    request whose cached reading conflicts with its base names the rebase
+    request whose cached reading conflicts with its base, or is behind a
+    base that requires it current, names the rebase
     instead of the merge, and one whose checks are red is left to the
     checks-failed row.
 
@@ -584,12 +603,19 @@ def _integrate_rows(
     if pull.get("url"):
         shown += f" ({pull['url']})"
     approval = record.get("approval")
-    if pull.get("mergeable") == "CONFLICTING":
+    stale = (
+        "conflicts with"
+        if pull.get("mergeable") == "CONFLICTING"
+        else "is behind"
+        if pull.get("merge_state") == "BEHIND"
+        else ""
+    )
+    if stale:
         return [
             _row(
                 INTEGRATE,
                 f"issue #{claim['issue']} reported ready but {shown} "
-                "conflicts with its base",
+                f"{stale} its base",
                 f"rebase the {name} branch onto the base and push, or "
                 f'agent-parley say {name} "<text>" {repo}',
                 seconds,
@@ -740,6 +766,61 @@ def _retire_rows(
             len(claims),
         )
     ]
+
+
+def _action(kind: str, reason: str = "", lane: str = "") -> dict:
+    """Shapes the remedy `problems --apply` may run for one row.
+
+    Args:
+        kind: `RETIRE_ACTION` or `COLLECT_ACTION`.
+        reason: Why running the remedy could drop work, empty when it is
+            safe to run unattended.
+        lane: Worktree a retirement removes, empty for a collection.
+
+    Returns:
+        The action, safe exactly when no reason was given.
+    """
+    return {"kind": kind, "safe": not reason, "reason": reason, "lane": lane}
+
+
+def _retire_action(
+    record: dict,
+    lane: str,
+    root: str,
+    dirt: dict[str, list[str] | None] | None,
+) -> dict:
+    """Classes the retirement a `READY` row names as safe or not.
+
+    A retirement is safe only when the lane's session process is known to
+    be gone, its project root still exists and Git reads its worktree as
+    clean or the worktree is already gone. A session process whose state is
+    unknown may still own the worktree, and a worktree Git cannot read is
+    no opinion rather than a clean one, so both keep the lane. Ignored
+    files are checked by `remedies`, only when an apply asks, because the
+    listing is a Git call each reading would otherwise pay.
+
+    Args:
+        record: One participant record from the status reading.
+        lane: The lane's worktree.
+        root: Canonical project key.
+        dirt: Uncommitted paths already read per worktree.
+
+    Returns:
+        A `RETIRE_ACTION` naming the worktree, with the reason it is not
+        safe when it is not.
+    """
+    reason = ""
+    if record["availability"].get("process_alive") is not False:
+        reason = "its session process may still be running"
+    elif not Path(root).exists():
+        reason = "its project root is gone; the service retires its lanes"
+    elif Path(lane).exists():
+        changed = _dirty(lane, dirt)
+        if changed is None:
+            reason = f"Git could not read its worktree {lane}"
+        elif changed:
+            reason = f"uncommitted changes in {lane}: {_listed(changed)}"
+    return _action(RETIRE_ACTION, reason, lane)
 
 
 def _orphan_rows(record: dict, name: str, root: str, peer: bool) -> list[dict]:
@@ -1115,7 +1196,20 @@ def _lane_rows(
     quiet = availability["state"] != supervision.ACTIVE
     waking = bool(config["wake"] and participant.get("wake", True))
     wake = record.get("wake") or {}
-    if wake.get("result", "") in WAKE_DETAILS:
+    if str(wake.get("result", "")).startswith(supervision.RESUME_FAILED):
+        rows.append(
+            _row(
+                WAKE,
+                f"wake {wake['result']}; its output is in "
+                f"{record.get('wake_log') or 'the lane wake log'}",
+                f"agent-parley run {name} --resume {repo}",
+                wake.get("age_seconds"),
+                name,
+                root,
+                BY_OPERATOR,
+            )
+        )
+    elif wake.get("result", "") in WAKE_DETAILS:
         command, actor = _remedy(name, repo, record, waking)
         detail = WAKE_DETAILS[wake["result"]]
         if wake["result"] in supervision.UNDELIVERED_WAKES and wake.get("at"):
@@ -1240,6 +1334,10 @@ def _lane_rows(
         retire = _retire_rows(
             record, name, repo, root, config["orphan_retire_after"]
         )
+        for row in retire:
+            row["action"] = _retire_action(
+                record, participant["lane"], root, dirt
+            )
         rows.extend(retire or _orphan_rows(record, name, root, peer))
     rows.extend(_unresolved_rows(record, name, repo, root, now))
     rows.extend(_diverging_rows(record, name, repo, root))
@@ -1372,6 +1470,54 @@ def _offer_rows(project: dict, now: float) -> list[dict]:
                 len(items),
             )
         )
+    return rows
+
+
+def _contention_rows(project: dict, now: float) -> list[dict]:
+    """Reports each flagged pair of lanes contending for one key once.
+
+    Reservations are advisory declarations, so the row asks the operator to
+    settle who owns the work. It is not a lock and clears when the operator
+    hands the work off or releases it.
+
+    Args:
+        project: One project block from the status reading.
+        now: Unix time the flag ages are measured against.
+
+    Returns:
+        One row per pair and key, however many lanes carry the record,
+        naming both lanes, the key and the issues each lane holds.
+    """
+    repo = f"--repo {shlex.quote(str(project['root']))}"
+    seen: set[tuple[str, str, str]] = set()
+    rows = []
+    for record in project["participants"]:
+        for item in record.get("contention") or []:
+            first, second = sorted((item["lane"], item["peer"]))
+            if (first, second, item["path"]) in seen:
+                continue
+            seen.add((first, second, item["path"]))
+            claims = {item["lane"]: item["own"], item["peer"]: item["theirs"]}
+            held = [
+                f"{lane} ("
+                + (", ".join(f"#{n}" for n in claims[lane]) or "no issue")
+                + ")"
+                for lane in (first, second)
+            ]
+            rows.append(
+                _row(
+                    CONTENTION,
+                    f"{held[0]} and {held[1]} refused each other "
+                    f"{item['count']} times on {item['path']}",
+                    f"agent-parley issue offer N --to PEER {repo} to hand "
+                    f"the work to one lane, or agent-parley issue release N "
+                    f"{repo} to free it",
+                    max(0, int(now - float(item["since"]))),
+                    "",
+                    project["root"],
+                    BY_OPERATOR,
+                )
+            )
     return rows
 
 
@@ -1696,6 +1842,9 @@ def _root_rows(
 
     Returns:
         One row while the supervisor records the root as missing, or none.
+        The row's action names why collecting the project's state is not
+        yet safe: a live lane, an unreachable root, a lane whose retirement
+        was refused, or a retirement the service has not reached.
     """
     try:
         recorded = json.loads(
@@ -1706,6 +1855,15 @@ def _root_rows(
     if not isinstance(recorded, dict) or recorded.get("retired"):
         return []
     live = [str(name) for name in recorded.get("live") or []]
+    reason = (
+        f"live lanes may still be running: {', '.join(live)}"
+        if live
+        else "its root is unreachable, not gone"
+        if recorded.get("unreachable")
+        else "lanes hold work their retirement refused to release"
+        if supervision.root_refused(directory)
+        else "the service has not retired its lanes yet"
+    )
     detail = (
         f"project root is gone; live lanes kept from retirement: "
         f"{', '.join(live)}"
@@ -1716,17 +1874,64 @@ def _root_rows(
         else "project root is gone; lanes retire once it has been gone "
         "root_gone_after"
     )
-    return [
-        _row(
-            ROOT,
-            detail,
-            "restore the root checkout, or end the named sessions so the "
-            "next poll retires them",
-            _age(recorded.get("since"), now),
-            project=root,
-            count=max(len(live), 1),
+    row = _row(
+        ROOT,
+        detail,
+        "restore the root checkout, or end the named sessions so the "
+        "next poll retires them",
+        _age(recorded.get("since"), now),
+        project=root,
+        count=max(len(live), 1),
+    )
+    row["action"] = _action(COLLECT_ACTION, reason)
+    return [row]
+
+
+def _collect_rows(home: Path) -> list[dict]:
+    """Reports each project whose root is gone and whose lanes retired.
+
+    `status` and `derive` skip such a project, because nothing in it can
+    act, so its rows exist only for `remedies`: the state directory stays
+    until `supervision.forget` collects it, and collecting it keeps the
+    recovery checkpoints, so it drops no work. `supervision.forget` refuses
+    a project with a lane that may still run or whose retirement was
+    refused, so such a project's action names that reason, as `_root_rows`
+    does, rather than failing every apply.
+
+    Args:
+        home: Private bridge state root.
+
+    Returns:
+        One `ROOT` row per project whose retired root is gone, carrying a
+        `COLLECT_ACTION` that is safe unless `supervision.forget` would
+        refuse it.
+    """
+    found = []
+    for path in sorted((home / "projects").glob("*/project.json")):
+        try:
+            data = roster.read(path.parent)
+        except (BridgeError, OSError, ValueError):
+            continue
+        root = str(data["root"])
+        if Path(root).exists() or not supervision.root_retired(path.parent):
+            continue
+        live = supervision.running_lanes(path.parent, data["participants"])
+        reason = (
+            f"live lanes may still be running: {', '.join(live)}"
+            if live
+            else "lanes hold work their retirement refused to release"
+            if supervision.root_refused(path.parent)
+            else ""
         )
-    ]
+        row = _row(
+            ROOT,
+            ROOT_COLLECTABLE,
+            protocol.FORGET_ROOT.format(root=shlex.quote(root)),
+            project=root,
+        )
+        row["action"] = _action(COLLECT_ACTION, reason)
+        found.append(row)
+    return found
 
 
 def _returned_rows(
@@ -1884,7 +2089,11 @@ def _forge_rows(directory: Path, root: str, now: float) -> list[dict]:
     ``failed_at`` in `FORGE_ISSUES`. A refused credential or a project the
     signed-in account cannot see stops every pull request and completion
     wake, so it is named with the `gh auth` remedy; a rate limit names the
-    next retry instead.
+    next retry instead, as the service's own row. A timeout or any other
+    error is the operator's once it repeats: the first failure follows the
+    last good reading by about `FORGE_TTL`, so the row appears when the
+    newest failure trails that reading by a further `FORGE_RETRY`, or at
+    once when no reading ever succeeded.
 
     Args:
         directory: Private project state directory.
@@ -1905,19 +2114,25 @@ def _forge_rows(directory: Path, root: str, now: float) -> list[dict]:
         return []
     if failed_at <= read_at or now - failed_at >= FORGE_STALE:
         return []
+    retry = time.strftime("%H:%M:%S", time.localtime(failed_at + FORGE_RETRY))
+    actor = BY_OPERATOR
     if kind in ("auth", "missing"):
         project = forge.slug(Path(root)) or "<owner>/<name>"
         owner = project.split("/")[0]
         command = f"gh auth status, then gh auth switch --user {owner}"
         cause = "refused the signed-in account"
     elif kind == "rate":
-        retry = time.strftime(
-            "%H:%M:%S", time.localtime(failed_at + FORGE_RETRY)
-        )
         command = f"none; the supervisor retries at {retry}"
         cause = "rate limited the supervisor"
-    else:
+        actor = BY_SERVICE
+    elif read_at and failed_at - read_at < FORGE_TTL + FORGE_RETRY:
         return []
+    else:
+        command = (
+            "gh issue list --limit 1 to check the forge and the network; "
+            f"the supervisor retries at {retry}"
+        )
+        cause = "did not answer the supervisor"
     return [
         _row(
             FORGE_REFUSED,
@@ -1925,7 +2140,49 @@ def _forge_rows(directory: Path, root: str, now: float) -> list[dict]:
             command,
             _age(failed_at, now),
             project=root,
+            actor=actor,
         )
+    ]
+
+
+def _blueprint_rows(
+    directory: Path, data: dict, root: str, now: float
+) -> list[dict]:
+    """Reports each blueprint run that ended blocked on an issue still open.
+
+    A run ends blocked when its lane lost the issue, a node failed past its
+    retries, the run looped, or its pull request closed or spent its CI
+    rounds. The run record was the only trace, read by `blueprint
+    progress` alone. A blocked run is reported until its issue ends or a
+    new run replaces it.
+
+    Args:
+        directory: Private project state directory.
+        data: Project manifest naming the lanes whose runs are read.
+        root: Canonical project key.
+        now: Unix time the block's age is measured against.
+
+    Returns:
+        One row per blocked run, on the run's lane.
+    """
+    from agent_parley import blueprints
+
+    ledger = issues.snapshot(directory)["issues"]
+    where = f"--repo {shlex.quote(str(root))}"
+    return [
+        _row(
+            BLUEPRINT,
+            blueprints.line(number, run),
+            f"agent-parley blueprint run {lane} {run.get('blueprint')} "
+            f"--issue {number} {where} once the cause is fixed",
+            _age(run.get("updated"), now),
+            lane,
+            root,
+        )
+        for lane in sorted(data["participants"])
+        for number, run in sorted(blueprints.for_lane(directory, lane).items())
+        if run.get("status") == blueprints.BLOCKED
+        and not issues.ended(ledger.get(number) or {})
     ]
 
 
@@ -2184,8 +2441,9 @@ def _checks_failed_rows(directory: Path, root: str, now: float) -> list[dict]:
                     f"{reading.get('exhausted')} CI rounds: {failing}",
                     "operator took over the branch"
                     if reading.get("taken_over")
-                    else "answer the decision: grant one more round or "
-                    "take over; the lane stops pushing",
+                    else "answer the decision (agent-parley decision open): "
+                    "grant one more round or take over; the lane stops "
+                    "pushing",
                     _age(reading.get("red_since"), now),
                     str(reading.get("lane") or ""),
                     root,
@@ -2352,6 +2610,16 @@ def derive(
                 "agent-parley up",
             )
         )
+    if failing := issues.supervision_error(home):
+        rows.append(
+            _row(
+                SUPERVISING,
+                f"service upkeep failing; last: {failing['detail']}",
+                "read server.log in the state directory and fix the step it "
+                "names; the next clean pass clears this row",
+                max(int(stamp - failing["since"]), 0),
+            )
+        )
     manifests = {}
     for path in (home / "projects").glob("*/project.json"):
         try:
@@ -2415,6 +2683,7 @@ def derive(
         aged.extend(_grouped_gaps(found, repo))
         aged.extend(_offer_rows(project, stamp))
         aged.extend(_request_rows(project, stamp))
+        aged.extend(_contention_rows(project, stamp))
         aged.extend(_bounce_rows(home, directory, data, project, config))
         aged.extend(_retired_rows(home, project))
         aged.extend(_refused_rows(directory, project["root"], stamp))
@@ -2424,6 +2693,7 @@ def derive(
         aged.extend(_plugin_rows(home, directory, data, project, stamp))
         aged.extend(_forge_rows(directory, project["root"], stamp))
         aged.extend(_plan_rows(directory, project["root"], stamp))
+        aged.extend(_blueprint_rows(directory, data, project["root"], stamp))
         aged.extend(_run_rows(directory, data, project["root"], stamp))
         aged.extend(_checks_rows(directory, project["root"], stamp))
         aged.extend(_checks_failed_rows(directory, project["root"], stamp))
@@ -2454,6 +2724,50 @@ def ready(rows: list[dict], root: str) -> list[str]:
             if row["condition"] == READY and row["project"] == root
         )
     )
+
+
+def remedies(home: Path, rows: list[dict]) -> list[dict]:
+    """Lists the remedies `problems --apply` may run, each classed.
+
+    The candidates are the rows `derive` gave an action, folded or not,
+    and every project `_collect_rows` finds collectable. A retirement still
+    classed safe is checked once more for ignored files, because removing
+    the worktree deletes them and `git status` never names them; such a
+    lane is left for `participant retire`, which asks about them.
+
+    Args:
+        home: Private bridge state root.
+        rows: Rows `derive` produced.
+
+    Returns:
+        A copy of each candidate row with its final action, in the order
+        the rows listed them, collectable projects last.
+    """
+    found = []
+    acted = [row for row in rows if "action" in row]
+    for row in acted + _collect_rows(home):
+        action = row["action"]
+        lane = action["lane"]
+        if (
+            action["safe"]
+            and action["kind"] == RETIRE_ACTION
+            and Path(lane).exists()
+        ):
+            ignored = retirement.ignored_files(lane)
+            if ignored is None:
+                action = _action(
+                    RETIRE_ACTION, f"Git could not list {lane}", lane
+                )
+            elif ignored:
+                action = _action(
+                    RETIRE_ACTION,
+                    f"removing {lane} deletes ignored files "
+                    f"{_listed(ignored)}; `agent-parley participant retire` "
+                    "asks before deleting them",
+                    lane,
+                )
+        found.append({**row, "action": action})
+    return found
 
 
 def _stale(row: dict) -> bool:
@@ -2559,12 +2873,16 @@ def rendered(rows: list[dict], everything: bool = False) -> dict:
     Returns:
         The rows `shown` keeps, their count, the split between the rows an
         operator owns and the rows the coordination service is already
-        handling, and how many folded rows were left out.
+        handling, and how many folded rows were left out. The action a
+        row carries for `remedies` is left out of the document.
     """
     kept = shown(rows, everything)
     handled = sum(row["actor"] == BY_SERVICE for row in kept)
     return {
-        "problems": kept,
+        "problems": [
+            {key: value for key, value in row.items() if key != "action"}
+            for row in kept
+        ],
         "count": len(kept),
         "operator": len(kept) - handled,
         "service": handled,

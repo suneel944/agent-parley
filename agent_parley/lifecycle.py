@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from agent_parley import attachments
+from agent_parley import criteria as acceptance
 from agent_parley.state import BridgeError, lock, write_json
 
 QUEUED = "queued"
@@ -421,11 +422,15 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
         owner: Existing owner to resume, or None for unowned work.
 
     Returns:
-        Issue numbers ordered numerically. Owner work is limited to its
+        Issue numbers. Owner work is ordered numerically and limited to its
         current generation and to issues that did not close on the forge
         inside it, so a closed issue is never the lane's next action. Free
-        work must be queued, unowned and not released after its issue ended
-        on the forge.
+        work must be queued, unowned, carry no pending offer and not have
+        been released after its issue ended on the forge; a claim of an
+        offered issue is refused, so naming one only spends a turn. It is
+        ordered most unblocking first, as `issues.unblocking_order` orders
+        it, so a pull offer leads with the issue whose completion moves the
+        most other work.
     """
     from agent_parley import issues
 
@@ -439,6 +444,8 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
         if owner is None:
             eligible = (
                 not record.get("owner")
+                and not record.get("offer")
+                and not record.get("trial")
                 and not record.get("ended_on_forge")
                 and execution["state"] == QUEUED
             )
@@ -452,6 +459,8 @@ def actionable(ledger: dict, owner: str | None = None) -> list[str]:
             )
         if eligible:
             found.append(number)
+    if owner is None:
+        return issues.unblocking_order(ledger, found)
     return sorted(found, key=int)
 
 
@@ -523,6 +532,7 @@ def record_report(
     claim_id: str = "",
     resume_on: str = "",
     backlog_count: int | None = None,
+    criteria_evidence: list[str] | None = None,
 ) -> list[str]:
     """Binds a lane report to one exact current claim generation.
 
@@ -542,6 +552,9 @@ def record_report(
         backlog_count: Work units the lane still states as remaining on this
             claim. None leaves the recorded count as it stands, because a
             report that does not restate the count says nothing about it.
+        criteria_evidence: One evidence line per acceptance criterion the
+            claim recorded, already matched by `criteria.matched`; kept on
+            the execution only by a ready report.
 
     Returns:
         Issue numbers whose current execution state changed.
@@ -645,6 +658,8 @@ def record_report(
         execution["progress"] = {"token": commit, "at": time.time()}
         if backlog_count is not None:
             execution["backlog"] = backlog_count
+        if phase == READY and criteria_evidence is not None:
+            execution["criteria_evidence"] = criteria_evidence
         record["execution"] = execution
         ledger["revision"] += 1
         write_json(directory / "issues.json", ledger)
@@ -910,6 +925,7 @@ def resolve(
     reason: str = "",
     claim_id: str | None = None,
     usage: dict | None = None,
+    criteria_evidence: list[str] | None = None,
 ) -> dict:
     """Ends a claim whose holder never answered its completion reminder.
 
@@ -933,6 +949,12 @@ def resolve(
     returns the work to the queue instead; it supersedes a stale ready state,
     because the generation that reported ready has ended on the forge.
 
+    A claim whose issue stated acceptance criteria keeps one evidence line
+    per criterion on its execution as ``criteria_evidence``: the lines the
+    caller gives, else the lines the holder's ready report recorded, else
+    the forge outcome itself (`criteria.forge_outcome`) for every criterion,
+    so an ended pull request still closes the claim with its evidence named.
+
     Args:
         directory: Private project state directory.
         issue: Issue number being resolved.
@@ -948,6 +970,8 @@ def resolve(
             call. Its difference from the reading taken at the claim is
             kept as ``usage`` on the resolution and its history entry. A
             reading of another participant, or none, records no usage.
+        criteria_evidence: One evidence line per acceptance criterion,
+            already matched by `criteria.matched`, or None.
 
     Returns:
         The resolved issue record.
@@ -1025,6 +1049,15 @@ def resolve(
                 commit="",
                 gate=None,
             )
+        stated = record.get("criteria") or []
+        if criteria_evidence is not None:
+            execution["criteria_evidence"] = criteria_evidence
+        elif stated and len(execution.get("criteria_evidence") or []) != len(
+            stated
+        ):
+            execution["criteria_evidence"] = [
+                acceptance.forge_outcome(evidence)
+            ] * len(stated)
         drop_offer(directory, record)
         started = record.pop("usage_start", None)
         used = (

@@ -56,6 +56,10 @@ https://github.com/user-attachments/assets/1de399fc-4078-49da-a4f9-116789bccb7d
   policy adds `--auto`, merges on the same gate as
   `participant merge`, and a failed integration holds every other merge until
   it is verified.
+- **Team rules as a shared policy.** `policy import` records a TOML file of
+  rules, such as a large diff needing a review round or a `fix:` commit
+  needing a changed test, that refuse a ready report or a resolve that breaks
+  them; `policy check` shows every rule as pass or fail.
 - **Churn is caught per issue.** An issue whose verification keeps failing is
   flagged in `issue show`, `problems` and a notification.
 - **Ownership stays explicit.** Atomic claims, accepted handoffs, advisory
@@ -161,6 +165,15 @@ For a pinned, checksummed install, take a wheel from
 `install.sh` against the release `SHA256SUMS` before it runs, shell
 completion, upgrades and the supported platforms are in
 [Operations](https://github.com/suneel944/agent-parley/blob/main/docs/operations.md#install-and-upgrade).
+
+`agent-parley doctor` and `agent-parley status` ask PyPI for the latest
+release at most once a day and, when the installed launcher is older, print
+one line on standard error with both versions and the upgrade command for your
+installer (`uv tool upgrade agent-parley`, `pipx upgrade agent-parley` or
+`pip install -U agent-parley`). An unreachable index prints nothing, and the
+request gives up after two seconds. A lane agent running `status` never sees
+the line, so only you decide when to upgrade.
+`AGENT_PARLEY_NO_UPDATE_CHECK=1` turns the check off.
 
 ## Run it
 
@@ -337,7 +350,19 @@ lane setup.
   child gets its own worktree, cut from the parent's branch, under the
   parent's provider and credential. The parent reads one capped report, never
   the transcript, and merges the branch with Git. A child cannot spawn
-  children; three per parent and eight per project at most.
+  children; three per parent and eight per project at most. A child is
+  retired once it reports, or after four hours without a report, and either
+  outcome wakes a parent that is waiting on it. To run a child
+  on another tier, open the body with `model: NAME` and `effort: LEVEL`
+  lines. Claude, Codex, Gemini, Copilot and OpenCode take `model:`; only
+  Claude (`low` to `max`) and Codex (`none` to `xhigh`) take `effort:`. A
+  setting the CLI cannot honour, an empty value or a repeated line refuses
+  the spawn with the reason. Without them the child runs on the provider
+  default. `top`, `participant show` and the child report name the tier,
+  and `quota show` splits a Claude credential's window use by model. A
+  worktree the lane's own client makes is recorded, never created, and
+  `top` lists it with its branch and base, flagged when it lies outside
+  `.claude/worktrees/`.
 - **Lanes sharing a credential park before its quota runs out.**
   `agent-parley quota set NAME --hours H --tokens N [--threshold F]` records
   the plan's window; `quota show` prints the remaining headroom. Near the
@@ -411,23 +436,26 @@ queries and decision answers back once inbound is on, as described in
 inbound off, nothing arrives over the channel and a permission prompt is
 answered only in your terminal.
 
-Fourteen changes notify: a handoff offered to a lane, a lane
+Fifteen changes notify: a handoff offered to a lane, a lane
 blocked on a permission prompt, a lane's tool call denied by its native
 permission check, a lane held by a native dialog, a lane still
 blocked past the escalation bound, a lane idle with no claim past
 `stalled_after`, issues waiting on an idle claim, a dead lane's claims waiting
 on your decision, a lane keeping a key refused to a peer past its deadline, an
 issue that is not converging, the enforced run budget running out, a lane run
-that finished, a hook refusal, and the inbound status path locking after
-repeated wrong passcodes. An unchanged situation sends nothing further.
+that finished, a hook refusal, the inbound status path locking after
+repeated wrong passcodes, and a headless session ended at a prompt nobody
+could answer. An unchanged situation sends nothing further.
 Sending never blocks a hook or tool call. Each of these situations is kept as a
 decision with a stable identifier, its options and a recommended one. So is
 each operator-owned `agent-parley problems` row younger than a day for an
 unresolved completion, an unacknowledged message, a bounced share, shares to a
 retired lane, a dirty worktree, a refused key still held, a second session, a
 refused recovery, an unverified integration, a wake needing attention, a wait
-on approval, a native dialog hold or a crossing ready, and those decisions are
-sent the same way. Nothing else notifies. A decision is retried
+on approval, a native dialog hold, a crossing ready, orphaned claims, supervision
+failing, a forge refused (a timeout or error once it repeats), an operator offer
+unanswered past ten minutes, a blocked blueprint run, or an escalated or
+pending plan revision, and those decisions are sent the same way. Nothing else notifies. A decision is retried
 with backoff on the next supervision poll until every transport accepts it, so
 a send cut short by a hook exiting still arrives. Decisions due together go
 out as one digest with one row of Telegram buttons each.
@@ -489,7 +517,10 @@ button, send `decide ID OPTION [NOTE]`, or reply to a one-decision message
 with the option and a note. The answer is recorded once, the message is
 edited to say who chose what and when, and the waiting lane gets it as mail
 that wakes it. A second answer is refused with the first one's name. An
-irreversible option needs a confirming tap. A note reaches the lane quoted,
+irreversible option needs a confirming tap. Without a chat, `agent-parley
+decision open` lists the open decisions and `agent-parley decision answer ID
+OPTION [NOTE]` answers one the same way, with `--yes` in place of the
+confirming tap. A note reaches the lane quoted,
 never as an instruction. A native prompt holding a lane, such as a tool
 permission or a question picker, arrives as a decision with the options the
 screen draws; the launcher presses the chosen option only while that same

@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
-from agent_parley import attachments, lifecycle, retries
+from agent_parley import attachments, lifecycle, protocol, retries, trials
 from agent_parley.state import BridgeError, Transient, lock, write_json
 
 MAX_BLOCKERS = 10
@@ -306,7 +306,8 @@ def deadline_notice(record: dict) -> dict:
     older ledgers kept after ownership ended. A no-progress notice is also
     silenced once the claim records progress after it was written, rather
     than at the supervisor's next poll, because its frozen idle age would
-    otherwise contradict the progress the holder just reported.
+    otherwise contradict the progress the holder just reported. An overdue
+    trial's notice names no holder and stands while that trial runs.
 
     Args:
         record: Published ledger record for one issue, or an empty mapping.
@@ -315,6 +316,9 @@ def deadline_notice(record: dict) -> dict:
         The recorded notice, or an empty mapping when it no longer applies.
     """
     notice = record.get("deadline_notice") or {}
+    if str(notice.get("id", "")).startswith("trial:"):
+        current = f"trial:{trials.running(record).get('id')}:"
+        return notice if notice["id"].startswith(current) else {}
     if (
         notice.get("holder")
         and notice["holder"] == record.get("owner")
@@ -738,25 +742,72 @@ def unclaimed(state: dict) -> list[str]:
         Issue numbers a lane could claim, most unblocking first.
     """
     issues = state.get("issues", {})
-    planned = waiters(state, owned_only=False)
-    waiting = waiters(state)
-    return sorted(
-        (
+    return unblocking_order(
+        state,
+        [
             number
             for number, record in issues.items()
             if not record.get("owner")
             and not record.get("offer")
+            and not trials.running(record)
             and not record.get("blocked_by")
             and not record.get("ended_on_forge")
             and lifecycle.state(record)["authorized"]
             and lifecycle.state(record)["state"]
             not in (lifecycle.COMPLETE, lifecycle.BLOCKED)
-        ),
+        ],
+    )
+
+
+def unblocking_order(state: dict, numbers: list[str]) -> list[str]:
+    """Orders candidate issues so the most unblocking one comes first.
+
+    The order `unclaimed` documents: the issues the most authorized,
+    unfinished work waits on first, then the issues more owned work waits
+    on, then the issue number, so the same ledger always gives one order.
+
+    Args:
+        state: Published issue ledger.
+        numbers: Candidate issue numbers.
+
+    Returns:
+        The same issue numbers, most unblocking first.
+    """
+    planned = waiters(state, owned_only=False)
+    waiting = waiters(state)
+    return sorted(
+        numbers,
         key=lambda number: (
             -len(planned.get(number, [])),
             -len(waiting.get(number, [])),
             int(number),
         ),
+    )
+
+
+def counted_claims(ledger: dict, agent: str) -> list[str]:
+    """Lists the claims of one lane that count toward the claim cap.
+
+    A delivered claim waits on verification and integration, not on its
+    holder, and a claim whose issue closed has nothing left to do, so
+    neither counts.
+
+    Args:
+        ledger: Issue records keyed by number.
+        agent: Lane whose claims are counted.
+
+    Returns:
+        The counted issue numbers, ordered numerically.
+    """
+    return sorted(
+        (
+            number
+            for number, item in ledger.items()
+            if (item.get("owner") == agent or trials.member(item, agent))
+            and not delivered(item)
+            and not closed(item)
+        ),
+        key=int,
     )
 
 
@@ -803,6 +854,7 @@ def change(
     takeover: dict | None = None,
     cap: int | None = None,
     usage: dict | None = None,
+    criteria: list[str] | None = None,
 ) -> dict:
     """Applies one issue transition once, however often it is retried.
 
@@ -852,6 +904,9 @@ def change(
             or an acceptance as the start its resolution is measured from.
             It is a reading, not intent, so it is excluded from the
             arguments a key is compared against.
+        criteria: Acceptance criteria read from the issue body on a claim.
+            Like a title it is forge context, excluded from the arguments a
+            key is compared against.
 
     Returns:
         The persisted issue record, including its capped transition history.
@@ -883,6 +938,7 @@ def change(
             takeover=takeover,
             cap=cap,
             usage=usage,
+            criteria=criteria,
             **transition,
         )
     key = retries.validate(key)
@@ -906,6 +962,7 @@ def change(
             takeover=takeover,
             cap=cap,
             usage=usage,
+            criteria=criteria,
             **transition,
         )
     except Transient:
@@ -916,12 +973,13 @@ def change(
 
 
 def _clear_recovery(record: dict) -> dict:
-    """Removes the previous generation's take and orphan marker.
+    """Removes the previous generation's take and orphan markers.
 
-    Both describe one ownership generation. Left on the record past a change
+    Each describes one ownership generation. Left on the record past a change
     of owner, a take makes the next claim restore a dead owner's checkpoint
-    over work handed on since, and an orphan marker hides the new owner's
-    continue offers and names an owner that no longer holds the issue.
+    over work handed on since, an orphan marker hides the new owner's
+    continue offers and names an owner that no longer holds the issue, and a
+    released orphan marker keeps a checkpoint the new owner did not take.
 
     Args:
         record: Mutable issue record whose ownership is changing.
@@ -931,7 +989,7 @@ def _clear_recovery(record: dict) -> dict:
     """
     return {
         field: record.pop(field)
-        for field in ("taken", "orphan")
+        for field in ("taken", "orphan", "released_orphan")
         if record.get(field)
     }
 
@@ -1009,6 +1067,47 @@ def _taken(
         "claim_id": record["claim_id"],
         "orphan_id": orphan.get("id", ""),
         "fence": fence["id"],
+    }
+
+
+def _released_take(directory: Path, issue: str, record: dict | None) -> dict:
+    """Returns a take of the checkpoint a released orphaned claim left.
+
+    A dead owner's claim released before anyone took it keeps its last
+    checkpoint, so the next claimant of the issue resumes that work rather
+    than starting from nothing. The owner is already gone and its claim
+    retired, so no fence is written: nothing remains to stop.
+
+    Args:
+        directory: Private state directory for the common repository.
+        issue: Repository issue number being claimed.
+        record: Published record for the issue, if any.
+
+    Returns:
+        A take naming the released owner and its checkpoint, or an empty
+        mapping when the issue has an owner, an offer pending, no released
+        orphan, or no durable checkpoint for that claim.
+    """
+    record = record or {}
+    released = record.get("released_orphan") or {}
+    if not released or record["owner"] or record.get("offer"):
+        return {}
+    from agent_parley import recovery
+
+    claim_id = str(released.get("claim_id") or "")
+    try:
+        saved = recovery.checkpoint(directory, issue, claim_id)
+    except BridgeError:
+        return {}
+    return {
+        "from": released.get("owner", ""),
+        "reason": released.get("reason", ""),
+        "at": time.time(),
+        "reservations": [],
+        "checkpoint": saved,
+        "claim_id": claim_id,
+        "orphan_id": released.get("id", ""),
+        "fence": "",
     }
 
 
@@ -1214,16 +1313,7 @@ def _within_cap(ledger: dict, agent: str, cap: int | None) -> None:
     Raises:
         BridgeError: If the lane already holds the cap.
     """
-    held = sorted(
-        (
-            number
-            for number, item in ledger.items()
-            if item["owner"] == agent
-            and not delivered(item)
-            and not closed(item)
-        ),
-        key=int,
-    )
+    held = counted_claims(ledger, agent)
     if not cap or len(held) < cap:
         return
     now = time.time()
@@ -1375,6 +1465,7 @@ def _change(
     takeover: dict | None = None,
     cap: int | None = None,
     usage: dict | None = None,
+    criteria: list[str] | None = None,
 ) -> dict:
     """Applies one issue transition while holding the repository lock.
 
@@ -1419,6 +1510,9 @@ def _change(
             past the cap one offer at a time.
         usage: The acting lane's consumption reading, kept on a claim or an
             acceptance it makes as the start of the new generation.
+        criteria: Acceptance criteria read from the issue body on a claim,
+            kept on the record as ``criteria``. None, a forge that could not
+            be read, leaves any previously recorded list in place.
 
     A transition that ends an ownership generation, by releasing it, by
     handing it to another lane, by taking it from an orphaned owner or by the
@@ -1459,6 +1553,14 @@ def _change(
                 recorded, action, scope.rsplit("\x00", 1)[1], fingerprint
             )
         record = state["issues"].get(issue)
+        if action in ("claim", "assign", "request") and trials.running(record):
+            raise BridgeError(
+                f"Issue #{issue} is in a trial across "
+                + ", ".join(sorted(trials.running(record)["lanes"]))
+                + "; the operator ends it with trial keep "
+                + f"{issue} --lane NAME.",
+                next_command=f"agent-parley trial show {issue}",
+            )
         if action == "claim":
             orphan = (record or {}).get("orphan") or {}
             taken: dict = {}
@@ -1485,11 +1587,15 @@ def _change(
                             else ""
                         ),
                         next_command=(
-                            f"agent-parley issue claim {issue} --take-orphaned"
+                            f"{protocol.cli_command()} issue claim {issue} "
+                            "--take-orphaned"
                             if orphan
-                            else f"agent-parley issue request {issue}"
+                            else f"{protocol.cli_command()} issue request "
+                            f"{issue}"
                         ),
                     )
+            elif taken := _released_take(directory, issue, record):
+                logged = "take"
             elif take_orphaned:
                 raise BridgeError(
                     f"Issue #{issue} has no orphaned owner to take it from; "
@@ -1505,10 +1611,10 @@ def _change(
                     f"{recipient} answers the offer, or the operator "
                     "withdraws it with issue assign --unassign, first.",
                     next_command=(
-                        f"agent-parley issue accept {issue} "
+                        f"{protocol.cli_command()} issue accept {issue} "
                         f"--offer-id {pending['id']}"
                         if recipient == agent
-                        else f"agent-parley issue show {issue}"
+                        else f"{protocol.cli_command()} issue show {issue}"
                     ),
                 )
             if not record or record["owner"] != agent:
@@ -1538,6 +1644,9 @@ def _change(
             resolved = title if title else previous.get("title")
             if resolved:
                 record["title"] = resolved
+            stated = previous.get("criteria") if criteria is None else criteria
+            if stated is not None:
+                record["criteria"] = stated
             if taken or reclaimed:
                 if inherited := previous.get("handoff"):
                     record["handoff"] = inherited
@@ -1676,10 +1785,17 @@ def _change(
                     inherited = record.pop("handoff", None) or {}
                     attachments.remove(directory, inherited.get("diff", ""))
                     lifecycle.drop_offer(directory, record)
+                    orphan = record.get("orphan") or {}
+                    dead = orphan.get("owner") == record["owner"]
                     record.update(
                         owner=None, offer=None, request=None, deadline=None
                     )
                     cleared = _clear_recovery(record)
+                    if dead:
+                        record["released_orphan"] = {
+                            **orphan,
+                            "claim_id": retired,
+                        }
                 elif action == "block":
                     waiting = record.get("blocked_by", [])
                     known = state["issues"].get(blocker)
@@ -2030,7 +2146,7 @@ def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
     owned = {
         number: record
         for number, record in ledger.items()
-        if record["owner"] == name
+        if record["owner"] == name or trials.member(record, name)
     }
     held = ", ".join(f"#{number}" for number in sorted(owned, key=int))
     if issue:
@@ -2042,9 +2158,9 @@ def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
                 + (f"; {holder} owns it." if holder else "; it is unclaimed.")
                 + (f" {name} owns {held}." if held else ""),
                 next_command=(
-                    f"agent-parley issue request {number}"
+                    f"{protocol.cli_command()} issue request {number}"
                     if holder
-                    else f"agent-parley issue claim {number}"
+                    else f"{protocol.cli_command()} issue claim {number}"
                 ),
             )
     elif len(owned) > 1:
@@ -2056,6 +2172,13 @@ def exact_claim(directory: Path, name: str, issue: str = "") -> dict:
         return {"issue": None, "claim_id": None}
     else:
         number = next(iter(owned))
+    trial = trials.running(owned[number])
+    if name in trial.get("lanes", {}):
+        return {
+            "issue": int(number),
+            "claim_id": trial["lanes"][name]["claim_id"],
+            "trial": True,
+        }
     return {"issue": int(number), "claim_id": owned[number].get("claim_id")}
 
 

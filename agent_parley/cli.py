@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         checkpoints,
         completion,
         convergence,
+        criteria,
         evidence,
         followups,
         forge,
@@ -44,17 +45,20 @@ if TYPE_CHECKING:
         metrics,
         notify,
         plan,
+        polling,
         problems,
         process,
         protocol,
         recaps,
         reclaim,
         recommend,
+        reviews,
         roster,
         state,
         store,
         supervision,
         terminal,
+        verification,
         views,
         worktrees,
     )
@@ -143,6 +147,7 @@ DEFERRED_MODULES = (
     "completion",
     "convergence",
     "copilot",
+    "criteria",
     "delivery",
     "dialogs",
     "evidence",
@@ -160,6 +165,7 @@ DEFERRED_MODULES = (
     "notify",
     "opencode",
     "plan",
+    "polling",
     "problems",
     "process",
     "protocol",
@@ -167,12 +173,14 @@ DEFERRED_MODULES = (
     "reclaim",
     "recommend",
     "retries",
+    "reviews",
     "roster",
     "state",
     "store",
     "supervision",
     "tables",
     "terminal",
+    "verification",
     "views",
     "watch",
     "worktrees",
@@ -362,6 +370,7 @@ REPO_HELP = (
     "Repository root or any of its worktrees; defaults to the current "
     "directory."
 )
+RUN_TASK = "Check shared coordination state and await my task."
 RETRY_HELP = (
     "Idempotency key. Retry a failed command with the key it first used and "
     "the repeat returns the first result without applying the change again. "
@@ -941,10 +950,186 @@ def decision_lines(page: dict) -> list[str]:
             f"Decision {row['id']}  {row['created_ts']}  "
             f"{row['sender']}  {subject}"
         )
+        if row.get("superseded_ts"):
+            lines.append(
+                f"  Superseded {row['superseded_ts']}: "
+                f"{row.get('superseded_reason') or 'no reason recorded'}"
+            )
         lines.append("  " + " ".join(str(row["body_md"]).split()))
     if page["has_more"]:
         lines.append("More decisions match; raise --limit or narrow the query.")
     return lines
+
+
+def checkpoint_lines(listed: dict) -> list[str]:
+    """Formats a lane's recorded checkpoints as compact rows.
+
+    Args:
+        listed: Reading as ``Bridge.lane_checkpoints`` reports it.
+
+    Returns:
+        One row per checkpoint, newest first, each followed by the decisions
+        the lane recorded since, or one sentence saying none was recorded.
+    """
+    name = listed["participant"]
+    if not listed["checkpoints"]:
+        return [
+            f"{name} has no recorded checkpoint. A checkpoint is recorded "
+            "while the lane holds a claim."
+        ]
+    lines = [f"{name} is on {listed['branch']}."]
+    for entry in listed["checkpoints"]:
+        captured = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.gmtime(float(entry.get("captured_at") or 0)),
+        )
+        claimed = " ".join(f"#{number}" for number in entry.get("issues", []))
+        decisions = entry["decisions"]
+        lines.append(
+            f"Checkpoint {entry['id']}  {captured}  {entry['head'][:12]}  "
+            f"{entry.get('branch') or 'detached'}  {claimed or '-'}  "
+            f"{len(decisions)} decision(s) since"
+        )
+        for row in decisions:
+            state = " (superseded)" if row["superseded_ts"] else ""
+            lines.append(
+                f"  Decision {row['id']}  {row['created_ts']}  "
+                f"{row['subject']}{state}"
+            )
+    return lines
+
+
+def rewind_lines(rewound: dict) -> list[str]:
+    """Formats the account of one lane rewind.
+
+    Args:
+        rewound: Result as ``Bridge.rewind`` reports it.
+
+    Returns:
+        The new and kept branches, the superseded decisions and whether the
+        lane was told.
+    """
+    name = rewound["participant"]
+    entry = rewound["checkpoint"]
+    lines = [
+        f"{name} rewound to checkpoint {entry['id']} at "
+        f"{entry['head'][:12]} on new branch {rewound['branch']}.",
+        f"Previous branch {rewound['previous_branch']} kept at "
+        f"{rewound['previous_head'][:12]}; nothing was deleted.",
+    ]
+    superseded = rewound["superseded"]
+    lines.append(
+        "Superseded decisions: "
+        + ", ".join(str(row["id"]) for row in superseded)
+        + "."
+        if superseded
+        else "No decision was superseded."
+    )
+    if "update_error" in rewound:
+        lines.append(f"The lane was not told: {rewound['update_error']}")
+    else:
+        lines.append(f"{name} was sent one update naming the checkpoint.")
+    return lines
+
+
+def waiting_decisions(directory: Path) -> list[dict]:
+    """Reads the decisions one project holds open for the operator.
+
+    Args:
+        directory: Private project state directory.
+
+    Returns:
+        One row per open decision, oldest first, with its identifier, lane,
+        kind, question, offered options, the options that take a
+        confirmation, and when it opened.
+    """
+    from agent_parley import decisions
+
+    return [
+        {
+            "id": record["id"],
+            "lane": record.get("lane") or "",
+            "kind": record.get("kind") or "",
+            "question": record.get("question") or "",
+            "options": decisions.options(record),
+            "confirm": [
+                option
+                for option in decisions.options(record)
+                if decisions.confirming(record, option)
+            ],
+            "created_at": views.timestamp(record.get("created")),
+        }
+        for record in decisions.list_open(directory)
+    ]
+
+
+def waiting_lines(rows: Sequence[dict]) -> list[str]:
+    """Formats the open decisions as an operator answers them.
+
+    Args:
+        rows: Open decisions as `waiting_decisions` reports them.
+
+    Returns:
+        A heading line and an options line per decision, or one sentence
+        saying none is open.
+    """
+    if not rows:
+        return ["No decision is waiting on the operator."]
+    lines = []
+    for row in rows:
+        lines.append(
+            f"Decision {row['id']}  {row['lane'] or '-'}  {row['question']}"
+        )
+        offered = ", ".join(
+            f"{option} (needs --yes)" if option in row["confirm"] else option
+            for option in row["options"]
+        )
+        lines.append(f"  options: {offered}")
+    lines.append("Answer one with: agent-parley decision answer ID OPTION")
+    return lines
+
+
+def answered_decision(home: Path, args: argparse.Namespace) -> str:
+    """Answers one open decision from the command line.
+
+    The answer takes the chat's own path, so it is refused, confirmed,
+    recorded and handed to the waiting lane exactly as a typed chat answer
+    is, with ``cli`` as the one who answered.
+
+    Args:
+        home: Private bridge state root.
+        args: Parsed `decision answer` arguments.
+
+    Returns:
+        The line or JSON document reporting the answer.
+
+    Raises:
+        BridgeError: If the decision is unknown, no longer open or does not
+            offer the option, or the option takes a confirmation that
+            ``--yes`` did not give.
+    """
+    outcome, record = inbound.decide(
+        home, args.id, args.option, "cli", " ".join(args.note), args.yes
+    )
+    if outcome == inbound.CONFIRMING:
+        raise BridgeError(
+            f"Decision {args.id} option {args.option!r} takes a "
+            "confirmation; nothing was answered. Rerun with --yes to "
+            "answer it."
+        )
+    if args.json:
+        return views.render(
+            "decision_answer",
+            {
+                "id": record["id"],
+                "lane": record.get("lane") or "",
+                "answer": record["answer"],
+                "answered_by": record["answered_by"],
+                "note": record.get("note") or "",
+            },
+        )
+    lane = record.get("lane") or "no lane"
+    return f"Decision {record['id']} for {lane} answered {record['answer']}."
 
 
 def reported_lanes(report: dict) -> int:
@@ -1015,6 +1200,11 @@ def lane_detail(record: dict, data: dict) -> None:
         f"  {agent} ({record['identity']}): {record['session']}\n"
         f"    Provider: {record['provider']}; {account}"
     )
+    if record.get("model") or record.get("effort"):
+        print(
+            f"    Model: {record.get('model') or 'provider default'}; "
+            f"effort: {record.get('effort') or 'provider default'}"
+        )
     print(
         f"    Availability: {record['availability']['state']}; "
         "session process alive: "
@@ -1026,7 +1216,7 @@ def lane_detail(record: dict, data: dict) -> None:
         )
     if timing := launch_line(data["participants"][agent].get("launch")):
         print(f"    {timing}")
-    if record["idle"]["stalled"]:
+    if record["idle"]["marker"]:
         print(f"    {record['idle']['marker']}")
     if record["budget"]["marker"]:
         print(f"    {record['budget']['marker']}")
@@ -1146,8 +1336,12 @@ def lane_detail(record: dict, data: dict) -> None:
         print("    " + supervision.operator_edit_marker(edited))
     if record["base_advance_paths"]:
         print("    " + record["base_advance"])
+    if conflicts := record.get("merge_conflicts"):
+        print("    " + forecast.marker(conflicts))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
+    if mail.get("reserved_symbols"):
+        print("    Symbols reserved: " + ", ".join(mail["reserved_symbols"]))
     if topics := mail.get("unread_topics"):
         print(
             "    Unread by topic: "
@@ -1591,12 +1785,17 @@ def selection_plan(
     return "\n".join(lines)
 
 
-def confirmed(proposal: str, assume_yes: bool) -> bool:
+def confirmed(
+    proposal: str,
+    assume_yes: bool,
+    question: str = "Proceed with these lanes?",
+) -> bool:
     """Prints one plan and asks once for the whole selected set.
 
     Args:
         proposal: The plan the operator reads before answering.
         assume_yes: Whether `--yes` already confirmed the whole set.
+        question: What the prompt asks, naming everything the plan changes.
 
     Returns:
         Whether the operator confirmed. A closed or empty answer declines.
@@ -1605,7 +1804,7 @@ def confirmed(proposal: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
     try:
-        answer = input("Proceed with these lanes? [y/N]: ")
+        answer = input(f"{question} [y/N]: ")
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes")
@@ -1651,6 +1850,73 @@ def shown_paths(paths: Sequence[str]) -> list[str]:
     return shown
 
 
+def lane_ignored(participant: dict) -> list[str]:
+    """Names the ignored paths removing every worktree of a lane deletes.
+
+    Args:
+        participant: Participant record from the manifest.
+
+    Returns:
+        Ignored paths of the lane's own worktree as they are, then those of
+        each existing linked worktree written ``NAME//path``.
+    """
+    return [
+        f"{name}//{path}" if name else path
+        for name, tree, _ in roster.worktrees(participant)
+        if tree.exists()
+        for path in ignored_paths(tree)
+    ]
+
+
+def removable(
+    tree: Path,
+    owner: str,
+    discard: Sequence[str],
+    *,
+    prefix: str = "",
+    action: str = "retire",
+    confirm: str = "",
+) -> None:
+    """Refuses removing a worktree that holds work its removal loses.
+
+    ``git worktree remove`` refuses uncommitted changes, but it deletes
+    ignored files, which ``git status`` never reports. Checking every
+    worktree of a removal before the first one is removed keeps a refusal
+    from leaving the removal half done.
+
+    Args:
+        tree: Existing worktree about to be removed.
+        owner: Name the refusal gives the worktree's lane.
+        discard: Ignored paths the operator agreed to delete.
+        prefix: ``NAME//`` for a linked worktree, so its ignored paths are
+            matched against ``discard`` as ``NAME//path``.
+        action: Command the refusal says never discards work.
+        confirm: Clause naming how to confirm deleting the ignored files,
+            or empty when nothing confirms it.
+
+    Raises:
+        BridgeError: If the worktree holds uncommitted changes or an
+            ignored path ``discard`` does not name.
+    """
+    if git(tree, "status", "--porcelain"):
+        raise BridgeError(
+            f"{owner} has uncommitted changes. Commit or preserve them "
+            f"first; {action} never discards work.",
+            next_command=worktrees.commit_all(tree),
+        )
+    kept = [
+        prefix + path
+        for path in ignored_paths(tree)
+        if prefix + path not in discard
+    ]
+    if kept:
+        raise BridgeError(
+            f"{owner}'s worktree holds ignored files that removing it "
+            f"deletes: {', '.join(shown_paths(kept))}. Move them first"
+            f"{confirm}."
+        )
+
+
 def retired_lane(
     bridge: Bridge, repo: Path, name: str, assume_yes: bool
 ) -> str:
@@ -1672,8 +1938,7 @@ def retired_lane(
     """
     _, data = lane_roster(bridge, repo)
     participant = data["participants"].get(name)
-    lane = Path(participant["lane"]) if participant else None
-    ignored = ignored_paths(lane) if lane and lane.exists() else []
+    ignored = lane_ignored(participant) if participant else []
     if ignored and not confirmed(
         f"Retiring {name} deletes these ignored files:\n"
         + "\n".join(f"- {path}" for path in shown_paths(ignored)),
@@ -1712,6 +1977,150 @@ def retired_ready(bridge: Bridge, repo: Path, assume_yes: bool) -> int:
         lambda name: retired_lane(bridge, repo, name, assume_yes),
         assume_yes=True,
     )
+
+
+def remedy_label(row: dict) -> str:
+    """Names one remedy `problems --apply` lists.
+
+    Args:
+        row: A row `problems.remedies` returned.
+
+    Returns:
+        What the remedy does and to which lane or project.
+    """
+    if row["action"]["kind"] == problems.RETIRE_ACTION:
+        return f"retire {row['participant']} in {row['project']}"
+    return f"collect the state of {row['project']}"
+
+
+def applied_remedy(bridge: Bridge, row: dict) -> str:
+    """Runs one safe remedy through the command that owns it.
+
+    A retirement takes `Bridge.retire` without discarding any ignored file,
+    so it still refuses a lane that is busy, has a running session or
+    holds uncommitted changes when the apply reaches it. A collection takes
+    `supervision.forget`, which keeps the recovery checkpoints.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        row: A row `problems.remedies` classed safe.
+
+    Returns:
+        The account the remedy produced.
+
+    Raises:
+        BridgeError: If the owning command refuses the remedy.
+    """
+    if row["action"]["kind"] == problems.RETIRE_ACTION:
+        return bridge.retire(Path(row["project"]), row["participant"])
+    removed = supervision.forget(bridge.home, row["project"], apply=True)
+    return " ".join(supervision.forgotten_lines(removed))
+
+
+def session_returned(bridge: Bridge, row: dict) -> bool:
+    """Tells whether a retirement's lane may have a session again.
+
+    The listing read the session process before the prompt, and the
+    operator may answer much later. A native session started in the
+    worktree since then holds no session lock, so the process is read once
+    more right before the retirement, which runs only while it is known to
+    be gone.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        row: A row `problems.remedies` classed safe.
+
+    Returns:
+        True when the row retires a lane whose session process is now alive
+        or unreadable; False for a gone process or a collection.
+
+    Raises:
+        BridgeError: If the row's project is no longer registered.
+    """
+    if row["action"]["kind"] != problems.RETIRE_ACTION:
+        return False
+    directory = bridge.project(Path(row["project"]), create=False)[1]
+    reading = supervision.presence(directory, row["participant"])
+    return reading["process_alive"] is not False
+
+
+def applied_remedies(bridge: Bridge, rows: list[dict], assume_yes: bool) -> int:
+    """Runs every remedy `problems` classes safe, after one confirmation.
+
+    The plan names each safe remedy and each skipped one with its reason,
+    and one question covers the whole safe set, naming the lanes it retires
+    and the projects whose state it collects. A remedy that refuses or
+    fails is reported beside its label while the rest are still run. A
+    retirement whose session process `session_returned` finds again is
+    reported skipped, not failed.
+
+    Args:
+        bridge: Launcher holding the private coordination state.
+        rows: Rows `problems.derive` produced.
+        assume_yes: Whether `--yes` already confirmed the safe set.
+
+    Returns:
+        0 when every safe remedy ran or none was safe; 1 when the operator
+        declined or left the question unanswered, or any remedy failed.
+    """
+    found = problems.remedies(bridge.home, rows)
+    safe = [row for row in found if row["action"]["safe"]]
+    skipped = [row for row in found if not row["action"]["safe"]]
+    plan = ["", f"Plan: run {len(safe)} safe remedy(s)."]
+    plan += [f"- {remedy_label(row)}" for row in safe]
+    if skipped:
+        plan.append(f"Skipped {len(skipped)}, each with its reason:")
+        plan += [
+            f"- {remedy_label(row)}: {row['action']['reason']}"
+            for row in skipped
+        ]
+    if not safe:
+        plan.append("No safe remedy to run, so nothing was done.")
+        print("\n".join(plan))
+        return 0
+    retiring = sum(
+        row["action"]["kind"] == problems.RETIRE_ACTION for row in safe
+    )
+    changes = []
+    if retiring:
+        changes.append(f"retiring {retiring} lane(s)")
+    if len(safe) > retiring:
+        changes.append(
+            f"collecting the state of {len(safe) - retiring} project(s)"
+        )
+    question = f"Proceed with {' and '.join(changes)}?"
+    if not confirmed("\n".join(plan), assume_yes, question):
+        print("Declined: nothing was done.")
+        return 1
+    failed = []
+    late = []
+    for row in safe:
+        label = remedy_label(row)
+        try:
+            if session_returned(bridge, row):
+                print(
+                    f"- {label}: skipped. Its session process may be "
+                    "running again, so the lane is kept."
+                )
+                late.append(label)
+                continue
+            print(f"- {label}: {applied_remedy(bridge, row)}")
+        except (
+            BridgeError,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+        ) as failure:
+            print(f"- {label}: failed. {failure}")
+            failed.append(label)
+    ran = len(safe) - len(failed) - len(late)
+    tally = f"Ran {ran} of {len(safe)} safe remedy(s)"
+    if late:
+        tally += f". Skipped: {'; '.join(late)}"
+    if failed:
+        tally += f". Failed: {'; '.join(failed)}"
+    print(f"{tally}.")
+    return 1 if failed else 0
 
 
 def bulk_lanes(
@@ -2350,6 +2759,186 @@ class Bridge(
             git(lane, "switch", branch)
             return f"{name} restored to {branch} from {actual}."
 
+    def lane_checkpoints(self, repo: Path, name: str) -> dict:
+        """Lists the checkpoints a lane can be rewound to, newest first.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose checkpoints are listed.
+
+        Returns:
+            The lane's name and assigned branch, and each recorded
+            checkpoint with its commit, branch, capture time, the issues
+            the lane owned then and the decisions the lane recorded since.
+
+        Raises:
+            BridgeError: If the participant does not exist.
+        """
+        from agent_parley import recovery
+
+        directory, data, participant = self._lane(repo, name)
+        listed = [
+            {
+                **entry,
+                "decisions": store.lane_decisions(
+                    self.home,
+                    data["root"],
+                    participant["display"],
+                    float(entry.get("captured_at") or 0),
+                ),
+            }
+            for entry in reversed(recovery.history(directory, name))
+        ]
+        return {
+            "participant": name,
+            "branch": participant["branch"],
+            "checkpoints": listed,
+        }
+
+    def rewind(self, repo: Path, name: str, identifier: str) -> dict:
+        """Moves a lane onto a new branch at one of its recorded checkpoints.
+
+        Nothing is deleted or reset. The new branch starts at the
+        checkpoint's commit and becomes the lane's assigned branch; the
+        branch the lane was on keeps every commit and is named in the
+        update the lane receives. A worktree holding uncommitted or
+        untracked changes is refused with its paths and never stashed or
+        cleaned. A lane mid-turn is refused rather than stopped or waited
+        on: the rewind runs only when the lane's last native event says its
+        turn ended, or no session runs. The check is made under the lane's
+        checkpoint lock, which every native hook takes before it records a
+        new turn, so a turn cannot begin between the check and the switch.
+        Decisions the lane recorded after the checkpoint are marked
+        superseded and keep their text. Claims, reservations and the lane's
+        holder identity are left exactly as they were.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose lane is rewound.
+            identifier: Checkpoint identifier `lane_checkpoints` lists.
+
+        Returns:
+            The checkpoint, the new and previous branches, the decisions
+            superseded and the update sent to the lane.
+
+        Raises:
+            BridgeError: If the participant or checkpoint is unknown, the
+                lane is mid-turn, off its assigned branch or dirty, or the
+                checkpoint's commit is no longer in the repository.
+        """
+        from agent_parley import recovery
+
+        directory, _, _ = self._lane(repo, name)
+        busy = f"{name} is recording a checkpoint; retry in a moment."
+        with (
+            lock(directory / "setup.lock"),
+            lock(directory / f"{name}-checkpoint.lock", busy, timeout=1),
+            lock(directory / f"{name}-capture.lock", busy, timeout=1),
+        ):
+            data = roster.read(directory)
+            participant = data["participants"].get(name)
+            if participant is None:
+                raise BridgeError(
+                    f"{name} was retired while this command ran; nothing "
+                    "changed."
+                )
+            entry = recovery.recorded(directory, name, identifier)
+            lane = Path(participant["lane"])
+            previous = participant["branch"]
+            published = activity(directory, name)
+            reading = supervision.lane_state(published)
+            if reading["state"] != supervision.STOPPED and not (
+                reading["state"] == supervision.IDLE
+                and published.get("activity") == "idle"
+            ):
+                raise BridgeError(
+                    f"{name} is not between turns ({reading['evidence']}); "
+                    "rewind never stops a running turn. Retry once the lane "
+                    "is idle; nothing changed."
+                )
+            if not lane.exists():
+                raise BridgeError(f"{name} has no worktree at {lane}.")
+            if lane_branch(lane) != previous:
+                raise BridgeError(
+                    f"{name} is not on its assigned branch {previous}; run "
+                    f"agent-parley participant restore {name} first.",
+                    next_command=f"agent-parley participant restore {name}",
+                )
+            changed = supervision.dirty_paths(str(lane))
+            if changed is None:
+                raise BridgeError(
+                    f"Git could not read {name}'s worktree; nothing changed."
+                )
+            if changed:
+                raise BridgeError(
+                    f"{name} has uncommitted changes: "
+                    f"{', '.join(shown_paths(changed))}. Commit or preserve "
+                    "them first; rewind never stashes or discards work.",
+                    next_command=worktrees.commit_all(lane),
+                )
+            head = str(entry["head"])
+            try:
+                git(lane, "cat-file", "-e", f"{head}^{{commit}}")
+            except BridgeError:
+                raise BridgeError(
+                    f"Checkpoint {identifier} names commit {head[:12]}, "
+                    "which the repository no longer holds; nothing changed."
+                ) from None
+            previous_head = git(lane, "rev-parse", "HEAD")
+            target = f"{previous}-rewind-{identifier}"
+            suffix = 1
+            while has_branch(lane, target):
+                suffix += 1
+                target = f"{previous}-rewind-{identifier}-{suffix}"
+            git(lane, "switch", "-c", target, head)
+            participant["branch"] = target
+            write_json(directory / "project.json", data)
+        captured = float(entry.get("captured_at") or 0)
+        superseded = store.supersede_decisions(
+            self.home,
+            data["root"],
+            participant["display"],
+            captured,
+            f"{name} was rewound to checkpoint {identifier}",
+        )
+        when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(captured))
+        dropped = (
+            "Decisions you recorded after it are superseded and stay in the "
+            "log for reference: "
+            + "; ".join(
+                f"decision {row['id']} {row['subject']!r}" for row in superseded
+            )
+            + "."
+            if superseded
+            else "No decision you recorded after it was superseded."
+        )
+        text = (
+            f"The operator rewound your lane to checkpoint {identifier}, "
+            f"commit {head[:12]} captured {when}. Your worktree is now on "
+            f"the new branch {target}. The previous branch {previous} is "
+            f"kept untouched at {previous_head[:12]}; nothing was deleted. "
+            f"{dropped} Your claims and reservations are unchanged. "
+            "Continue from this commit."
+        )
+        result = {
+            "participant": name,
+            "checkpoint": entry,
+            "branch": target,
+            "previous_branch": previous,
+            "previous_head": previous_head,
+            "superseded": superseded,
+        }
+        try:
+            result["update"] = self.say(
+                repo,
+                name,
+                text,
+                f"Rewound to checkpoint {identifier}",
+            )
+        except BridgeError as exc:
+            result["update_error"] = str(exc)
+        return result
+
     def retire(self, repo: Path, name: str, discard: Sequence[str] = ()) -> str:
         """Removes a participant's lane while preserving any work it holds.
 
@@ -2362,6 +2951,9 @@ class Bridge(
         retirement before anything is removed. Removing the worktree deletes
         its ignored files, which `git status` never reports, so they are
         deleted only when every one of them was named in ``discard``. The
+        lane's worktrees in linked repositories are checked the same way,
+        their ignored paths written ``NAME//path``, and every worktree is
+        checked before the first one is removed. The
         lane's session and checkpoint locks are both taken before the first
         irreversible step, so a busy lane refuses the retirement with its
         worktree, branch, credential and record intact rather than failing
@@ -2402,25 +2994,25 @@ class Bridge(
                 ),
                 lock(directory / f"{name}-checkpoint.lock", timeout=1),
             ):
-                if lane.exists():
-                    if git(lane, "status", "--porcelain"):
-                        raise BridgeError(
-                            f"{name} has uncommitted changes. Commit or "
-                            "preserve them first; retire never discards work.",
-                            next_command=worktrees.commit_all(lane),
+                for link, tree, _ in roster.worktrees(participant):
+                    if tree.exists():
+                        removable(
+                            tree,
+                            f"{name} in {link}" if link else name,
+                            discard,
+                            prefix=f"{link}//" if link else "",
+                            confirm=(
+                                ", or run `agent-parley participant retire "
+                                f"{name}` to confirm deleting them"
+                            ),
                         )
-                    kept = [
-                        path
-                        for path in ignored_paths(lane)
-                        if path not in discard
-                    ]
-                    if kept:
-                        raise BridgeError(
-                            f"{name}'s worktree holds ignored files that "
-                            f"removing it deletes: "
-                            f"{', '.join(shown_paths(kept))}. Move "
-                            "them first, or run `agent-parley participant "
-                            f"retire {name}` to confirm deleting them."
+                for link, tree, _ in roster.worktrees(participant)[1:]:
+                    if tree.exists():
+                        git(
+                            Path(data["links"][link]),
+                            "worktree",
+                            "remove",
+                            str(tree),
                         )
                 retirement.return_work(directory, data, name)
                 if lane.exists():
@@ -2466,6 +3058,7 @@ class Bridge(
                 for suffix in (
                     "identity.json",
                     "activity.json",
+                    "checkpoints.json",
                     "mcp.json",
                     "events.jsonl",
                     "events.1.jsonl",
@@ -3001,8 +3594,8 @@ class Bridge(
         if not claimed:
             raise BridgeError(
                 f"{name} claims no issue, so the pull request would carry no "
-                "issue reference. Run `agent-parley issue claim NUMBER` in "
-                "the lane first."
+                f"issue reference. Run `{protocol.cli_command()} issue claim "
+                "NUMBER` in the lane first."
             )
         policy = data.get("pull_request", {})
         labels, milestone = hygiene_metadata(root, claimed, policy)
@@ -3184,12 +3777,13 @@ class Bridge(
         for row in rows:
             if not row["reclaim"]:
                 continue
-            lane = Path(manifest["participants"][row["participant"]]["lane"])
             try:
                 self.retire(
                     repo,
                     row["participant"],
-                    discard=ignored_paths(lane) if lane.exists() else (),
+                    discard=lane_ignored(
+                        manifest["participants"][row["participant"]]
+                    ),
                 )
             except BridgeError as exc:
                 row.update(reclaim=False, removed=False, reason=str(exc))
@@ -3284,6 +3878,8 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Coordination",
         (
             "issue",
+            "trial",
+            "milestone",
             "followup",
             "mail",
             "say",
@@ -3302,11 +3898,13 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "approval",
             "verify",
             "unattended",
+            "policy",
             "timeout",
             "init",
             "pool",
             "blueprint",
             "branch",
+            "link",
             "forge",
             "deadlines",
             "budget",
@@ -3326,9 +3924,11 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "metrics",
             "history",
             "events",
+            "audit",
             "problems",
             "doctor",
             "notify",
+            "merge",
         ),
     ),
     (
@@ -3401,6 +4001,41 @@ class Absorbed:
 
 
 WHOLE_PARSER = frozenset({"completion", "__complete"})
+SHOW_BY_DEFAULT = frozenset(
+    {"unattended", "verify", "init", "pool", "approval", "timeout"}
+)
+
+
+def with_default_action(arguments: Sequence[str]) -> list[str]:
+    """Adds ``show`` to a policy command typed without an action.
+
+    Only a command in `SHOW_BY_DEFAULT` that is followed by nothing, or by an
+    option other than a help flag, gains the action, so a command that
+    changes state still demands its own action.
+
+    Args:
+        arguments: Arguments as typed, without the program name.
+
+    Returns:
+        The arguments, with ``show`` after the command when it was omitted.
+    """
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token in ("-V", "--version"):
+            index += 1
+        elif token == "--home":
+            index += 2
+        elif token.startswith("--home="):
+            index += 1
+        else:
+            break
+    if index >= len(arguments) or arguments[index] not in SHOW_BY_DEFAULT:
+        return list(arguments)
+    rest = arguments[index + 1 :]
+    if rest and (not rest[0].startswith("-") or rest[0] in ("-h", "--help")):
+        return list(arguments)
+    return [*arguments[: index + 1], "show", *rest]
 
 
 class CommandIndex:
@@ -3738,7 +4373,7 @@ def lane_reading(bridge: Bridge, repo: Path, name: str) -> tuple[dict, dict]:
 
 
 def issue_lines(reading: dict) -> str:
-    """Renders one issue's ownership, blockers, reservations and history.
+    """Renders an issue's ownership, blockers, criteria and history.
 
     Args:
         reading: Reading produced by the issue show command.
@@ -3780,8 +4415,19 @@ def issue_lines(reading: dict) -> str:
         "Reservations held: "
         + (", ".join(reading["reservations"]) or "none recorded")
     )
+    for flagged in reading.get("contention") or []:
+        lines.append(
+            f"Contention with {flagged['peer']} on {flagged['path']}: "
+            f"{flagged['count']} refusals; {flagged['peer']} holds "
+            + (
+                ", ".join(f"#{held}" for held in flagged["issues"])
+                or "no issue"
+            )
+            + "; the operator hands off or releases one"
+        )
     if reading.get("convergence"):
         lines.append(convergence.describe(reading["convergence"]))
+    lines.extend(criteria.lines(record))
     reported = reading["history"]
     lines.append(
         history.describe(
@@ -4174,8 +4820,9 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         help=(
             "Show only these columns, comma separated, such as "
             "PARTICIPANT,STATE,IDLE, or all for every column. The default "
-            "leaves out PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED and "
-            "FIT."
+            "leaves out PROVIDER, EVENT, REVIEW, CONTEXT, CALLS, UNUSED, FIT "
+            "and MERGED, the merge fraction over the --since window or the "
+            "last 7 days."
         ),
     )
     watch.add_argument(
@@ -4262,6 +4909,58 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     delivered.add_argument("--json", action="store_true", help=JSON_HELP)
+    compared = readings.add_parser(
+        "trials",
+        help=(
+            "Aggregate ended trial outcomes per provider: lanes kept and "
+            "released, wall time to ready and client-reported tokens."
+        ),
+    )
+    compared.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        default=0.0,
+        metavar="TIME",
+        help="Count only trials that ended at or after this instant or window.",
+    )
+    compared.add_argument("--json", action="store_true", help=JSON_HELP)
+    verified = readings.add_parser(
+        "verification",
+        help=(
+            "Report the find rate of review rounds and child reports by "
+            "issue label and by provider and model."
+        ),
+    )
+    verified.add_argument(
+        "--since",
+        dest="window",
+        type=duration,
+        default=verification.WINDOW,
+        metavar="WINDOW",
+        help="Count outcomes inside this window, such as 7d; 30d by default.",
+    )
+    verified.add_argument("--json", action="store_true", help=JSON_HELP)
+    spent = readings.add_parser(
+        "cost",
+        help=(
+            "Estimate the cost per merged issue, merged pull request and "
+            "review finding by lane and provider, from client token counts "
+            "and the operator's recorded prices."
+        ),
+    )
+    spent.add_argument(
+        "--since",
+        dest="start",
+        type=instant,
+        required=True,
+        metavar="TIME",
+        help=(
+            "Start of the window, such as 2026-10-15T09:01:00Z, or a window "
+            "counted back from now, such as 7d."
+        ),
+    )
+    spent.add_argument("--json", action="store_true", help=JSON_HELP)
     follow = commands.add_parser(
         "watch",
         help=(
@@ -4410,6 +5109,74 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     "otherwise."
                 ),
             )
+    audited = commands.add_parser(
+        "audit",
+        help="Export or verify a hash-chained, signable audit bundle.",
+    )
+    audits = audited.add_subparsers(dest="action", required=True)
+    exported = audits.add_parser(
+        "export",
+        help=(
+            "Write one JSON bundle of the lanes, resolved issues, claims, "
+            "handoffs, ready reports, review rounds, pull requests and "
+            "commits inside a window."
+        ),
+    )
+    exported.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    exported.add_argument(
+        "--since",
+        required=True,
+        metavar="REF",
+        help=(
+            "Window start: an instant such as 2026-10-15T09:01:00Z, a "
+            "window such as 7d, or a commit such as a tag, standing for "
+            "its committer time."
+        ),
+    )
+    exported.add_argument(
+        "--until",
+        metavar="REF",
+        help="Window end, in the same forms as --since; now by default.",
+    )
+    exported.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        metavar="FILE",
+        help="The bundle file to write.",
+    )
+    exported.add_argument(
+        "--sign",
+        type=Path,
+        metavar="KEY",
+        help=(
+            "Sign the bundle with this SSH key through ssh-keygen -Y sign; "
+            "unsigned by default."
+        ),
+    )
+    checked = audits.add_parser(
+        "verify",
+        help=(
+            "Check a bundle's hash chain and, when present, its SSH signature."
+        ),
+    )
+    checked.add_argument("bundle", type=Path, help="The bundle file.")
+    checked.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="Fail when the bundle carries no signature.",
+    )
+    checked.add_argument(
+        "--signer",
+        type=Path,
+        metavar="PUBKEY_FILE",
+        help=(
+            "Require a signature by this SSH public key; another key's "
+            "signature fails."
+        ),
+    )
     archived = commands.add_parser(
         "state",
         help="Export, inspect or import the coordination state as one archive.",
@@ -4495,7 +5262,25 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     run.add_argument(
         "participant",
+        nargs="?",
+        default="",
         help="Participant name; a new name creates its own worktree lane.",
+    )
+    run.add_argument(
+        "--lanes",
+        default="",
+        metavar="NAME[,NAME...]",
+        help=(
+            "Open each named lane in its own tmux window, each on a distinct "
+            "issue of --milestone; without tmux, print one run command per "
+            "lane."
+        ),
+    )
+    run.add_argument(
+        "--milestone",
+        default="",
+        metavar="TITLE",
+        help="Milestone whose issues --lanes claims, one per lane.",
     )
     run.add_argument(
         "--provider",
@@ -4525,7 +5310,7 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     run.add_argument(
         "--task",
-        default="Check shared coordination state and await my task.",
+        default=RUN_TASK,
         help=(
             "Opening prompt for the session, not an issue; use --issue to "
             "claim one."
@@ -4624,8 +5409,14 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     )
     report.add_argument(
         "--evidence",
-        default="",
-        help="What was checked; longer evidence is attached to the report.",
+        action="append",
+        default=[],
+        help=(
+            "What was checked; repeatable, one line each. A ready report on "
+            "an issue with acceptance criteria needs one line per criterion, "
+            "written `N: <evidence>`. Longer evidence is attached to the "
+            "report."
+        ),
     )
     report.add_argument(
         "--issue",
@@ -4763,6 +5554,16 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
                     "lane that is merely idle is never orphaned."
                 ),
             )
+            command.add_argument(
+                "--link",
+                action="append",
+                default=[],
+                metavar="NAME",
+                help=(
+                    "Also work in this linked repository: the lane gains a "
+                    "worktree there on its own branch. Repeat for several."
+                ),
+            )
         if action == "offer":
             command.add_argument(
                 "--to", required=True, help="Lane the ownership is offered to."
@@ -4861,6 +5662,17 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Return the work to the queue instead of recording it complete. "
             "It is required when the pull request was closed without merging, "
             "because nothing was integrated."
+        ),
+    )
+    resolving.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        metavar="N: TEXT",
+        help=(
+            "Evidence for one acceptance criterion of the claim; repeatable, "
+            "one per criterion. Without it the holder's ready report evidence "
+            "stands, or the forge outcome is recorded for every criterion."
         ),
     )
     resolving.add_argument("--json", action="store_true", help=JSON_HELP)
@@ -4984,6 +5796,39 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         followup_parser.add_argument(
             "--json", action="store_true", help=JSON_HELP
         )
+    trying = commands.add_parser(
+        "trial",
+        help=(
+            "Run one issue side by side across provider lanes, compare them "
+            "with trial show ISSUE, keep one with trial keep ISSUE, or end "
+            "it keeping none with trial cancel ISSUE."
+        ),
+    )
+    trying.add_argument(
+        "target",
+        metavar="ISSUE|show|keep|cancel",
+        help="Issue number to start a trial of, or show, keep or cancel.",
+    )
+    trying.add_argument(
+        "issue",
+        nargs="?",
+        default="",
+        help="Issue number the show, keep or cancel reading names.",
+    )
+    trying.add_argument(
+        "--lanes",
+        default="",
+        metavar="A,B",
+        help="Comma-separated lanes to start the trial on, at least two.",
+    )
+    trying.add_argument(
+        "--lane",
+        default="",
+        metavar="NAME",
+        help="Lane whose branch trial keep keeps.",
+    )
+    trying.add_argument("--repo", type=Path, default=Path.cwd(), help=REPO_HELP)
+    trying.add_argument("--json", action="store_true", help=JSON_HELP)
     checking = commands.add_parser(
         "doctor",
         help="Report launcher, plugin and store versions and their fit.",
@@ -5029,6 +5874,22 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "Also list the rows of lanes dead past the project's fold_after "
             "that are older than it, which one line otherwise counts."
         ),
+    )
+    triaging.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "After the list, run every remedy classed safe (retiring a lane "
+            "ready to retire whose worktree is clean, collecting a project "
+            "whose root is gone) after one question; remedies that could "
+            "drop work are listed and skipped with the reason. Exit 1 if "
+            "any remedy failed."
+        ),
+    )
+    triaging.add_argument(
+        "--yes",
+        action="store_true",
+        help="With --apply, run the safe remedies without asking.",
     )
     triage = triaging.add_subparsers(dest="action")
     acking = triage.add_parser(
@@ -5174,6 +6035,18 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "with --inbound for a group chat."
         ),
     )
+    merging = commands.add_parser(
+        "merge", help="Forecast merge conflicts between lanes."
+    )
+    merge_steps = merging.add_subparsers(dest="action", required=True)
+    landing = merge_steps.add_parser(
+        "plan",
+        help="Recommend a landing order that minimises predicted conflicts.",
+    )
+    landing.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    landing.add_argument("--json", action="store_true", help=JSON_HELP)
     planning = commands.add_parser(
         "plan", help="Apply, compare or show the recorded work-order plan."
     )
@@ -5376,11 +6249,21 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "recording the same decision again records nothing further."
         ),
     )
+    deciding.add_argument(
+        "--link",
+        default="",
+        metavar="NAME",
+        help=(
+            "Linked repository the decision concerns, recorded as [NAME] "
+            "before the subject; without it the primary repository."
+        ),
+    )
     deciding.add_argument("--json", action="store_true", help=JSON_HELP)
     decision = commands.add_parser(
         "decision",
         help=(
-            "Read the decisions recorded for this project; `decide` records "
+            "Read the decisions recorded for this project, or list and "
+            "answer the ones waiting on the operator; `decide` records "
             "a new one."
         ),
     )
@@ -5414,6 +6297,38 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         ),
     )
     decision_list.add_argument("--json", action="store_true", help=JSON_HELP)
+    decision_open = decision_actions.add_parser(
+        "open",
+        help=(
+            "List the decisions waiting on the operator in this project, "
+            "with the ID and options `decision answer` takes."
+        ),
+    )
+    decision_open.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    decision_open.add_argument("--json", action="store_true", help=JSON_HELP)
+    decision_answer = decision_actions.add_parser(
+        "answer",
+        help=(
+            "Answer one open decision as a chat answer would; the lane "
+            "waiting on it is told."
+        ),
+    )
+    decision_answer.add_argument("id", help="Decision ID, as `open` lists.")
+    decision_answer.add_argument("option", help="One option it offers.")
+    decision_answer.add_argument(
+        "note",
+        nargs="*",
+        default=[],
+        help="Note the lane receives quoted, never as an instruction.",
+    )
+    decision_answer.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm an option that takes a confirmation.",
+    )
+    decision_answer.add_argument("--json", action="store_true", help=JSON_HELP)
     participant = commands.add_parser(
         "participant", help="Inspect or add participants for a repository."
     )
@@ -5437,6 +6352,38 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     reporting_lane.add_argument("--json", action="store_true", help=JSON_HELP)
+    listing_checkpoints = roles.add_parser(
+        "checkpoints",
+        help=(
+            "List a lane's recorded checkpoints with their commit, time and "
+            "the decisions recorded since."
+        ),
+    )
+    listing_checkpoints.add_argument("name", help="Lane to list.")
+    listing_checkpoints.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    listing_checkpoints.add_argument(
+        "--json", action="store_true", help=JSON_HELP
+    )
+    rewinding = roles.add_parser(
+        "rewind",
+        help=(
+            "Move an idle, clean lane onto a new branch at a recorded "
+            "checkpoint; keep the old branch."
+        ),
+    )
+    rewinding.add_argument("name", help="Lane to rewind.")
+    rewinding.add_argument(
+        "--to",
+        required=True,
+        metavar="ID",
+        help="Checkpoint identifier `participant checkpoints` lists.",
+    )
+    rewinding.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    rewinding.add_argument("--json", action="store_true", help=JSON_HELP)
     joining = roles.add_parser(
         "add", help="Create a lane with an optional provider and credentials."
     )
@@ -5730,6 +6677,31 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     standing_run.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
+    gating = commands.add_parser(
+        "policy",
+        help="Import or check the project policy rules that gate steps.",
+    )
+    gatings = gating.add_subparsers(dest="action", required=True)
+    gating_check = gatings.add_parser(
+        "check",
+        help=(
+            "Judge every rule against every held claim; claims nothing "
+            "and changes nothing."
+        ),
+    )
+    gating_check.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    gating_import = gatings.add_parser(
+        "import",
+        help="Validate a TOML policy file and record it for the project.",
+    )
+    gating_import.add_argument(
+        "path", type=Path, help="Policy file the operator chose."
+    )
+    gating_import.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     waiting_kind = commands.add_parser(
         "timeout",
         help=(
@@ -5983,6 +6955,73 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     naming_base.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
+    linking = commands.add_parser(
+        "link",
+        help="Show, add or remove sibling repositories lanes can work in.",
+    )
+    linkings = linking.add_subparsers(dest="action", required=True)
+    link_show = linkings.add_parser(
+        "show", help="List the repositories this project links."
+    )
+    link_show.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    link_add = linkings.add_parser(
+        "add", help="Link a sibling repository; operator-only."
+    )
+    link_add.add_argument(
+        "path",
+        metavar="PATH",
+        type=Path,
+        help="Any checkout of the repository to link.",
+    )
+    link_add.add_argument(
+        "--name",
+        default="",
+        help=(
+            "Link name used by issue claim --link and in reservation keys "
+            "NAME//path; defaults to the checkout directory's name."
+        ),
+    )
+    link_add.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    link_remove = linkings.add_parser(
+        "remove",
+        help=(
+            "Remove a link and its clean lane worktrees; branches remain. "
+            "Operator-only."
+        ),
+    )
+    link_remove.add_argument("name", metavar="NAME", help="Link name.")
+    link_remove.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    milestoning = commands.add_parser(
+        "milestone",
+        help="Read how a milestone's open issues depend on one another.",
+    )
+    milestone_actions = milestoning.add_subparsers(dest="action", required=True)
+    milestone_path = milestone_actions.add_parser(
+        "path",
+        help=(
+            "Print the critical path of a milestone with each issue's state "
+            "and holder; it claims nothing."
+        ),
+    )
+    milestone_path.add_argument(
+        "--milestone",
+        default=None,
+        metavar="TITLE",
+        help=(
+            "Milestone to read; the forge's active milestone when omitted, "
+            "every cached open issue when the forge names none."
+        ),
+    )
+    milestone_path.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    milestone_path.add_argument("--json", action="store_true", help=JSON_HELP)
     tracker = commands.add_parser(
         "forge",
         help="Show or set the issue tracker this project coordinates over.",
@@ -6220,6 +7259,21 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
             "fetched, and refused from a lane."
         ),
     )
+    pricing.add_argument(
+        "--model",
+        metavar="NAME",
+        help=(
+            "Record this model's rates for `metrics cost`; needs --input, "
+            "--output and --cache-read."
+        ),
+    )
+    for rate in ("input", "output", "cache-read"):
+        pricing.add_argument(
+            f"--{rate}",
+            type=float,
+            metavar="AMOUNT",
+            help=f"Price per million {rate} tokens of --model.",
+        )
     accounts = commands.add_parser(
         "credentials", help="Inspect or define per-account profiles."
     )
@@ -6384,6 +7438,71 @@ def root_parser(
     return parser, commands
 
 
+def _audit(bridge: Bridge, args: argparse.Namespace) -> str:
+    """Exports or verifies an audit bundle and words the outcome.
+
+    A reference is read first as an instant or a window, as every other
+    `--since` reads it, and otherwise as a commit of the project, which
+    stands for its committer time.
+
+    Args:
+        bridge: Command object holding the state root.
+        args: Parsed `audit` command line.
+
+    Returns:
+        One account of what was written or checked.
+
+    Raises:
+        BridgeError: If a reference names nothing, signing fails, or the
+            bundle fails verification.
+    """
+    from agent_parley import audit
+
+    if args.action == "verify":
+        checked = audit.verify(
+            args.bundle,
+            require_signature=args.require_signature,
+            signer=args.signer,
+        )
+        signed = (
+            f" {checked['signer']}"
+            if checked["signed"]
+            else " No signature; the chain alone does not show who exported it."
+        )
+        return (
+            f"Chain intact: {checked['records']} records, head "
+            f"{checked['head']}.{signed}"
+        )
+    root, directory = bridge.project(args.repo.resolve(), create=False)
+    bounds = []
+    for ref in (args.since, args.until):
+        if ref is None:
+            bounds.append(("now", time.time()))
+            continue
+        try:
+            bounds.append((ref, instant(ref)))
+        except ValueError:
+            bounds.append((ref, audit.commit_time(root, ref)))
+    bundle = audit.export(
+        bridge.home,
+        directory,
+        roster.read(directory),
+        args.output,
+        since=bounds[0],
+        until=bounds[1],
+        key=args.sign,
+    )
+    tally = ", ".join(
+        f"{count} {kind}" for kind, count in audit.counts(bundle).items()
+    )
+    return (
+        f"Exported {len(bundle['records'])} records ({tally or 'none'}) "
+        f"to {args.output}, "
+        + ("signed" if "signature" in bundle else "unsigned")
+        + "; credentials, tokens and transcripts excluded."
+    )
+
+
 def _plain_status() -> int:
     """Runs the bare status command without building its parser.
 
@@ -6395,13 +7514,32 @@ def _plain_status() -> int:
     )
     try:
         bridge = Bridge(home)
+        polling.record(bridge.home, "cli:status")
         bridge.board(
             Selection(project=bridge.project_at(Path.cwd())), terminal_width()
         )
     except (BridgeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         print(f"agent-parley: {refusal(exc)}", file=sys.stderr)
         return 1
+    _update_notice(home)
     return 0
+
+
+def _update_notice(home: Path) -> None:
+    """Prints the newer-release notice on standard error, if there is one.
+
+    Only `doctor` and `status` call this, so no hook and no service poll
+    waits on the package index; standard error keeps ``--json`` output
+    parseable.
+
+    Args:
+        home: The private state root holding the update check cache.
+    """
+    from agent_parley import updates
+
+    line = updates.notice(home.expanduser())
+    if line:
+        print(line, file=sys.stderr)
 
 
 def _title() -> int:
@@ -6432,7 +7570,7 @@ def main() -> int:
     parser, commands = root_parser(typed)
     if typed is not None and typed not in commands.declared:
         parser, commands = root_parser(None)
-    args = parser.parse_args()
+    args = parser.parse_args(with_default_action(sys.argv[1:]))
     home = args.home.expanduser()
     if args.version:
         print(protocol.launcher_version())
@@ -6625,6 +7763,24 @@ def main() -> int:
                 print(json.dumps(reading, indent=2))
             else:
                 print(metrics.describe_throughput(reading), end="")
+        elif args.command == "metrics" and args.reading == "trials":
+            reading = metrics.trials(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_trials(reading), end="")
+        elif args.command == "metrics" and args.reading == "verification":
+            outcomes = verification.reading(bridge.home, args.window)
+            if args.json:
+                print(json.dumps(outcomes, indent=2))
+            else:
+                print(verification.describe(outcomes), end="")
+        elif args.command == "metrics" and args.reading == "cost":
+            reading = metrics.cost(bridge.home, args.start)
+            if args.json:
+                print(json.dumps(reading, indent=2))
+            else:
+                print(metrics.describe_cost(reading), end="")
         elif args.command == "metrics":
             from agent_parley import dashboard
 
@@ -6704,6 +7860,8 @@ def main() -> int:
                 message,
                 file=sys.stdout if output else sys.stderr,
             )
+        elif args.command == "audit":
+            print(_audit(bridge, args))
         elif args.command == "state" and args.action == "show" and args.json:
             print(
                 views.render(
@@ -6760,6 +7918,43 @@ def main() -> int:
             if used:
                 with contextlib.suppress(BridgeError, OSError):
                     projects.touch(bridge.home, used)
+            if args.lanes or args.milestone:
+                from agent_parley import lanes_launch
+
+                if args.participant or not (args.lanes and args.milestone):
+                    parser.error("run --lanes needs --milestone, no NAME.")
+                lane_names = [name.strip() for name in args.lanes.split(",")]
+                if not all(lane_names):
+                    parser.error("run --lanes needs a name between commas.")
+                ignored = [
+                    flag
+                    for flag, given in (
+                        ("--provider", args.provider),
+                        ("--credentials", args.credentials),
+                        ("--issue", args.issue),
+                        ("--task", args.task != RUN_TASK),
+                        ("--resume", args.resume),
+                        ("--blueprint", args.blueprint),
+                    )
+                    if given
+                ]
+                if ignored:
+                    parser.error(
+                        f"run --lanes cannot take {', '.join(ignored)}."
+                    )
+                opened = lanes_launch.open_lanes(
+                    bridge, args.repo.resolve(), lane_names, args.milestone
+                )
+                for lane in opened["lanes"]:
+                    if lane["reason"]:
+                        print(
+                            f"{lane['participant']}: {lane['reason']}",
+                            file=sys.stderr,
+                        )
+                print("\n".join(lanes_launch.lines(opened)))
+                return 1 if lanes_launch.failed(opened) else 0
+            if not args.participant:
+                parser.error("run needs a participant NAME, or --lanes.")
             status = bridge.launch(
                 args.participant,
                 args.repo.resolve(),
@@ -6833,7 +8028,7 @@ def main() -> int:
                 args.state,
                 args.summary,
                 args.remaining,
-                args.evidence,
+                "\n".join(args.evidence),
                 key=args.idempotency_key,
                 issue=args.issue,
                 resume_on=args.resume_on,
@@ -6874,6 +8069,12 @@ def main() -> int:
                 if args.json
                 else issue_lines(detail)
             )
+            if not args.json:
+                _, directory = bridge.project(args.repo.resolve(), create=False)
+                for line in reviews.lines(
+                    reviews.rounds(directory, issue=str(args.number))
+                ):
+                    print(line)
         elif (
             args.command == "issue"
             and args.action == "assign"
@@ -6881,6 +8082,7 @@ def main() -> int:
         ):
             return assigned_selection(bridge, args.repo.resolve(), args)
         elif args.command == "issue" and args.action == "next":
+            polling.record(bridge.home, "cli:issue-next")
             ranked = bridge.issue_next(args.repo.resolve(), args.limit)
             print(
                 views.render("issue_next", ranked)
@@ -6912,6 +8114,58 @@ def main() -> int:
                     )
                 )
             )
+        elif args.command == "trial":
+            from agent_parley import trials
+
+            repo = args.repo.resolve()
+            if args.target in ("show", "keep", "cancel") and not args.issue:
+                parser.error(f"trial {args.target} needs an ISSUE.")
+            if args.target == "show":
+                compared = bridge.trial_show(repo, args.issue)
+                print(
+                    json.dumps(compared, indent=2)
+                    if args.json
+                    else trials.render(compared),
+                    end="\n" if args.json else "",
+                )
+            elif args.target == "keep":
+                if not args.lane:
+                    parser.error("trial keep needs --lane NAME.")
+                ended = bridge.trial_keep(repo, args.issue, args.lane)
+                print(
+                    json.dumps(ended, indent=2)
+                    if args.json
+                    else f"Kept {args.lane}'s branch for #{ended['issue']}; "
+                    "released "
+                    + ", ".join(
+                        sorted(
+                            name for name in ended["lanes"] if name != args.lane
+                        )
+                    )
+                    + "; no branch was deleted."
+                )
+            elif args.target == "cancel":
+                ended = bridge.trial_cancel(repo, args.issue)
+                print(
+                    json.dumps(ended, indent=2)
+                    if args.json
+                    else f"Cancelled the trial of #{ended['issue']}; released "
+                    + ", ".join(sorted(ended["lanes"]))
+                    + "; no branch was deleted."
+                )
+            else:
+                if args.issue:
+                    parser.error("trial ISSUE takes no second issue.")
+                if not args.lanes:
+                    parser.error("trial ISSUE needs --lanes A,B.")
+                begun = bridge.trial_start(repo, args.target, args.lanes)
+                print(
+                    json.dumps(begun, indent=2)
+                    if args.json
+                    else f"Trial of #{begun['issue']} started on "
+                    + ", ".join(sorted(begun["lanes"]))
+                    + f" from base {begun['base'][:12]}."
+                )
         elif args.command == "followup" and args.action == "list":
             suggested = bridge.followup_list(args.repo.resolve())
             print(
@@ -6937,6 +8191,7 @@ def main() -> int:
                 args.number,
                 reason=args.reason,
                 release=args.release,
+                proof="\n".join(args.evidence),
             )
             print(
                 views.render("issue_resolve", views.resolution(ended))
@@ -6966,6 +8221,7 @@ def main() -> int:
                 when_released=getattr(args, "when_released", ""),
                 remaining=getattr(args, "remaining", None),
                 take_orphaned=getattr(args, "take_orphaned", False),
+                links=getattr(args, "link", None),
             )
             if args.action != "list":
                 print(json.dumps(result, indent=2))
@@ -6980,6 +8236,7 @@ def main() -> int:
                 if args.json
                 else protocol.render(reported)
             )
+            _update_notice(bridge.home)
             return 0 if reported["consistent"] else 1
         elif args.command == "problems" and args.action == "ack":
             recorded = bridge.acknowledge(args.repo.resolve(), args.message_id)
@@ -6991,12 +8248,18 @@ def main() -> int:
                 + "."
             )
         elif args.command == "problems":
+            if args.yes and not args.apply:
+                parser.error("--yes needs --apply.")
+            if args.apply and args.json:
+                parser.error("--apply prints text; drop --json.")
             found = bridge.problems(args.ack_after)
             print(
                 views.render("problems", problems.rendered(found, args.all))
                 if args.json
                 else "\n".join(problems.lines(found, args.all))
             )
+            if args.apply:
+                return applied_remedies(bridge, found, args.yes)
             return 1 if problems.shown(found, args.all) else 0
         elif args.command in ("gc", "reclaim"):
             if args.force and not args.apply:
@@ -7111,6 +8374,18 @@ def main() -> int:
                 else notification_report(probed)
             )
             return 0 if all(item["ok"] for item in probed["results"]) else 1
+        elif args.command == "merge":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            planned = forecast.project_plan(
+                directory,
+                reported_ready(directory),
+                directory / supervision.PULL_REQUEST_RECORD,
+            )
+            print(
+                views.render("merge_plan", planned)
+                if args.json
+                else forecast.render_plan(planned)
+            )
         elif args.command == "plan" and args.action == "update":
             recorded = bridge.task_plan(
                 args.repo.resolve(),
@@ -7180,6 +8455,7 @@ def main() -> int:
                     else plan.render_diff(applied)
                 )
         elif args.command == "mail":
+            polling.record(bridge.home, "cli:mail")
             page = bridge.mail(
                 args.repo.resolve(),
                 args.action,
@@ -7222,18 +8498,58 @@ def main() -> int:
                 lane_detail(record, roster.read(directory))
                 for line in recap_lines(directory, args.name):
                     print(line)
+                display = str(
+                    roster.read(directory)["participants"]
+                    .get(args.name, {})
+                    .get("display")
+                    or args.name
+                )
+                for line in reviews.lines(
+                    reviews.rounds(directory, lane=display)
+                ):
+                    print(line)
                 for line in plan_lines(
                     lanes.lane_task_plan(directory, args.name)
                 ):
                     print(line)
+        elif args.command == "participant" and args.action == "checkpoints":
+            recorded_points = bridge.lane_checkpoints(
+                args.repo.resolve(), args.name
+            )
+            print(
+                views.render("participant_checkpoints", recorded_points)
+                if args.json
+                else "\n".join(checkpoint_lines(recorded_points))
+            )
+        elif args.command == "participant" and args.action == "rewind":
+            rewound = bridge.rewind(args.repo.resolve(), args.name, args.to)
+            print(
+                views.render("participant_rewind", rewound)
+                if args.json
+                else "\n".join(rewind_lines(rewound))
+            )
         elif args.command == "decide":
             recorded = bridge.decide(
-                args.repo.resolve(), args.text, args.subject, args.key
+                args.repo.resolve(),
+                args.text,
+                args.subject,
+                args.key,
+                args.link,
             )
             print(
                 views.render("decide", recorded)
                 if args.json
                 else f"Recorded decision {recorded['id']}."
+            )
+        elif args.command == "decision" and args.action == "answer":
+            print(answered_decision(bridge.home, args))
+        elif args.command == "decision" and args.action == "open":
+            _, directory = bridge.project(args.repo.resolve(), create=False)
+            waiting = waiting_decisions(directory)
+            print(
+                views.render("decision_open", {"decisions": waiting})
+                if args.json
+                else "\n".join(waiting_lines(waiting))
             )
         elif args.command == "decision":
             decisions = bridge.decisions(
@@ -7263,7 +8579,9 @@ def main() -> int:
                 ):
                     print(
                         supervision.OPT_IN_WARNING.format(
-                            name=args.name, adapter=gap
+                            name=args.name,
+                            adapter=gap,
+                            remedy=supervision.opt_in_remedy(gap),
                         ),
                         file=sys.stderr,
                     )
@@ -7340,6 +8658,25 @@ def main() -> int:
                         repository, getattr(args, "prefix", None)
                     )
                 )
+        elif args.command == "link":
+            repository = args.repo.resolve()
+            if args.action == "remove":
+                print(bridge.unlink(repository, args.name))
+            else:
+                print(
+                    bridge.link(
+                        repository,
+                        getattr(args, "path", None),
+                        getattr(args, "name", ""),
+                    )
+                )
+        elif args.command == "milestone":
+            reading = bridge.milestone_path(args.repo.resolve(), args.milestone)
+            print(
+                views.render("milestone_path", reading)
+                if args.json
+                else recommend.render_path(reading)
+            )
         elif args.command == "forge":
             repository = args.repo.resolve()
             if getattr(args, "json", False):
@@ -7588,6 +8925,14 @@ def main() -> int:
                 )
             else:
                 print(unattended.describe(bridge, repository))
+        elif args.command == "policy":
+            from agent_parley import rules
+
+            repository = args.repo.resolve()
+            if args.action == "import":
+                print(rules.install(bridge, repository, args.path.resolve()))
+            else:
+                print(rules.check(bridge, repository))
         elif args.command == "pool":
             from agent_parley import pool
 
@@ -7719,7 +9064,28 @@ def main() -> int:
                     )
                 return 0
             elif args.action == "price":
-                print(bridge.price(Path.cwd(), args.name, args.per_mtok))
+                rates = {
+                    "input": args.input,
+                    "output": args.output,
+                    "cache_read": args.cache_read,
+                }
+                if args.model and None in rates.values():
+                    parser.error(
+                        "--model needs --input, --output and --cache-read."
+                    )
+                if not args.model and set(rates.values()) != {None}:
+                    parser.error(
+                        "--input, --output and --cache-read need --model."
+                    )
+                print(
+                    bridge.price(
+                        Path.cwd(),
+                        args.name,
+                        args.per_mtok,
+                        args.model or "",
+                        rates,
+                    )
+                )
                 return 0
             defined = roster.inspect(bridge.home)
             print(
@@ -7772,6 +9138,7 @@ def main() -> int:
                 else json.dumps(registered, indent=2)
             )
         else:
+            polling.record(bridge.home, "cli:status")
             selection = selected_status(args)
             workspace = getattr(args, "workspace", "")
             if workspace:
@@ -7804,6 +9171,7 @@ def main() -> int:
                         every_claim=getattr(args, "all", False),
                         every_project=every_project,
                     )
+            _update_notice(bridge.home)
             if matched and (
                 selection.drifted or selection.pending or selection.over_budget
             ):

@@ -22,6 +22,7 @@ from agent_parley import (
     recommend,
     retries,
     roster,
+    trials,
 )
 from agent_parley.roster import OPERATOR
 from agent_parley.state import BridgeError, lock
@@ -81,8 +82,16 @@ PRUNES = (
         "scheduled_deliveries WHERE coalesce(delivered_ts,cancelled_ts)<:epoch "
         "AND id<(SELECT max(id) FROM scheduled_deliveries) LIMIT :limit)",
     ),
+    (
+        "reservation_contention",
+        "DELETE FROM reservation_contention WHERE rowid IN (SELECT rowid "
+        "FROM reservation_contention WHERE "
+        "coalesce(flagged_ts,last_ts)<:epoch LIMIT :limit)",
+    ),
 )
 REFUSAL_SECONDS = 86400.0
+CONTENTION_WINDOW = 1800.0
+CONTENTION_ATTEMPTS = 4
 MAX_THREAD_PAGE = 10
 MAX_SEARCH_HITS = 5
 MAX_QUERY_BYTES = 160
@@ -96,6 +105,7 @@ BASE_TOPIC = "base"
 DIRECT_TOPIC = "direct"
 MAX_TOPIC = 80
 MIN_STEM = 3
+SYMBOL_SEPARATOR = "::"
 BROADCAST_MIN = 3
 MARK_READ_TIMEOUT = 0.5
 BASE_NOTE = re.compile(
@@ -181,7 +191,8 @@ CREATE TABLE IF NOT EXISTS messages (
  created_ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, dedup_key TEXT,
  ack_deadline_ts TEXT, claim_id TEXT, decision INTEGER NOT NULL DEFAULT 0,
  topic TEXT NOT NULL DEFAULT '', feed INTEGER NOT NULL DEFAULT 0,
- ack_retired_ts TEXT, UNIQUE(sender_id,dedup_key));
+ ack_retired_ts TEXT, decision_superseded_ts TEXT,
+ decision_superseded_reason TEXT, UNIQUE(sender_id,dedup_key));
 CREATE INDEX IF NOT EXISTS threads ON messages(project_id,thread_id,id);
 CREATE TABLE IF NOT EXISTS message_recipients (
  message_id INTEGER NOT NULL REFERENCES messages(id),
@@ -214,6 +225,12 @@ CREATE TABLE IF NOT EXISTS reservation_refusals (
  agent_id INTEGER NOT NULL REFERENCES agents(id), holder TEXT NOT NULL,
  path_pattern TEXT NOT NULL, refused_ts REAL NOT NULL,
  PRIMARY KEY(project_id,agent_id,holder,path_pattern));
+CREATE TABLE IF NOT EXISTS reservation_contention (
+ project_id INTEGER NOT NULL REFERENCES projects(id),
+ low TEXT NOT NULL, high TEXT NOT NULL, path_pattern TEXT NOT NULL,
+ count INTEGER NOT NULL, first_ts REAL NOT NULL, last_ts REAL NOT NULL,
+ flagged_ts REAL, last_lane TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(project_id,low,high,path_pattern));
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
  agent_id INTEGER NOT NULL REFERENCES agents(id), tool TEXT NOT NULL,
@@ -420,6 +437,10 @@ def initialize(home: Path) -> None:
     message as ordinary mail, so nothing a lane sent in private becomes
     project-wide by being upgraded.
 
+    Upgrading a store written before decisions could be superseded adds the
+    marker and its reason to each message, and every stored decision reads
+    as standing.
+
     Upgrading a store written before leases recorded their declared window
     backfills that window from the distance between a lease's creation and
     its deadline, so a renewal restores what its holder asked for rather
@@ -471,6 +492,7 @@ def initialize(home: Path) -> None:
                 _add_ack_deadline(db)
                 _add_ack_retirement(db)
                 _add_decision_flag(db)
+                _add_decision_supersession(db)
                 _add_reservation_created(db)
                 _rebuild_reservations(db)
                 _add_claim_correlation(db)
@@ -541,6 +563,28 @@ def _add_decision_flag(db: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS decisions ON messages(project_id,id) "
         "WHERE decision=1"
     )
+
+
+def _add_decision_supersession(db: sqlite3.Connection) -> None:
+    """Adds the time and reason a recorded decision was superseded.
+
+    Rewinding a lane to a checkpoint marks the decisions it recorded after
+    that checkpoint as superseded, keeping their text in the log. Both
+    columns are additive and nullable: a decision stored before the upgrade
+    reads as standing.
+
+    Args:
+        db: Open upgrade transaction owned by the caller.
+    """
+    columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+    if "decision_superseded_ts" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN decision_superseded_ts TEXT"
+        )
+    if "decision_superseded_reason" not in columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN decision_superseded_reason TEXT"
+        )
 
 
 def _add_claim_correlation(db: sqlite3.Connection) -> None:
@@ -2037,6 +2081,15 @@ def _decisions(db: sqlite3.Connection, actor: dict, args: dict) -> dict:
         "index": index,
     }
     messages = _bounded(result, rows[:limit])
+    for message in messages:
+        marked = db.execute(
+            "SELECT decision_superseded_ts,decision_superseded_reason "
+            "FROM messages WHERE id=? AND decision_superseded_ts IS NOT NULL",
+            (message["id"],),
+        ).fetchone()
+        if marked:
+            message["superseded_ts"] = marked[0]
+            message["superseded_reason"] = marked[1] or ""
     result["messages"] = messages
     result["has_more"] = len(rows) > len(messages)
     return result
@@ -2047,7 +2100,9 @@ def named_resource(pattern: str) -> bool:
 
     A resource is written with a scheme, such as ``port:5432`` or
     ``suite:integration``, and a repository-relative path never carries one,
-    so the two key types cannot be confused for each other.
+    so the two key types cannot be confused for each other. A path key that
+    names a Python symbol, such as ``store.py::Store.claim``, is still a
+    path key.
 
     Args:
         pattern: Reservation key as the caller wrote it.
@@ -2055,8 +2110,97 @@ def named_resource(pattern: str) -> bool:
     Returns:
         Whether the key names a resource.
     """
-    scheme, separator, _ = pattern.partition(":")
+    scheme, separator, _ = split_symbol(pattern)[0].partition(":")
     return bool(separator) and "/" not in scheme
+
+
+def repository(key: str) -> str:
+    """Names the repository a reservation key belongs to.
+
+    A path in a linked repository is written ``NAME//path``. A normalized
+    path never holds ``//``, so a key without the prefix, including every
+    reservation recorded before linked repositories existed, belongs to
+    the primary repository. Named resources are shared by every
+    repository.
+
+    Args:
+        key: Reservation key or repository-relative path.
+
+    Returns:
+        The link name, or an empty string for the primary repository.
+    """
+    if named_resource(key):
+        return ""
+    name, separator, _ = key.partition("//")
+    return name if separator and roster.IDENTIFIER.fullmatch(name) else ""
+
+
+def linked_keys(home: Path, root: str, paths: object) -> None:
+    """Refuses a reservation key in a repository the project does not link.
+
+    A misspelt ``NAME//`` prefix would otherwise be granted as a
+    reservation that covers nothing any lane writes.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key recorded in the manifest.
+        paths: Reservation keys the call asks for, still unvalidated.
+
+    Raises:
+        BridgeError: If a key names a link the project manifest lacks.
+    """
+    if not isinstance(paths, list):
+        return
+    names = {repository(key) for key in paths if isinstance(key, str)}
+    names.discard("")
+    if not names:
+        return
+    directory = roster.locate(home, root) if root else None
+    try:
+        links = roster.read(directory).get("links", {}) if directory else {}
+    except (BridgeError, OSError, ValueError):
+        links = {}
+    if unknown := sorted(names - set(links)):
+        raise BridgeError(
+            f"{unknown[0]}// names no repository this project links. Linked: "
+            + (", ".join(sorted(links)) or "none")
+            + "; run agent-parley link show."
+        )
+
+
+def split_symbol(key: str) -> tuple[str, str]:
+    """Splits a reservation key into its path and the symbol it names.
+
+    A key such as ``agent_parley/store.py::Store.claim`` reserves one
+    function or class of a Python file; a key without ``::`` reserves the
+    whole path.
+
+    Args:
+        key: Reservation key or repository-relative path.
+
+    Returns:
+        The path part and the dotted symbol, empty when the key names none.
+    """
+    path, _, symbol = key.partition(SYMBOL_SEPARATOR)
+    return path, symbol
+
+
+def nested_symbols(symbol: str, other: str) -> bool:
+    """Reports whether one dotted symbol is the other or encloses it.
+
+    Args:
+        symbol: Qualified name such as ``Store.claim``.
+        other: Qualified name it is compared against.
+
+    Returns:
+        Whether a change to one can change the other: a class covers its
+        methods, and two sibling definitions never overlap.
+    """
+    return (
+        symbol == other
+        or symbol.startswith(other + ".")
+        or other.startswith(symbol + ".")
+    )
 
 
 def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
@@ -2073,7 +2217,13 @@ def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
 
     A project on a case-insensitive file system folds case, so two paths
     that open the same file overlap however each is spelled. Named
-    resources are still compared exactly.
+    resources are still compared exactly. Paths in different repositories
+    never overlap.
+
+    A key naming a Python symbol overlaps only where its path does. A path
+    without a symbol covers every symbol in the file, and two symbol keys
+    on one file overlap only when one is or encloses the other, so two
+    lanes may hold different functions of one module.
 
     Args:
         pattern: Reservation key or repository-relative path.
@@ -2085,6 +2235,12 @@ def overlapping(pattern: str, other: str, *, fold: bool = False) -> bool:
     """
     if named_resource(pattern) or named_resource(other):
         return pattern == other
+    if repository(pattern) != repository(other):
+        return False
+    pattern, symbol = split_symbol(pattern)
+    other, theirs = split_symbol(other)
+    if symbol and theirs and not nested_symbols(symbol, theirs):
+        return False
     if fold:
         pattern = pattern.casefold()
         other = other.casefold()
@@ -2114,10 +2270,13 @@ def overlapping_paths(
     spelling, so either side being one is answered by a set lookup; only a
     globbed path checked against a plain pattern uses the pairwise rule.
     Folding case answers the same question over casefolded paths and
-    reports each match in the spelling the caller gave.
+    reports each match in the spelling the caller gave. Keys spanning
+    several repositories are answered one repository at a time. A pattern
+    naming a Python symbol is matched by its path, since a path carries no
+    symbol and so overlaps every symbol in its file.
 
     Args:
-        paths: Reservation keys or repository-relative paths.
+        paths: Repository-relative paths or keys naming no symbol.
         patterns: Reservation keys each path is compared against.
         fold: Whether paths are compared without regard to case.
 
@@ -2127,6 +2286,35 @@ def overlapping_paths(
     """
     if not patterns:
         return set()
+    names = {
+        repository(key)
+        for key in (*paths, *patterns)
+        if not named_resource(key)
+    }
+    if len(names) > 1:
+        return set().union(
+            *(
+                overlapping_paths(
+                    [
+                        path
+                        for path in paths
+                        if named_resource(path) or repository(path) == name
+                    ],
+                    [
+                        pattern
+                        for pattern in patterns
+                        if named_resource(pattern)
+                        or repository(pattern) == name
+                    ],
+                    fold=fold,
+                )
+                for name in names
+            )
+        )
+    patterns = [
+        pattern if named_resource(pattern) else split_symbol(pattern)[0]
+        for pattern in patterns
+    ]
     if fold:
         spellings: dict[str, list[str]] = {}
         for path in paths:
@@ -2227,15 +2415,30 @@ def _keys(
                 )
             keys.append(pattern)
             continue
-        parts = PurePosixPath(pattern)
+        name = repository(pattern)
+        path, symbol = split_symbol(
+            pattern.removeprefix(name + "//") if name else pattern
+        )
+        if SYMBOL_SEPARATOR in pattern and not all(
+            part.isidentifier() for part in symbol.split(".")
+        ):
+            raise BridgeError(
+                f"{pattern!r} names no Python symbol; write path::Name or "
+                "path::Class.method, such as src/store.py::Store.claim."
+            )
+        parts = PurePosixPath(path)
         if (
             parts.is_absolute()
             or ".." in parts.parts
-            or "\\" in pattern
+            or "\\" in path
             or str(parts) == "."
         ):
             raise BridgeError("Reservations require repository-relative paths.")
-        keys.append(str(parts))
+        keys.append(
+            (f"{name}//" if name else "")
+            + str(parts)
+            + (SYMBOL_SEPARATOR + symbol if symbol else "")
+        )
     return keys, ttl, exclusive, reason
 
 
@@ -3027,7 +3230,9 @@ def _event(
         db: Open transaction that also carries the tool's own effect.
         actor: Authenticated project and lane.
         tool: Coordination tool that was called.
-        outcome: ``ok`` for a served call, ``error`` for a rejected one.
+        outcome: ``ok`` for a served call, ``error`` for a rejected one,
+            ``conflict`` for a reservation that met a holder and ``empty``
+            for an inbox page that carried no message.
         started: Monotonic reading taken before the call was dispatched.
         result_bytes: Encoded size of the served result, zero on rejection.
     """
@@ -3100,7 +3305,9 @@ def call(home: Path, actor: dict, tool: str, args: dict) -> dict:
             home,
             actor,
             tool,
-            "ok",
+            "empty"
+            if tool == "fetch_inbox" and not result.get("messages")
+            else "ok",
             started,
             len(json.dumps(result, ensure_ascii=False).encode()),
         )
@@ -3490,8 +3697,12 @@ def _dispatch(
     writes only the project's suggestion record and an operator decision
     beside the ledger, never the store, so it runs outside the transaction
     and records its event separately.
+
+    A review round is mail addressed to ``reviews.ADDRESS``. It records the
+    round beside the ledger and then sends ordinary mail, to the reviewer
+    or back to the builder, through this same call.
     """
-    from agent_parley import followups
+    from agent_parley import followups, reviews
 
     if tool == "next_issues":
         return _recommended(home, actor, args)
@@ -3517,8 +3728,11 @@ def _dispatch(
             "paths": to[1:],
         }
         return _suggested(home, actor, suggestion, started)
+    if isinstance(to, list) and to[:1] == [reviews.ADDRESS]:
+        return _review_round(home, actor, args)
     if tool in RESERVING:
         children.confine(home, actor, args.get("paths"))
+        linked_keys(home, str(actor.get("project", "")), args.get("paths"))
     declared = (
         declared_resources(home, str(actor.get("project", "")))
         if tool in RESERVING
@@ -3549,6 +3763,7 @@ def _dispatch(
         )
         if tool in RESERVING and result.get("conflicts"):
             _record_refusals(db, actor, result["conflicts"])
+            _contend(db, actor, result["conflicts"], time.time())
         if tool not in READ_ONLY:
             _event(
                 db,
@@ -3577,6 +3792,131 @@ def _lane_provider(directory: Path, display: str) -> str:
     )
 
 
+def _review_round(home: Path, actor: dict, args: dict) -> dict:
+    """Records a review round or its findings, then sends the mail.
+
+    Recipients ``["@review", PATH, ...]`` with the branch as the subject ask
+    for a round on the caller's one held claim. Recipients ``["@review",
+    ROUND]`` from that round's reviewer return the findings, capped like a
+    child report, to the builder. Neither writes the issue ledger, so the
+    claim never moves. A round whose offer mail fails is withdrawn so the
+    builder can ask again.
+
+    Args:
+        home: Private bridge state root.
+        actor: Authenticated project and lane.
+        args: ``send_message`` arguments addressed to the review address.
+
+    Returns:
+        The sent mail's result with a ``review`` entry naming the round.
+
+    Raises:
+        BridgeError: If the project keeps no ledger, the caller holds no
+            single claim, the round cap is reached, no lane can review, or
+            the findings do not answer the caller's open round.
+    """
+    from agent_parley import reviews
+
+    root = str(actor.get("project", ""))
+    directory = roster.locate(home, root) if root else None
+    if directory is None:
+        raise BridgeError("This project keeps no issue ledger.")
+    name = actor["name"]
+    rest = args["to"][1:]
+    note = str(args.get("body_md") or "")
+    base = {
+        key: value
+        for key, value in args.items()
+        if key not in ("to", "subject", "body_md")
+    }
+    if len(rest) == 1 and re.fullmatch(r"r[0-9]+", str(rest[0])):
+        entry = reviews.pending(directory, rest[0], name)
+        report = reviews.cap(note)
+        if not report.strip():
+            raise BridgeError("Put the findings in the body.")
+        total = reviews.count(report)
+        sent = call(
+            home,
+            actor,
+            "send_message",
+            {
+                **base,
+                "to": [entry["builder"]],
+                "subject": reviews.findings_subject(entry, total),
+                "body_md": report,
+            },
+        )
+        entry = reviews.returned(directory, entry["id"], name, report)
+    else:
+        claim = held_claim(home, root, name)
+        ledger = issues.snapshot(directory)
+        issue = next(
+            (
+                number
+                for number, record in ledger.get("issues", {}).items()
+                if claim
+                and (
+                    record.get("claim_id") == claim
+                    or any(
+                        entry.get("claim_id") == claim
+                        for entry in trials.running(record)
+                        .get("lanes", {})
+                        .values()
+                    )
+                )
+            ),
+            "",
+        )
+        if not issue:
+            raise BridgeError(
+                "Ask for a review round while holding exactly one claim."
+            )
+        manifest = roster.read(directory)
+        entry = reviews.request(
+            directory,
+            builder=name,
+            issue=issue,
+            claim=claim,
+            branch=args.get("subject"),
+            paths=rest,
+            candidates=reviews.idle_lanes(directory, manifest),
+            providers=reviews.providers(manifest),
+            key=str(args.get("idempotency_key") or ""),
+        )
+        subject, body = reviews.offer_text(entry, note)
+        try:
+            sent = call(
+                home,
+                actor,
+                "send_message",
+                {
+                    **base,
+                    "to": [entry["reviewer"]],
+                    "subject": subject,
+                    "body_md": body,
+                },
+            )
+        except (BridgeError, OSError, sqlite3.Error):
+            if not entry["repeated"]:
+                reviews.withdraw(directory, entry["id"])
+            raise
+    return {
+        **sent,
+        "review": {
+            key: entry[key]
+            for key in (
+                "id",
+                "issue",
+                "round",
+                "builder",
+                "reviewer",
+                "state",
+                "findings",
+            )
+        },
+    }
+
+
 def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
     """Records a lane's follow-up suggestion for the operator to accept.
 
@@ -3593,8 +3933,9 @@ def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
 
     Returns:
         The suggestion identifier, its state and expiry, whether it was
-        already recorded, the open issues and claims it duplicates and a
-        note that nothing was filed.
+        already recorded, the open issues and claims it duplicates, whether
+        the open forge issues could be checked and a note that nothing was
+        filed.
 
     Raises:
         BridgeError: If the project keeps no state directory, an argument is
@@ -3630,7 +3971,12 @@ def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
                 ),
                 options=(followups.ACCEPT,),
                 detail=recorded["why"]
-                + (f"\nMay duplicate {matched}." if matched else ""),
+                + (f"\nMay duplicate {matched}." if matched else "")
+                + (
+                    ""
+                    if recorded["forge_checked"]
+                    else f"\n{followups.FORGE_UNCHECKED}"
+                ),
                 confirm=(followups.ACCEPT,),
                 ttl=followups.TTL,
             )
@@ -3641,6 +3987,7 @@ def _suggested(home: Path, actor: dict, args: dict, started: float) -> dict:
         "expires_at": recorded["expires"],
         "repeated": recorded["repeated"],
         "duplicates": recorded["duplicates"],
+        "forge_checked": recorded["forge_checked"],
         "note": recorded["note"],
     }
     _observe(
@@ -3946,6 +4293,9 @@ def cochange_history(home: Path, root: str) -> list[list[str]]:
 def owned_claims(home: Path, root: str, display: str) -> set[str] | None:
     """Returns every claim identifier a lane currently owns.
 
+    A lane in a running trial holds that trial's claim for it, so its records
+    and review rounds correlate with the trial issue.
+
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
@@ -3969,10 +4319,16 @@ def owned_claims(home: Path, root: str, display: str) -> set[str] | None:
         for name, participant in manifest["participants"].items()
         if participant["display"] == display
     ]
-    return {
+    owned = {
         str(record["claim_id"])
         for record in ledger["issues"].values()
         if record.get("owner") in names and record.get("claim_id")
+    }
+    return owned | {
+        str(entry["claim_id"])
+        for record in ledger["issues"].values()
+        for lane, entry in trials.running(record).get("lanes", {}).items()
+        if lane in names and entry.get("claim_id")
     }
 
 
@@ -4557,6 +4913,91 @@ def search_decisions(
         return _decisions(
             db, actor, {"query": query, "limit": limit, "since": since}
         )
+
+
+LANE_DECISIONS = (
+    "SELECT m.id,substr(m.subject,1,160) AS subject,m.created_ts,"
+    "m.decision_superseded_ts,m.decision_superseded_reason FROM messages m "
+    "JOIN agents a ON a.id=m.sender_id JOIN projects p ON p.id=m.project_id "
+    "WHERE p.human_key=? AND a.name=? AND m.decision=1 "
+    "AND m.created_ts>datetime(?,'unixepoch') "
+)
+
+
+def _lane_decision(row: sqlite3.Row) -> dict:
+    """Shapes one decision a lane recorded for an operator reading."""
+    return {
+        "id": row["id"],
+        "subject": row["subject"],
+        "created_ts": row["created_ts"],
+        "superseded_ts": row["decision_superseded_ts"],
+        "superseded_reason": row["decision_superseded_reason"] or "",
+    }
+
+
+def lane_decisions(
+    home: Path, root: str, name: str, since: float
+) -> list[dict]:
+    """Lists the decisions one lane recorded after an instant, oldest first.
+
+    The store keeps creation times to the second, so a decision recorded
+    in the same second as ``since`` reads as recorded before it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own decisions are listed.
+        since: Unix time the decisions must follow.
+
+    Returns:
+        Each decision's identifier, subject, creation time and, where it
+        was superseded, the time and reason. No store reads as none.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home) as db:
+        rows = db.execute(
+            LANE_DECISIONS + "ORDER BY m.id", (root, name, int(since))
+        ).fetchall()
+    return [_lane_decision(row) for row in rows]
+
+
+def supersede_decisions(
+    home: Path, root: str, name: str, since: float, reason: str
+) -> list[dict]:
+    """Marks the decisions one lane recorded after an instant as superseded.
+
+    Only decisions still standing are marked, in the transaction that reads
+    them, so a repeated call marks nothing twice. Every decision keeps its
+    text and stays in the log; the mark tells a reader not to act on it.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose own decisions are marked.
+        since: Unix time the decisions must follow.
+        reason: Why the decisions stopped standing.
+
+    Returns:
+        The decisions this call marked, oldest first.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with connect(home, write=True) as db:
+        rows = db.execute(
+            LANE_DECISIONS
+            + "AND m.decision_superseded_ts IS NULL ORDER BY m.id",
+            (root, name, int(since)),
+        ).fetchall()
+        for row in rows:
+            db.execute(
+                "UPDATE messages SET decision_superseded_ts=CURRENT_TIMESTAMP,"
+                "decision_superseded_reason=? WHERE id=?",
+                (reason[:MAX_SUPERSEDE_REASON], row["id"]),
+            )
+    return [
+        {**_lane_decision(row), "superseded_reason": reason} for row in rows
+    ]
 
 
 def decide(home: Path, root: str, subject: str, body: str, key: str) -> dict:
@@ -5455,6 +5896,206 @@ def _record_refusals(
     )
 
 
+def _contend(
+    db: sqlite3.Connection, actor: dict, conflicts: list[dict], now: float
+) -> None:
+    """Counts alternating refusals between two lanes on one key and flags it.
+
+    Refusals in either direction between the same two lanes on the same key
+    share one row. The count rises only when the refused lane differs from
+    the lane refused in the previous counted refusal, so one lane retrying
+    against an idle holder counts once, and `CONTENTION_ATTEMPTS` means that
+    many alternating refusals. A refusal blocked by several leases of one
+    owner counts once per owner and key. A refusal arriving more than
+    `CONTENTION_WINDOW` after the first refusal of the count restarts the
+    count at that refusal. The row that reaches `CONTENTION_ATTEMPTS` is
+    flagged once and each lane receives one bounded update. A flagged row is
+    never changed or sent again until `clear_contention` removes it or the
+    prune retires it. Reservations stay advisory: nothing here locks a path.
+
+    Args:
+        db: Open transaction that also carries the refused call.
+        actor: Authenticated project and the lane that was refused.
+        conflicts: Conflicts the refused batch reported.
+        now: Unix time of this refusal.
+    """
+    project = actor["project_id"]
+    db.execute(
+        "DELETE FROM reservation_contention WHERE project_id=? "
+        "AND flagged_ts IS NULL AND last_ts<?",
+        (project, now - REFUSAL_SECONDS),
+    )
+    lane = str(actor["name"])
+    refused = dict.fromkeys(
+        (str(conflict["owner"]), conflict["path"]) for conflict in conflicts
+    )
+    for owner, path in refused:
+        low, high = sorted((lane, owner))
+        if low == high:
+            continue
+        key = (project, low, high, path)
+        row = db.execute(
+            "SELECT count,first_ts,flagged_ts,last_lane FROM "
+            "reservation_contention WHERE project_id=? AND low=? AND high=? "
+            "AND path_pattern=?",
+            key,
+        ).fetchone()
+        if row is None:
+            db.execute(
+                "INSERT INTO reservation_contention(project_id,low,high,"
+                "path_pattern,count,first_ts,last_ts,last_lane) "
+                "VALUES (?,?,?,?,1,?,?,?)",
+                (*key, now, now, lane),
+            )
+            continue
+        if row["flagged_ts"] is not None:
+            continue
+        if now - row["first_ts"] > CONTENTION_WINDOW:
+            count, first = 1, now
+        else:
+            count = row["count"] + (row["last_lane"] != lane)
+            first = row["first_ts"]
+        flagged = now if count >= CONTENTION_ATTEMPTS else None
+        db.execute(
+            "UPDATE reservation_contention SET count=?,first_ts=?,last_ts=?,"
+            "flagged_ts=?,last_lane=? WHERE project_id=? AND low=? "
+            "AND high=? AND path_pattern=?",
+            (count, first, now, flagged, lane, *key),
+        )
+        if flagged is not None:
+            _warn_contention(db, project, (low, high), path, now)
+
+
+def _warn_contention(
+    db: sqlite3.Connection,
+    project: int,
+    lanes: tuple[str, str],
+    path: str,
+    now: float,
+) -> None:
+    """Sends each of two contending lanes one update from the operator.
+
+    A lane that cannot receive mail, such as a retired one, is skipped, so a
+    refusal is never turned into an error by the update that follows it.
+
+    Args:
+        db: Open transaction that also carries the refused call.
+        project: Identifier of the project both lanes belong to.
+        lanes: The two lane identities, sorted.
+        path: Key the lanes keep refusing each other.
+        now: Unix time the pair was flagged, which keys the update.
+    """
+    db.execute(
+        "INSERT INTO agents(project_id,name) VALUES (?,?) "
+        "ON CONFLICT(project_id,name) DO NOTHING",
+        (project, OPERATOR),
+    )
+    sender = dict(
+        db.execute(
+            "SELECT id,project_id,name FROM agents WHERE project_id=? "
+            "AND name=?",
+            (project, OPERATOR),
+        ).fetchone()
+    )
+    for lane, peer in (lanes, lanes[::-1]):
+        digest = hashlib.sha256(
+            f"{lane}\0{peer}\0{path}\0{now}".encode()
+        ).hexdigest()
+        with contextlib.suppress(BridgeError):
+            _send(
+                db,
+                sender,
+                {
+                    "to": [lane],
+                    "subject": f"Reservation contention on {path[:100]}",
+                    "body_md": (
+                        f"You and {peer} keep refusing each other's "
+                        f"reservation on {path}. Finish or stash your edit "
+                        "on that path and wait. The operator will hand the "
+                        "work off or release it. Reservations are advisory "
+                        "declarations; nothing locks the path."
+                    ),
+                    "idempotency_key": f"contention-{digest[:40]}",
+                },
+            )
+
+
+def _contended(db: sqlite3.Connection, root: str) -> list[dict]:
+    """Reads the flagged records of one project whose lanes both remain.
+
+    A record naming a retired lane, one without an active credential, is
+    left out, so the surviving lane is not reported as contended with a
+    lane that can no longer act. Records come oldest first.
+    """
+    return [
+        {
+            "lanes": [row["low"], row["high"]],
+            "path": row["path_pattern"],
+            "count": row["count"],
+            "since": row["flagged_ts"],
+        }
+        for row in db.execute(
+            "SELECT c.low,c.high,c.path_pattern,c.count,c.flagged_ts "
+            "FROM reservation_contention c "
+            "JOIN projects p ON p.id=c.project_id WHERE p.human_key=? "
+            "AND c.flagged_ts IS NOT NULL AND (SELECT count(*) FROM agents a "
+            "WHERE a.project_id=c.project_id AND a.name IN (c.low,c.high) "
+            "AND a.token_digest IS NOT NULL)=2 "
+            "ORDER BY c.flagged_ts,c.low,c.high",
+            (root,),
+        )
+    ]
+
+
+def contentions(home: Path, root: str) -> list[dict]:
+    """Lists the lane pairs flagged for repeated reservation contention.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+
+    Returns:
+        One record per flagged pair and key, oldest first, naming the two
+        ``lanes``, the ``path``, the refusal ``count`` and ``since`` as the
+        Unix time of the flag. Empty when no store exists.
+    """
+    if not (home / DATABASE).exists():
+        return []
+    with reading(home) as db:
+        return _contended(db, root)
+
+
+def clear_contention(
+    home: Path, root: str, name: str, peer: str | None = None
+) -> int:
+    """Removes the contention records that name one lane.
+
+    The operator's handoff or release of that lane's work is the action that
+    ends a flag, so the pair is flagged again only if refusals resume. A
+    lane releasing or renewing its own reservations does not call this.
+
+    Args:
+        home: Private bridge state root.
+        root: Canonical project key registered with the store.
+        name: Registered identity whose records are removed.
+        peer: When given, only the records between `name` and this lane are
+            removed and records against any other lane stay.
+
+    Returns:
+        How many records were removed.
+    """
+    if not (home / DATABASE).exists():
+        return 0
+    low, high = sorted((name, peer)) if peer is not None else (name, name)
+    clause = "low=? AND high=?" if peer is not None else "(low=? OR high=?)"
+    with connect(home, write=True) as db:
+        return db.execute(
+            "DELETE FROM reservation_contention WHERE project_id=("
+            f"SELECT id FROM projects WHERE human_key=?) AND {clause}",
+            (root, low, high),
+        ).rowcount
+
+
 def record_refusal(
     home: Path, root: str, name: str, holder: str, path: str
 ) -> None:
@@ -5557,7 +6198,8 @@ def usage(
         declared time to live, the age of its oldest held lease, how long
         the oldest expired one has been expired, and the queued reservation
         requests waiting on the keys it holds with the lanes that asked,
-        and the lanes it refused a key it still holds as ``refused``. An
+        and the lanes it refused a key it still holds as ``refused``, and the
+        flagged contention records naming it as ``contention`` when any. An
         expired lease is counted apart from the live ones and keeps blocking
         until it is renewed, released or reclaimed; a queued request holds
         nothing of its own. Counts cover retained events only; older events
@@ -5592,6 +6234,19 @@ def usage(
             )
         for holder, refused in _refused_by(db, root).items():
             report.setdefault(holder, {}).update(refused=refused)
+        for flagged in _contended(db, root):
+            for lane, peer in (
+                flagged["lanes"],
+                flagged["lanes"][::-1],
+            ):
+                report.setdefault(lane, {}).setdefault("contention", []).append(
+                    {
+                        "peer": peer,
+                        "path": flagged["path"],
+                        "count": flagged["count"],
+                        "since": flagged["since"],
+                    }
+                )
         for row in db.execute(
             "SELECT a.name AS name,count(*) AS leases,"
             "coalesce(sum(f.expires_ts IS NOT NULL "
@@ -6028,12 +6683,15 @@ def renew_reservations(home: Path, root: str, name: str) -> dict:
         return {"renewed": sorted(set(renewed)), "released": released}
 
 
-def active_reservations(home: Path, root: str) -> dict[str, list[str]]:
+def active_reservations(
+    home: Path, root: str, db: sqlite3.Connection | None = None
+) -> dict[str, list[str]]:
     """Reports every unreleased, unexpired reservation key for one project.
 
     Args:
         home: Private bridge state root.
         root: Canonical project key registered with the store.
+        db: A status frame's open read transaction, or None to open one.
 
     Returns:
         Mapping of registered identity to the keys it holds, in sorted order.
@@ -6041,10 +6699,10 @@ def active_reservations(home: Path, root: str) -> dict[str, list[str]]:
         and still reported as stale elsewhere, but the paths it names no
         longer read as reserved for the purpose of naming a collision.
     """
-    if not present(home):
+    if db is None and not present(home):
         return {}
     held: dict[str, list[str]] = {}
-    with connect(home) as db:
+    with reading(home, db) as db:
         for row in db.execute(
             "SELECT a.name AS name,f.path_pattern AS pattern "
             "FROM file_reservations f JOIN agents a ON a.id=f.agent_id "

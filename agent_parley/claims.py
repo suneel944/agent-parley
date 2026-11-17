@@ -11,7 +11,7 @@ import contextlib
 import time
 from pathlib import Path
 
-from agent_parley import BridgeError, recommend
+from agent_parley import BridgeError, protocol, recommend
 from agent_parley.reports import ReportsMixin
 
 FORGE_MARKS = "forge-assigned.json"
@@ -85,6 +85,51 @@ def forge_unclaim(repo: Path, directory: Path, number: str) -> bool:
     return True
 
 
+def link_start(root: Path, integration: str | None) -> str:
+    """Names the commit a lane branch new to a linked repository starts at.
+
+    The linked checkout's own ``HEAD`` is never the start: an operator's
+    sibling checkout may stand on an unrelated feature branch, whose
+    commits would then sit under the lane's work unseen. The first ref the
+    linked repository holds is taken, in order: the project's integration
+    branch, remote-tracking then local, the remote default branch
+    ``origin/HEAD``, then a local ``main`` or ``master``.
+
+    Args:
+        root: Checkout of the linked repository.
+        integration: The project's recorded integration branch, if any.
+
+    Returns:
+        The full commit identifier the lane branch starts at, so the new
+        branch tracks no upstream.
+
+    Raises:
+        BridgeError: If the linked repository holds none of those refs.
+    """
+    from agent_parley.cli import git
+
+    refs = [
+        *(
+            [f"refs/remotes/origin/{integration}", f"refs/heads/{integration}"]
+            if integration
+            else []
+        ),
+        "refs/remotes/origin/HEAD",
+        "refs/heads/main",
+        "refs/heads/master",
+    ]
+    for ref in refs:
+        with contextlib.suppress(BridgeError):
+            return git(
+                root, "rev-parse", "--verify", "--quiet", ref + "^{commit}"
+            )
+    raise BridgeError(
+        f"{root} has no integration branch, origin/HEAD, main or master to "
+        "start a lane branch from; create one there, or create the lane "
+        "branch there yourself, and claim again."
+    )
+
+
 class ClaimsMixin(ReportsMixin):
     """Issue ledger transitions, claim forecasts and the work-order plan.
 
@@ -127,6 +172,324 @@ class ClaimsMixin(ReportsMixin):
 
         return recovery.authorize(directory, data, parse_issue(number), reason)
 
+    def _link_worktrees(
+        self, directory: Path, agent: str, names: list[str]
+    ) -> dict[str, str]:
+        """Prepares the lane's linked worktrees for a new claim.
+
+        Each repository the claim names gains a worktree in the project
+        state directory, beside the lane, so the linked repository holds no
+        coordination state. It checks out the lane's own branch, created
+        from the start `link_start` names when that repository lacks it, so
+        a sibling checkout left on a feature branch never puts that
+        branch's commits under the lane's. A worktree the lane already has
+        is kept. Every linked worktree of the lane, named by this claim or
+        kept from an earlier one, records the commit its branch stands on
+        as ``base``, so a resolve counts only commits made under this
+        claim, never those a reused lane branch carried from an earlier
+        one. Each worktree is recorded even when a later one fails, so a
+        refused claim leaves no worktree the manifest does not name, and
+        retirement or ``link remove`` still finds it.
+
+        Args:
+            directory: Private project state directory.
+            agent: Claiming participant.
+            names: Link names the claim asked for.
+
+        Returns:
+            The worktree path per link name, covering every linked worktree
+            of the lane.
+        """
+        from agent_parley.cli import git, has_branch, lock, roster, write_json
+
+        with lock(directory / "setup.lock"):
+            data = roster.read(directory)
+            participant = data["participants"][agent]
+            branch = participant["branch"]
+            linked = participant.get("linked", {})
+            if not names and not linked:
+                return {}
+            participant["linked"] = linked
+            try:
+                for name in sorted({*names, *linked}):
+                    root = Path(data["links"][name])
+                    lane = directory / f"{agent}.links" / name
+                    if not lane.exists():
+                        git(root, "worktree", "prune")
+                        if has_branch(root, branch):
+                            git(root, "worktree", "add", str(lane), branch)
+                        else:
+                            git(
+                                root,
+                                "worktree",
+                                "add",
+                                "-b",
+                                branch,
+                                str(lane),
+                                link_start(root, data.get("integration_base")),
+                            )
+                    linked[name] = {
+                        "lane": str(lane),
+                        "branch": branch,
+                        "base": git(lane, "rev-parse", branch),
+                    }
+            finally:
+                if not linked:
+                    participant.pop("linked")
+                write_json(directory / "project.json", data)
+        return {name: entry["lane"] for name, entry in sorted(linked.items())}
+
+    def _trial_operator(self, repo: Path, verb: str) -> tuple[Path, dict]:
+        """Resolves a trial command run from the project base checkout.
+
+        Args:
+            repo: Checkout the command runs from.
+            verb: What the command does, for the refusal.
+
+        Returns:
+            The project state directory and manifest.
+
+        Raises:
+            BridgeError: If run from a lane rather than the base checkout.
+        """
+        from agent_parley.cli import roster
+
+        _, directory = self.project(repo)
+        data = roster.read(directory)
+        if repo.resolve() != Path(data["root"]).resolve() or roster.from_lane(
+            data
+        ):
+            raise BridgeError(
+                f"Only the operator can {verb} a trial, from the project "
+                "base checkout."
+            )
+        return directory, data
+
+    def trial_start(self, repo: Path, number: str, lanes: str) -> dict:
+        """Assigns one issue to several lanes as a side-by-side trial.
+
+        Each lane keeps its own provider, credential and worktree; the base
+        commit they all start from is recorded and sent to each lane.
+
+        Args:
+            repo: Project base checkout.
+            number: Repository issue number.
+            lanes: Comma-separated participant names, at least two.
+
+        Returns:
+            The running trial.
+
+        Raises:
+            BridgeError: If run from a lane, a named lane's head is not the
+                base commit or its worktree has uncommitted tracked changes,
+                or `trials.start` refuses.
+        """
+        from agent_parley import budgets, supervision, trials
+        from agent_parley.cli import git, parse_issue
+
+        directory, data = self._trial_operator(repo, "start")
+        issue = parse_issue(number)
+        names = lanes.split(",")
+        chosen = {item.strip() for item in names}
+        base = git(Path(data["root"]), "rev-parse", data["base"])
+        for name, participant in sorted(data["participants"].items()):
+            if name not in chosen:
+                continue
+            worktree = Path(participant["lane"])
+            if git(worktree, "rev-parse", "HEAD") != base:
+                raise BridgeError(
+                    f"{name}'s head is not the trial base {base[:12]}; "
+                    f"reset its worktree to {data['base']} first."
+                )
+            if git(worktree, "status", "--porcelain", "--untracked-files=no"):
+                raise BridgeError(
+                    f"{name}'s worktree has uncommitted changes; commit, "
+                    "stash or revert them before the trial starts."
+                )
+        trial = trials.start(
+            directory,
+            data,
+            issue,
+            names,
+            base=base,
+            readings={
+                name: budgets.claim_reading(self.home, directory, data, name)
+                for name in data["participants"]
+                if name in chosen
+            },
+            cap=supervision.configuration(self.home, data)[
+                "max_claims_per_lane"
+            ],
+            expected=(data.get("deadlines") or {}).get("claim"),
+        )
+        for name, entry in trial["lanes"].items():
+            self._trial_mail(
+                data,
+                name,
+                f"Trial of issue #{issue}: work it on your own branch "
+                f"{entry['branch']} from base {trial['base']}; other "
+                f"lanes work it too. Report ready with --issue {issue} "
+                "when done; the operator keeps one branch.",
+            )
+        return trial
+
+    def trial_show(self, repo: Path, number: str) -> dict:
+        """Compares the lanes of an issue's trial side by side.
+
+        Args:
+            repo: Any checkout of the project.
+            number: Repository issue number.
+
+        Returns:
+            The comparison `trials.comparison` builds.
+        """
+        from agent_parley import trials
+        from agent_parley.cli import parse_issue, roster
+
+        _, directory = self.project(repo)
+        return trials.comparison(
+            directory, roster.read(directory), parse_issue(number)
+        )
+
+    def trial_keep(self, repo: Path, number: str, lane: str) -> dict:
+        """Ends a trial by keeping one lane's branch and releasing the rest.
+
+        No branch or worktree is deleted; a released lane's branch stays
+        until the operator removes it.
+
+        Args:
+            repo: Project base checkout.
+            number: Repository issue number.
+            lane: Participant whose branch is kept.
+
+        Returns:
+            The ended trial.
+
+        Raises:
+            BridgeError: If run from a lane, or `trials.keep` refuses.
+        """
+        from agent_parley import trials
+        from agent_parley.cli import forge, issues, parse_issue
+
+        directory, data = self._trial_operator(repo, "end")
+        issue = parse_issue(number)
+        trial = trials.keep(
+            directory, issue, lane, defaults=data.get("deadlines") or {}
+        )
+        forge.select(repo, data)
+        if (
+            not issues.forge_assignees(directory, issue)
+            and forge.assigned(repo, issue) is False
+            and forge.assign(repo, issue)
+        ):
+            forge_mark(directory, issue, added=True)
+        for name, entry in trial["lanes"].items():
+            self._trial_mail(
+                data,
+                name,
+                f"Trial of issue #{issue} ended: the operator kept "
+                f"{lane}'s branch. "
+                + (
+                    f"You now own #{issue}."
+                    if name == lane
+                    else self._trial_release_text(
+                        data, issue, name, entry, trial["id"]
+                    )
+                ),
+            )
+        return trial
+
+    def trial_cancel(self, repo: Path, number: str) -> dict:
+        """Ends a trial without keeping any lane's branch.
+
+        Every lane is released with the recorded outcome and the issue
+        returns to the queue unclaimed. No branch or worktree is deleted.
+
+        Args:
+            repo: Project base checkout.
+            number: Repository issue number.
+
+        Returns:
+            The ended trial.
+
+        Raises:
+            BridgeError: If run from a lane, or `trials.cancel` refuses.
+        """
+        from agent_parley import trials
+        from agent_parley.cli import parse_issue
+
+        directory, data = self._trial_operator(repo, "cancel")
+        issue = parse_issue(number)
+        trial = trials.cancel(directory, issue)
+        for name, entry in trial["lanes"].items():
+            self._trial_mail(
+                data,
+                name,
+                f"Trial of issue #{issue} was cancelled by the operator; "
+                "no branch was kept. "
+                + self._trial_release_text(
+                    data, issue, name, entry, trial["id"]
+                ),
+            )
+        return trial
+
+    @staticmethod
+    def _trial_release_text(
+        data: dict, issue: str, name: str, entry: dict, trial: str
+    ) -> str:
+        """Tells a released trial lane how to start its next work cleanly.
+
+        The keeping branch carries the trial id, so a second trial of the
+        same issue on the same lane gets its own name, and the reset runs
+        only after that branch exists.
+
+        Args:
+            data: Project manifest.
+            issue: Bare issue number the trial ran on.
+            name: Released participant.
+            entry: The lane's trial entry.
+            trial: Id of the trial that ended.
+
+        Returns:
+            The release text with the one command that keeps the trial work
+            on its own branch and then resets the worktree to the base.
+        """
+        kept = f"trial-{issue}-{trial}-{name}"
+        return (
+            f"You are released from #{issue}. Before new work, run "
+            f"git branch {kept} && git reset --hard {data['base']}. The "
+            f"reset moves your branch {entry['branch']} to the base; the "
+            f"trial commits stay on {kept}."
+        )
+
+    def _trial_mail(self, data: dict, name: str, body: str) -> None:
+        """Writes one operator message about a trial to a lane's inbox.
+
+        Delivery is best effort: the trial is already recorded, so a lane
+        whose inbox cannot be written still reads it in status and show, and
+        a lane no longer on the roster is skipped.
+
+        Args:
+            data: Project manifest.
+            name: Participant the message goes to.
+            body: Message text.
+        """
+        from agent_parley.cli import operator_key, store
+
+        if name not in data["participants"]:
+            return
+        identity = data["participants"][name].get("display", name)
+        subject = "trial"
+        with contextlib.suppress(BridgeError):
+            store.speak(
+                self.home,
+                data["root"],
+                identity,
+                subject,
+                body,
+                operator_key(identity, subject, body),
+            )
+
     def issue(
         self,
         repo: Path,
@@ -142,6 +505,7 @@ class ClaimsMixin(ReportsMixin):
         when_released: str = "",
         remaining: list[str] | None = None,
         take_orphaned: bool = False,
+        links: list[str] | None = None,
     ) -> dict:
         """Reads the issue ledger or applies a transition as the selected lane.
 
@@ -153,7 +517,11 @@ class ClaimsMixin(ReportsMixin):
         title. That lookup is optional context: an unavailable forge resolves
         to no title and never blocks or fails the claim. The same forge
         refuses a claim on an issue it reports closed, since that work is
-        already over; a forge that cannot be read allows the claim.
+        already over; a forge that cannot be read allows the claim. The claim
+        also reads the issue body and records the acceptance criteria its
+        template section lists as ``criteria`` (`criteria.parse`), which a
+        ready report must then prove one by one; an unreadable body leaves
+        any list recorded earlier.
 
         A completed claim or release is then mirrored onto the host forge as
         an assignment, so the issue reads as worked outside Agent Parley. The
@@ -195,6 +563,9 @@ class ClaimsMixin(ReportsMixin):
                 per entry, recorded beside the summary.
             take_orphaned: Whether this claim takes an issue the supervisor
                 marked orphaned, recording the previous owner and the reason.
+            links: Linked repositories this claim also works in. The lane
+                gains a worktree in each, on its own branch, and the result
+                names them under ``linked``.
 
         Returns:
             The whole ledger for list, or the resulting issue record. An
@@ -205,6 +576,7 @@ class ClaimsMixin(ReportsMixin):
         Raises:
             BridgeError: If lane, ownership, or transition checks fail.
         """
+        from agent_parley import criteria as acceptance
         from agent_parley.cli import (
             attachments,
             budgets,
@@ -255,11 +627,19 @@ class ClaimsMixin(ReportsMixin):
                     "condition": f"released:{parse_issue(when_released)}",
                 },
             )
+        unknown = sorted(set(links or ()) - set(data.get("links", {})))
+        if links and action != "claim":
+            raise BridgeError("Only a claim adds linked worktrees.")
+        if unknown:
+            raise BridgeError(
+                f"This project links no repository named {unknown[0]}; run "
+                "agent-parley link show."
+            )
         forge.select(repo, data)
-        title = (
-            forge.issue_title(repo, parse_issue(number))
+        title, body = (
+            forge.issue_text(repo, parse_issue(number))
             if action == "claim"
-            else None
+            else (None, None)
         )
         closed = (
             forge.issue_completion(repo, parse_issue(number))
@@ -319,10 +699,20 @@ class ClaimsMixin(ReportsMixin):
                     if action in ("claim", "accept")
                     else None
                 ),
+                criteria=None if body is None else acceptance.parse(body),
             )
         except BridgeError:
             attachments.remove(directory, carried.get("diff", ""))
             raise
+        if action in ("accept", "release"):
+            self._end_contention(
+                data,
+                directory,
+                (record.get("handoff") or {}).get("from")
+                if action == "accept"
+                else agent,
+                agent if action == "accept" else None,
+            )
         if action == "accept":
             return self._inherit(data, agent, record)
         if action == "claim":
@@ -343,6 +733,8 @@ class ClaimsMixin(ReportsMixin):
             )
             if likely:
                 record = {**record, "forecast": likely}
+            if linked := self._link_worktrees(directory, agent, links or []):
+                record = {**record, "linked": linked}
         elif action == "release":
             forge_unclaim(repo, directory, parse_issue(number))
         return record
@@ -411,6 +803,50 @@ class ClaimsMixin(ReportsMixin):
             )
             carried["diff_bytes"] = len(text.encode())
         return carried
+
+    def _end_contention(
+        self,
+        data: dict,
+        directory: Path,
+        lane: str | None,
+        peer: str | None,
+    ) -> None:
+        """Clears the contention records the moved work answers.
+
+        An accepted handoff answers only the pair of the offering and the
+        accepting lane. A release answers the releasing lane's records only
+        when that lane holds no other issue, because a record names a path
+        and the claim ledger does not record which paths an issue touched.
+        A flag may be raised again if refusals resume. A store that cannot
+        answer leaves the records, which the next handoff or release clears.
+
+        Args:
+            data: Project manifest.
+            directory: Coordination directory of the project.
+            lane: Participant that gave up the work, or None when unknown.
+            peer: Participant that accepted the work, or None for a release.
+        """
+        import sqlite3
+
+        from agent_parley.cli import snapshot, store
+
+        participants = data["participants"]
+        if lane not in participants or (
+            peer is not None and peer not in participants
+        ):
+            return
+        if peer is None and any(
+            record.get("owner") == lane
+            for record in snapshot(directory)["issues"].values()
+        ):
+            return
+        with contextlib.suppress(BridgeError, OSError, sqlite3.Error):
+            store.clear_contention(
+                self.home,
+                data["root"],
+                participants[lane]["display"],
+                participants[peer]["display"] if peer is not None else None,
+            )
 
     def _inherit(self, data: dict, agent: str, record: dict) -> dict:
         """Moves an accepted handoff's reservations to the accepting lane.
@@ -612,6 +1048,66 @@ class ClaimsMixin(ReportsMixin):
             ),
         }
 
+    def milestone_path(self, repo: Path, milestone: str | None = None) -> dict:
+        """Reports the longest dependency chain among a milestone's open issues.
+
+        The reading uses the issue ledger and the supervisor's cached forge
+        issues only, so it makes no forge call beyond naming the active
+        milestone when none is given, and it claims nothing, offers nothing
+        and writes nothing.
+
+        Args:
+            repo: Repository or assigned worktree that selects the project.
+            milestone: Milestone title, or None for the forge's active
+                milestone, falling back to every cached open issue when the
+                forge names none.
+
+        Returns:
+            The milestone, whether a fresh cached forge reading backed the
+            graph as ``forge_reading``, the chain blocker first with each
+            issue's title, lifecycle state and holder, and the dependency
+            cycles found.
+
+        Raises:
+            BridgeError: If the repository has no recorded project.
+        """
+        from agent_parley import critical, issues, lifecycle
+        from agent_parley.cli import forge
+
+        _, directory = self.project(repo, create=False)
+        title = milestone or forge.active_milestone(repo)
+        state = issues.snapshot(directory)
+        found = recommend.dependencies(directory, state, title)
+        catalog = recommend.cached_catalog(directory)
+        recorded = state.get("issues", {})
+
+        def step(number: str) -> dict:
+            """Describes one issue on the path for the reading."""
+            record = recorded.get(number) or {}
+            owner = record.get("owner")
+            return {
+                "issue": number,
+                "title": str(
+                    record.get("title")
+                    or (catalog.get(number) or {}).get("title")
+                    or ""
+                ),
+                "state": (
+                    lifecycle.state(record)["state"] if owner else "unclaimed"
+                ),
+                "holder": owner or "nobody",
+            }
+
+        return {
+            "milestone": title,
+            "forge_reading": any(
+                isinstance(item, dict) and "milestone" in item
+                for item in catalog.values()
+            ),
+            "path": [step(number) for number in critical.path(found)],
+            "cycles": found["cycles"],
+        }
+
     def issue_match(
         self, repo: Path, goal: str, limit: int = recommend.MAX_SHORTLIST
     ) -> dict:
@@ -797,6 +1293,7 @@ class ClaimsMixin(ReportsMixin):
         *,
         reason: str = "",
         release: bool = False,
+        proof: str = "",
     ) -> dict:
         """Ends a claim whose holder never filed the completion it landed.
 
@@ -814,8 +1311,22 @@ class ClaimsMixin(ReportsMixin):
         holder that is answering is never resolved out from under it. The
         transition is recorded as the operator's own, never as the lane's.
 
+        Each linked repository whose lane branch gained commits since the
+        claim must show the same evidence for that branch, recorded under
+        ``repositories`` with the link name.
+
         Peers gain nothing here. The escalation goes to the operator, and no
         lane is given any power over another lane's claim.
+
+        When the claim recorded acceptance criteria, `proof` may give one
+        evidence line per criterion, written ``N: <evidence>``; a proof that
+        misses one is refused, naming it. Without a proof the holder's ready
+        report evidence stands, and a claim with none records the forge
+        outcome as the evidence of every criterion (`lifecycle.resolve`).
+
+        Completing the claim, but not releasing it, is refused while a
+        project policy rule that applies to ``resolve`` fails on the holder's
+        lane (`rules.gate`). A project without a policy is unaffected.
 
         Args:
             repo: Any checkout of the target repository.
@@ -824,21 +1335,26 @@ class ClaimsMixin(ReportsMixin):
             release: Whether to return the work to the queue instead of
                 recording it complete. It is required for a pull request that
                 was closed without merging, because nothing was integrated.
+            proof: Evidence lines for the claim's acceptance criteria, one
+                per line, or empty.
 
         Returns:
             The issue, the outcome recorded, the lane the claim was held by,
-            the forge evidence that justified it and the resulting execution
-            state.
+            the forge evidence that justified it, the resulting execution
+            state, and the acceptance criteria with their evidence lines.
 
         Raises:
             BridgeError: If the issue is unheld, no merged or closed pull
                 request names the current claim, the evidence is closed and
-                unmerged without `release`, or the claim carries no
-                unresolved-completion escalation.
+                unmerged without `release`, the claim carries no
+                unresolved-completion escalation, or `proof` is given for a
+                claim without criteria or misses one of them.
         """
+        from agent_parley import criteria as acceptance
         from agent_parley.cli import (
             budgets,
             forge,
+            git,
             issues,
             lifecycle,
             parse_issue,
@@ -861,6 +1377,13 @@ class ClaimsMixin(ReportsMixin):
                 f"reminders unanswered. {holder} can end the claim with "
                 f"issue release {issue}."
             )
+        stated = record.get("criteria") or []
+        if proof.strip() and not stated:
+            raise BridgeError(
+                f"Issue #{issue} recorded no acceptance criteria, so it takes "
+                "no --evidence."
+            )
+        proven = acceptance.matched(stated, proof) if proof.strip() else None
         participant = data["participants"].get(holder) or {}
         forge.select(repo, data)
         closing = forge.issue_completion(Path(data["root"]), issue)
@@ -878,22 +1401,68 @@ class ClaimsMixin(ReportsMixin):
             evidence = forge.branch_evidence(
                 Path(data["root"]), str(participant.get("branch", ""))
             )
-        if not evidence or evidence["state"] not in ("MERGED", "CLOSED"):
-            raise BridgeError(
-                f"No merged or closed pull request was observed for {holder}, "
-                f"so issue #{issue} has no evidence to resolve it on."
-            )
-        if evidence["created_at"] < supervision.claimed_since(record):
-            raise BridgeError(
-                f"The newest pull request on {evidence['branch']} predates "
-                f"the current claim on issue #{issue}, so it does not name "
-                "this work."
-            )
-        if evidence["state"] != "MERGED" and not release:
-            raise BridgeError(
-                f"The pull request on {evidence['branch']} was closed without "
-                "merging, so nothing was integrated; add --release to return "
-                "the work to the queue."
+
+        def verified(found: dict | None, where: str) -> dict:
+            """Returns forge evidence once it proves this claim's work.
+
+            Args:
+                found: Pull request evidence one repository's forge read.
+                where: Lane and repository the refusal names.
+
+            Returns:
+                The same evidence.
+
+            Raises:
+                BridgeError: If no closed pull request was observed, it
+                    predates the claim, or it closed unmerged without
+                    ``release``.
+            """
+            if not found or found["state"] not in ("MERGED", "CLOSED"):
+                raise BridgeError(
+                    f"No merged or closed pull request was observed for "
+                    f"{where}, so issue #{issue} has no evidence to resolve "
+                    "it on."
+                )
+            if found["created_at"] < supervision.claimed_since(record):
+                raise BridgeError(
+                    f"The newest pull request on {found['branch']} predates "
+                    f"the current claim on issue #{issue}, so it does not "
+                    "name this work."
+                )
+            if found["state"] != "MERGED" and not release:
+                raise BridgeError(
+                    f"The pull request on {found['branch']} was closed "
+                    "without merging, so nothing was integrated; add "
+                    "--release to return the work to the queue."
+                )
+            return found
+
+        evidence = verified(evidence, holder)
+        repositories = []
+        for name, _, branch in roster.worktrees(participant)[1:]:
+            root = Path(data["links"][name])
+            base = participant["linked"][name]["base"]
+            if git(root, "rev-list", "--count", f"{base}..{branch}") != "0":
+                found = forge.branch_evidence(root, branch)
+                repositories.append(
+                    {
+                        "repository": name,
+                        **verified(found, f"{holder} in {name}"),
+                    }
+                )
+        if repositories:
+            evidence = {**evidence, "repositories": repositories}
+        if not release:
+            from agent_parley import rules
+
+            rules.gate(
+                directory,
+                Path(data["root"]),
+                Path(str(participant.get("lane", ""))),
+                event=rules.RESOLVE,
+                builder=holder,
+                issue=issue,
+                claim=str(record.get("claim_id") or ""),
             )
         resolved = lifecycle.resolve(
             directory,
@@ -903,6 +1472,7 @@ class ClaimsMixin(ReportsMixin):
             actor=roster.OPERATOR,
             reason=reason,
             usage=budgets.claim_reading(self.home, directory, data, holder),
+            criteria_evidence=proven,
         )
         if release:
             forge_unclaim(Path(data["root"]), directory, issue)
@@ -913,6 +1483,11 @@ class ClaimsMixin(ReportsMixin):
             "owner": resolved["owner"],
             "state": lifecycle.state(resolved)["state"],
             "evidence": resolved["resolution"]["evidence"],
+            "criteria": resolved.get("criteria") or [],
+            "criteria_evidence": lifecycle.state(resolved).get(
+                "criteria_evidence"
+            )
+            or [],
         }
 
     def _request_notice(
@@ -945,10 +1520,10 @@ class ClaimsMixin(ReportsMixin):
                 f"The operator asks you to hand issue #{issue} to "
                 f"{request['to']}.",
                 f"Reason: {request['reason'] or 'none given'}",
-                f"Authorize it with: agent-parley issue accept {issue} "
-                f"--offer-id {request['id']}",
-                f"Refuse it with: agent-parley issue decline {issue} "
-                f"--offer-id {request['id']}",
+                f"Authorize it with: `{protocol.cli_command()} issue accept "
+                f"{issue} --offer-id {request['id']}`",
+                f"Refuse it with: `{protocol.cli_command()} issue decline "
+                f"{issue} --offer-id {request['id']}`",
                 "You keep the issue until you authorize the handoff, and "
                 f"{request['to']} owns it only after accepting the offer "
                 "your authorization creates.",
@@ -984,13 +1559,16 @@ class ClaimsMixin(ReportsMixin):
             issue's record in it, the reservation keys its owner holds, and
             the history reading for the same issue, and the convergence
             account of an owned issue's current claim generation, or None
-            for an unowned issue.
+            for an unowned issue. ``contention`` lists each flagged pair
+            the owner is one lane of, naming the peer, the key, the
+            refusal count and the issues the peer holds.
 
         Raises:
             BridgeError: If the number is unusable or the project has none.
         """
         from agent_parley import convergence
         from agent_parley.cli import parse_issue, roster, snapshot, store
+        from agent_parley.status import held_issues
 
         root, directory = self.project(repo, create=False)
         data = roster.read(directory)
@@ -1004,9 +1582,24 @@ class ClaimsMixin(ReportsMixin):
             if owner in data["participants"]
             else ""
         )
+        contention = [
+            {
+                "peer": peer,
+                "path": flagged["path"],
+                "count": flagged["count"],
+                "issues": held_issues(ledger["issues"], data, peer),
+            }
+            for flagged in (
+                store.contentions(self.home, data["root"]) if identity else []
+            )
+            if identity in flagged["lanes"]
+            for peer in flagged["lanes"]
+            if peer != identity
+        ]
         return {
             "root": str(root),
             "issue": identifier,
+            "contention": contention,
             "ledger": ledger,
             "record": record or None,
             "owner": owner,
@@ -1105,13 +1698,15 @@ class ClaimsMixin(ReportsMixin):
             evidence: Bounded observations supporting a proposal.
 
         Returns:
-            The proposal record, or the listing for proposals.
+            The proposal record, or the listing for proposals. A decision
+            is also mailed to the lane that proposed it, which otherwise
+            learned the outcome only by listing proposals again.
 
         Raises:
             BridgeError: If the caller lacks the authority the action needs
                 or the plan layer refuses the proposal.
         """
-        from agent_parley.cli import git, plan, roster
+        from agent_parley.cli import git, plan, roster, store
 
         _, directory = self.project(repo)
         if action == "proposals":
@@ -1146,4 +1741,18 @@ class ClaimsMixin(ReportsMixin):
                 "Only the operator approves or rejects a plan revision, from "
                 "the project base checkout."
             )
-        return plan.decide(directory, identity, action == "approve", reason)
+        decided = plan.decide(directory, identity, action == "approve", reason)
+        proposer = data["participants"].get(decided.get("by"))
+        if proposer and not decided.get("replayed"):
+            with contextlib.suppress(BridgeError):
+                store.speak(
+                    self.home,
+                    data["root"],
+                    proposer.get("display", decided["by"]),
+                    f"Plan proposal {identity} {decided['status']}",
+                    f"The operator decided your plan proposal {identity}: "
+                    f"{decided['status']}. "
+                    f"Note: {decided.get('note') or 'none given'}",
+                    f"plan-{identity}-{decided['status']}",
+                )
+        return decided

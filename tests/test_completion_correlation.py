@@ -292,6 +292,46 @@ def test_the_issue_reading_names_its_closing_pull_request(
     assert forge.issue_completion(tmp_path, "1216") is None
 
 
+def test_a_later_unmerged_duplicate_never_hides_the_merged_closer(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    pulls = {
+        "1330": {"state": "CLOSED", "number": 1330, "headRefName": "dup"},
+        "1328": {
+            "state": "MERGED",
+            "number": 1328,
+            "headRefName": "landed",
+            "mergeCommit": {"oid": "abc"},
+        },
+    }
+    asked = []
+
+    def run(args, timeout):
+        if args[1] == "issue":
+            return json.dumps(
+                {
+                    "state": "CLOSED",
+                    "closedAt": "2026-09-20T00:00:00Z",
+                    "closedByPullRequestsReferences": [
+                        {"number": 1328},
+                        {"number": 1330},
+                    ],
+                }
+            )
+        asked.append(args[3])
+        return json.dumps(pulls[args[3]])
+
+    monkeypatch.setattr(forge, "_run", run)
+    reading = forge.issue_completion(tmp_path, "1216")
+    assert asked == ["1330", "1328"]
+    assert (reading["state"], reading["pull_request"]) == ("MERGED", 1328)
+    assert (reading["branch"], reading["commit"]) == ("landed", "abc")
+    pulls["1328"] = {**pulls["1328"], "state": "CLOSED"}
+    reading = forge.issue_completion(tmp_path, "1216")
+    assert (reading["state"], reading["pull_request"]) == ("CLOSED", 1330)
+
+
 @pytest.mark.parametrize("pull", [None, "", "null", "{}", "not json"])
 def test_an_unreadable_closing_pull_request_gives_no_reading(
     monkeypatch, tmp_path, pull

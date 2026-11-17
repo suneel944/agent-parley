@@ -1070,7 +1070,7 @@ def test_a_lane_pull_request_past_the_newest_window_stays_tracked(
     answer(None)
     observe(bridge, project, monkeypatch, *window(project))
     assert "7" in cached(project)
-    answer({})
+    answer({"state": "MERGED"})
     observe(bridge, project, monkeypatch, *window(project))
     assert "7" not in cached(project)
     assert len(received(bridge, "claude")) == 1
@@ -1111,10 +1111,111 @@ def test_the_forge_reads_one_pull_request_by_number(monkeypatch, tmp_path):
     assert (found["number"], found["branch"]) == (7, "lane")
     assert calls[0][:4] == ["gh", "pr", "view", "7"]
     run("MERGED")
-    assert forge.pull_request(tmp_path, 7) == {}
+    assert forge.pull_request(tmp_path, 7) == {"state": "MERGED"}
+    run("CLOSED")
+    assert forge.pull_request(tmp_path, 7) == {"state": "CLOSED"}
     monkeypatch.setattr(forge, "_run", lambda *args: None)
     assert forge.pull_request(tmp_path, 7) is None
     monkeypatch.setattr(forge, "_run", lambda *args: "[]")
     assert forge.pull_request(tmp_path, 7) is None
     forge.select(tmp_path, {"forge": "null"})
     assert forge.pull_request(tmp_path, 7) is None
+
+
+def test_a_head_with_no_checks_wakes_the_lane_once_on_the_second_reading(
+    bridge, project, monkeypatch
+):
+    quiet = reading(project, checks="none")
+    observe(bridge, project, monkeypatch, quiet)
+    assert received(bridge, "claude") == []
+    observe(bridge, project, monkeypatch, quiet)
+    observe(bridge, project, monkeypatch, quiet)
+    [notice] = received(bridge, "claude")
+    assert "no checks reported on this head" in notice
+    observe(bridge, project, monkeypatch, reading(project, checks="pending"))
+    assert len(received(bridge, "claude")) == 1
+
+
+def test_a_behind_or_blocked_merge_state_wakes_the_lane_once(
+    bridge, project, monkeypatch
+):
+    observe(bridge, project, monkeypatch, reading(project, merge_state="CLEAN"))
+    for state in ["BEHIND", "UNKNOWN", "BEHIND"]:
+        observe(
+            bridge, project, monkeypatch, reading(project, merge_state=state)
+        )
+    blocked = reading(project, sha=NEXT, merge_state="BLOCKED")
+    observe(bridge, project, monkeypatch, blocked)
+    observe(bridge, project, monkeypatch, {**blocked, "checks": "green"})
+    observe(bridge, project, monkeypatch, {**blocked, "checks": "green"})
+    behind, gated = received(bridge, "claude")
+    assert "behind its base" in behind and SHA in behind
+    assert "checks passed" in gated and NEXT in gated
+    assert "merge is blocked though checks passed" in gated
+
+
+def test_a_conversation_comment_wakes_the_lane(bridge, project, monkeypatch):
+    observe(bridge, project, monkeypatch, reading(project))
+    comment = {"author": "bob", "at": "2026-11-13T00:00:00Z"}
+    observe(bridge, project, monkeypatch, reading(project, comments=[]))
+    assert received(bridge, "claude") == []
+    observe(bridge, project, monkeypatch, reading(project, comments=[comment]))
+    observe(bridge, project, monkeypatch, reading(project, comments=[comment]))
+    [notice] = received(bridge, "claude")
+    assert "conversation comment from bob" in notice
+    assert "gh pr view 7 --comments" in notice
+
+
+def test_a_pull_request_closed_unmerged_wakes_its_lane(
+    bridge, project, monkeypatch
+):
+    observe(bridge, project, monkeypatch, reading(project))
+    answers = iter([None, {"state": "CLOSED"}])
+    monkeypatch.setattr(
+        supervision.forge, "pull_request", lambda root, number: next(answers)
+    )
+    observe(bridge, project, monkeypatch)
+    assert "7" in cached(project)
+    assert received(bridge, "claude") == []
+    observe(bridge, project, monkeypatch)
+    assert "7" not in cached(project)
+    [notice] = received(bridge, "claude")
+    assert "#7" in notice and "closed without merging" in notice
+
+
+def test_a_merged_pull_request_leaves_without_a_wake(
+    bridge, project, monkeypatch
+):
+    observe(bridge, project, monkeypatch, reading(project))
+    monkeypatch.setattr(
+        supervision.forge,
+        "pull_request",
+        lambda root, number: {"state": "MERGED"},
+    )
+    observe(bridge, project, monkeypatch)
+    assert "7" not in cached(project)
+    assert received(bridge, "claude") == []
+
+
+def test_the_forge_reading_keeps_merge_state_and_comment_authors(
+    monkeypatch, tmp_path
+):
+    forge.select(tmp_path, {"forge": "github"})
+    monkeypatch.setattr(forge, "_reachable", lambda repo: "owner/name")
+    comments = [
+        {"author": {"login": f"u{index}"}, "createdAt": f"t{index}"}
+        for index in range(forge.MAX_COMMENTS + 5)
+    ]
+    record = {
+        "number": 1,
+        "mergeStateStatus": "BEHIND",
+        "comments": comments,
+    }
+    monkeypatch.setattr(forge, "_run", lambda *args: json.dumps([record]))
+    [found] = forge.open_pull_requests(tmp_path)
+    assert found["merge_state"] == "BEHIND"
+    assert len(found["comments"]) == forge.MAX_COMMENTS
+    assert found["comments"][-1] == {
+        "author": f"u{forge.MAX_COMMENTS + 4}",
+        "at": f"t{forge.MAX_COMMENTS + 4}",
+    }

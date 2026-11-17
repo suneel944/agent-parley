@@ -424,6 +424,7 @@ ADAPTERS: dict[str, tuple[Finder, Fold]] = {
     "copilot": (_copilot_records, _fold_copilot),
     "gemini": (_gemini_records, _fold_gemini),
 }
+REPLAYED_FOLDS: frozenset[Fold] = frozenset({_fold_claude, _fold_gemini})
 SOURCES: dict[str, Callable[[Path, Path], list[Path]]] = {
     "claude": _claude_sources,
     "codex": _codex_sources,
@@ -1199,6 +1200,66 @@ def _advance(
     return reading
 
 
+def _replay(
+    path: Path, fold: Fold, reading: dict, mark: bytes, end: int
+) -> dict:
+    """Advances one reading past ``MAX_READ`` until it reaches ``end``.
+
+    Args:
+        path: Session record file.
+        fold: Adapter-specific accumulator for one parsed record.
+        reading: Reading to advance, or an empty mapping.
+        mark: Bytes every line the fold can use contains.
+        end: Byte offset to read up to; a reading that stops moving ends
+            short of it.
+
+    Returns:
+        The advanced reading.
+    """
+    reading = _advance(path, fold, reading, mark)
+    while reading["offset"] < end:
+        before = reading["offset"]
+        reading = _advance(path, fold, reading, mark)
+        if reading["offset"] <= before:
+            break
+    return reading
+
+
+def _counted(fold: Fold, mark: bytes, known: dict) -> set[str]:
+    """Collects the message identifiers a lane's known records hold.
+
+    A resumed session's new record replays the messages of the record it
+    resumed, so these identifiers, read up to the offset each known
+    record was counted to, are skipped when that new record is first read.
+
+    Args:
+        fold: Adapter-specific accumulator that records identifiers.
+        mark: Bytes every line the fold can use contains.
+        known: Previous reading per ``path:inode`` key.
+
+    Returns:
+        Identifiers already counted; a record that was replaced or can no
+        longer be read adds none.
+    """
+    counted: set[str] = set()
+    for key, prior in known.items():
+        location, _, inode = key.rpartition(":")
+        path = Path(location)
+        with contextlib.suppress(KeyError, OSError, TypeError, ValueError):
+            if path.stat().st_ino != int(inode):
+                continue
+            base = {"path": location, "inode": int(inode)}
+            reading = _replay(
+                path,
+                fold,
+                {**base, "offset": 0, "tokens": 0, "seen": set()},
+                mark,
+                int(prior["offset"]),
+            )
+            counted |= reading["seen"]
+    return counted
+
+
 def reported_tokens(
     home: Path, participant: dict, cache: dict, whole: bool = False
 ) -> int | None:
@@ -1244,13 +1305,12 @@ def reported_tokens(
         if path is None:
             cache.pop(key, None)
             return None
-        size = path.stat().st_size
-        reading = _advance(path, fold, cache.get(key, {}), mark)
-        while whole and reading["offset"] < size:
-            before = reading["offset"]
-            reading = _advance(path, fold, reading, mark)
-            if reading["offset"] <= before:
-                break
+        reading = cache.get(key, {})
+        reading = (
+            _replay(path, fold, reading, mark, path.stat().st_size)
+            if whole
+            else _advance(path, fold, reading, mark)
+        )
     except (BridgeError, KeyError, OSError, ValueError):
         return None
     cache[key] = reading
@@ -1314,6 +1374,13 @@ def lane_sources(
     readings, or were written while nobody was reading, are still counted.
     Each record is advanced by at most ``MAX_READ`` bytes per call.
 
+    A resumed Claude or Gemini session writes a new record that replays the
+    messages of the one it resumed, and per-record keys counted those
+    tokens again. A record read for the first time is therefore read to
+    its end at once, skipping the message identifiers the lane's known
+    records, and any record read earlier in this call, already counted.
+    Records are read oldest first so the original is the one counted.
+
     Args:
         home: Private bridge state root.
         participant: Manifest entry naming the lane, provider and account.
@@ -1345,7 +1412,8 @@ def lane_sources(
     except (BridgeError, KeyError, OSError, ValueError):
         return None
     readings = []
-    for path in paths:
+    counted: set[str] | None = None
+    for path in sorted(paths, key=_mtime):
         try:
             stat = path.stat()
             key = f"{path}:{stat.st_ino}"
@@ -1367,8 +1435,19 @@ def lane_sources(
                 )
             elif stat.st_mtime < since:
                 reading = {**base, "offset": stat.st_size, "tokens": 0}
-            else:
+            elif fold not in REPLAYED_FOLDS:
                 reading = _advance(path, fold, {}, mark)
+            else:
+                if counted is None:
+                    counted = _counted(fold, mark, known)
+                reading = _replay(
+                    path,
+                    fold,
+                    {**base, "offset": 0, "tokens": 0, "seen": set(counted)},
+                    mark,
+                    stat.st_size,
+                )
+                counted |= reading["seen"]
         except (KeyError, OSError, TypeError, ValueError):
             continue
         readings.append(

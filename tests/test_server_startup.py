@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 from agent_parley import server
 from agent_parley.server import Server
 from agent_parley.state import MAX_LOG_BYTES
@@ -110,8 +112,11 @@ def test_a_refused_relaunch_is_logged(tmp_path, monkeypatch, capsys):
         raise OSError("text file busy")
 
     monkeypatch.setattr(server.os, "execv", refused)
-    server.replace(tmp_path, "0.1.0")
-    assert " relaunch failed: text file busy" in capsys.readouterr().out
+    monkeypatch.setattr(server, "EXEC_RETRY_SECONDS", 0.0)
+    with pytest.raises(SystemExit):
+        server.replace(tmp_path, "0.1.0")
+    written = capsys.readouterr().out
+    assert " relaunch failed, attempt 1 of 5: text file busy" in written
 
 
 def test_the_service_log_stays_under_its_rotation_bound(tmp_path):

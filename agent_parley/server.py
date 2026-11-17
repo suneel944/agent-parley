@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
@@ -55,6 +55,9 @@ OVERSIZED = {
 }
 HOOK_PATH = "/hook/"
 REVISION_SECONDS = 2.0
+LOOP_RESTART_SECONDS = 5.0
+EXEC_ATTEMPTS = 5
+EXEC_RETRY_SECONDS = 1.0
 LOG_NAME = "server.log"
 WORKERS = 16
 DECISION_SECONDS = hook.REPLY_TIMEOUT - 0.5
@@ -121,6 +124,102 @@ def log(home: Path, event: str, detail: str = "") -> None:
         except OSError:
             return
         trim_log(rotated)
+
+
+class Background:
+    """Runs the service's background loops and restarts one that fails.
+
+    Supervision and the inbound reader each ran on a thread started once.
+    An exception either loop let through ended its thread for the life of
+    the process, and nothing looked at the thread again, so the service kept
+    answering as ready while no lane was being supervised. Each loop now
+    runs under `keep`, which logs whatever ended it, with the traceback,
+    waits `LOOP_RESTART_SECONDS` and starts it again. Until that restart the
+    loop is listed by `faults`, which `Server.health` reports as
+    `protocol.DEGRADED`. A loop that returns has finished on purpose, as the
+    inbound reader does when it is not configured, and is not restarted.
+
+    Attributes:
+        home: Private bridge state root the loops are given.
+        stopped: Event set when the service is shutting down.
+        failed: Loop name to the failure that ended its last run, held from
+            the failure until the loop is started again.
+        threads: One thread per started loop.
+    """
+
+    def __init__(self, home: Path, stopped: threading.Event) -> None:
+        """Holds the state root and the stop event every loop is given.
+
+        Args:
+            home: Private bridge state root.
+            stopped: Event the service sets when it is shutting down.
+        """
+        self.home = home
+        self.stopped = stopped
+        self.failed: dict[str, str] = {}
+        self.threads: list[threading.Thread] = []
+
+    def start(
+        self, name: str, run: Callable[[Path, threading.Event], None]
+    ) -> None:
+        """Starts one loop on a daemon thread that restarts it on failure.
+
+        Args:
+            name: Word naming the loop in the log and in a health reading.
+            run: The loop, given the state root and the stop event.
+        """
+        thread = threading.Thread(
+            target=self.keep, args=(name, run), name=name, daemon=True
+        )
+        self.threads.append(thread)
+        thread.start()
+
+    def keep(
+        self, name: str, run: Callable[[Path, threading.Event], None]
+    ) -> None:
+        """Runs one loop until it returns or the service stops.
+
+        Every exception is caught, `SystemExit` included, because a command
+        helper that exits inside a poll would otherwise end the thread
+        without a trace. A log entry that cannot be written does not stop
+        the restart.
+
+        Args:
+            name: Word naming the loop.
+            run: The loop, given the state root and the stop event.
+        """
+        while not self.stopped.is_set():
+            try:
+                run(self.home, self.stopped)
+                return
+            except BaseException as exc:
+                self.failed[name] = f"{type(exc).__name__}: {exc}"
+                with contextlib.suppress(Exception):
+                    log(
+                        self.home,
+                        "background",
+                        f"{name} failed; restarting in "
+                        f"{LOOP_RESTART_SECONDS:g} s\n{traceback.format_exc()}",
+                    )
+            self.stopped.wait(LOOP_RESTART_SECONDS)
+            self.failed.pop(name, None)
+
+    def faults(self) -> dict[str, str]:
+        """Names the loops that failed and have not been started again.
+
+        Returns:
+            Loop name to the exception that ended its last run.
+        """
+        return dict(self.failed)
+
+    def join(self, deadline: float) -> None:
+        """Waits for every loop to return, all against one deadline.
+
+        Args:
+            deadline: Monotonic time after which the wait gives up.
+        """
+        for thread in self.threads:
+            thread.join(timeout=max(deadline - time.monotonic(), 0.0))
 
 
 def sweep(home: Path) -> int:
@@ -402,6 +501,7 @@ class Server(ThreadingHTTPServer):
         self.reading = threading.Lock()
         self.stopping = threading.Event()
         self.signalled = threading.Event()
+        self.background: Background | None = None
         self.counting = threading.Lock()
         self.deciding: dict[tuple[str, str], int] = {}
         self.recovering: dict[tuple[str, str], dict | None] = {}
@@ -552,7 +652,11 @@ class Server(ThreadingHTTPServer):
             The readiness document, naming the package version the service
             started with and whether the sources still match it. A stale
             service names the command that replaces it, so an operator reads
-            the drift from `status` and `doctor` instead of from a log.
+            the drift from `status` and `doctor` instead of from a log. A
+            service with a background loop that failed and has not been
+            started again reads `protocol.DEGRADED` and names each such loop
+            with the exception that ended it, because a service that answers
+            requests while nothing supervises its lanes is not ready.
         """
         document = {
             "status": "ready",
@@ -561,6 +665,12 @@ class Server(ThreadingHTTPServer):
         }
         if self.drifted():
             return {**document, "status": protocol.STALE, "detail": DRIFTED}
+        faults = self.background.faults() if self.background else {}
+        if faults:
+            detail = "; ".join(
+                f"{name}: {fault}" for name, fault in sorted(faults.items())
+            )
+            return {**document, "status": protocol.DEGRADED, "detail": detail}
         return document
 
     def server_bind(self) -> None:
@@ -1503,12 +1613,23 @@ def replace(home: Path, served: str) -> None:
     metadata for the log entry only. The source fingerprint, not the version,
     decided the restart, so a checkout edit restarts the service the same
     way, and the new process takes a fresh fingerprint at start, so one
-    change restarts it once. A re-execution the kernel refuses is logged and
-    the process exits, which is the state the hook's relaunch recovers from.
+    change restarts it once.
+
+    A re-execution the kernel refuses is tried `EXEC_ATTEMPTS` times,
+    `EXEC_RETRY_SECONDS` apart, because an upgrade that is still rewriting
+    the environment can leave the interpreter missing for a moment and one
+    refusal used to end the service for good. Each refusal is logged. After
+    the last one the process exits with status 1 rather than 0, so a service
+    manager told to restart on failure does, and the dead record it leaves
+    is the state the relaunch of a hook or of a lane's launcher recovers
+    from.
 
     Args:
         home: Private bridge state root the service was started with.
         served: Package version this process was serving.
+
+    Raises:
+        SystemExit: With status 1 once every attempt was refused.
     """
     from importlib import metadata
 
@@ -1522,19 +1643,36 @@ def replace(home: Path, served: str) -> None:
         f"version {served} re-executes as version {installed} on disk, "
         f"pid {os.getpid()}",
     )
-    try:
-        os.execv(
-            sys.executable,
-            [sys.executable, "-m", "agent_parley.server", "--home", str(home)],
-        )
-    except OSError as exc:
-        log(home, "relaunch", f"failed: {exc}")
+    for attempt in range(1, EXEC_ATTEMPTS + 1):
+        try:
+            os.execv(
+                sys.executable,
+                [
+                    sys.executable,
+                    "-m",
+                    "agent_parley.server",
+                    "--home",
+                    str(home),
+                ],
+            )
+            return
+        except OSError as exc:
+            log(
+                home,
+                "relaunch",
+                f"failed, attempt {attempt} of {EXEC_ATTEMPTS}: {exc}",
+            )
+        if attempt < EXEC_ATTEMPTS:
+            time.sleep(EXEC_RETRY_SECONDS)
+    raise SystemExit(1)
 
 
 def main() -> None:
     """Runs the detached coordination service using its private config.
 
-    The background workers are joined against one deadline rather than one
+    The background loops run under `Background`, which restarts one that
+    fails and lets a health reading name it meanwhile. They are joined
+    against one deadline rather than one
     deadline each, so the whole exit is bounded by `REVISION_SECONDS`. A
     service that stopped because its sources moved finishes the requests in
     flight, bounded by the longest a decision may take, and re-executes
@@ -1558,14 +1696,12 @@ def main() -> None:
     terminal.sweep_sockets(args.home)
 
     stopped = threading.Event()
-    workers = [
-        threading.Thread(target=run, args=(args.home, stopped), daemon=True)
-        for run in (supervision.run, inbound.run)
-    ]
-    for worker in workers:
-        worker.start()
+    background = Background(args.home, stopped)
+    background.start("supervision", supervision.run)
+    background.start("inbound", inbound.run)
     try:
         with Server(args.home, config) as server:
+            server.background = background
             stop_on_signal(args.home, server)
             server.serve_forever(poll_interval=0.2)
             server.flush_repeats()
@@ -1580,9 +1716,7 @@ def main() -> None:
             log(args.home, "stopped", "no longer accepting connections")
     finally:
         stopped.set()
-        deadline = time.monotonic() + REVISION_SECONDS
-        for worker in workers:
-            worker.join(timeout=max(deadline - time.monotonic(), 0.0))
+        background.join(time.monotonic() + REVISION_SECONDS)
     if server.relaunching():
         replace(args.home, server.version)
 

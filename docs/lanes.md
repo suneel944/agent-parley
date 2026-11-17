@@ -208,6 +208,48 @@ then, capped by the project's `deadlines.wait` ceiling. A blocked report is for
 a lane that cannot continue: it ends the lane's work on the claim and the next
 resume starts a fresh session.
 
+Waiting is not polling. A lane that makes 30 or more coordination reads
+(`status`, `issue next`, `mail`, the board, or an inbox read that found no
+message) in five minutes with no claim, reservation, commit, report or
+handoff is marked polling in `status` and `top` and receives one message
+naming the pattern. Inbox pages that carry mail, threads, attachments and
+searches never count, so a lane draining a backlog is not polling. If it
+makes as many reads again, the supervisor parks it the way it parks a lane
+on an exhausted quota: wakes, continuations and work offers wait, and a
+running turn is never stopped. The next progress or your next message to the
+lane ends the park. A lane that heeds the message and falls under 30 reads
+in the window stops being marked polling. A lane blocked in
+`wait_for_message` is never counted.
+
+## Asking for a review round
+
+A lane holding one claim can ask an idle peer to review its branch without
+handing the claim over. It sends mail to `@review` with the branch as the
+subject and the paths to read as the remaining recipients:
+
+```text
+send_message to=["@review", "agent_parley/retries.py"]
+  subject="feat/7-retry" body_md="Check the retry bound."
+```
+
+The coordinator offers the round to an idle lane, one holding no claim and
+no pending offer, and prefers a lane on a different provider than the
+builder. It falls back to any idle lane, and refuses when none is idle. The
+reviewer gets mail naming the round, such as `r3`, and answers once with
+`send_message to=["@review", "r3"]` and its findings in the body, one per
+bullet line. The findings are cut to 2000 bytes like a child report and
+mailed to the builder; the builder never reads the reviewer's transcript.
+
+The claim stays with the builder throughout. Each claim gets at most three
+rounds, one open at a time; a fourth request is refused with "open the pull
+request or ask the operator". The cap is not configurable. A round left
+unanswered for two hours expires: the builder may ask again, the reviewer
+counts as idle again, late findings are refused, and the expired round does
+not count toward the cap. Returned and expired rounds are dropped from
+`reviews.json` a week after they finish. `issue show` and `participant show`
+print each round with its reviewer, round number and finding count, or
+`open` or `expired`.
+
 ## Integrating one lane
 
 When a lane's work is ready, integrate it from the base checkout:
@@ -323,17 +365,22 @@ merge lock is then taken only to check the target has not moved and merge;
 a moved target is gated again, so an unverified result never lands. The merge
 is the `participant merge` step with the same locks and approvals, and every
 attempt records a decision in the lane's report log. It never pushes and
-never repairs an unverified integration. A lane holding several claims
+never repairs another lane's unverified integration; the lane that owns the
+record, for the issue it records, retries it as `participant merge` would,
+such as a verified merge whose completion could not be recorded. A lane
+holding several claims
 integrates its only ready one; when several are ready, name one with
 `--issue N`, which `participant merge NAME` accepts too.
 
 With `--auto` recorded, each supervision poll makes that same attempt for
 every listed issue whose claim is ready, on its own thread so a slow gate
 never holds the poll. A lane whose session is still running waits until the
-session ends, because every merge refuses a running session. The service
-attempts one claim once per issue, claim generation, ready commit and target
-commit, so an unchanged refusal is recorded once, not on every poll; after
-fixing what it names, run `unattended run NAME` or let a new commit move it.
+session ends, because every merge refuses a running session. A failure is
+attempted once per issue, claim generation, ready commit and target commit.
+A refusal is evaluated again on every poll, because its cause, such as the
+base off the target branch or a peer reservation, can clear on its own; an
+unchanged refusal is recorded and mailed once, and the claim integrates on
+the first poll after the cause clears.
 Each new decision is mailed to the lane, and a failed attempt raises an
 `unattended integration failed` row in `problems`. Without `--auto` the
 service never attempts it. The full policy is in

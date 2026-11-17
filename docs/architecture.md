@@ -13,7 +13,7 @@ when that policy records `auto`, and never on an agent's own authority.
 | --- | --- |
 | `entry` | Installed command's startup: answers a bare version flag, refuses native Windows with a pointer to WSL2, prints the start-here screen for a bare invocation, and hands every other invocation to `cli` unchanged |
 | `start` | The read-only start-here screen: Git checkout and cleanliness, registration from the recorded manifests, native CLIs on PATH with their plugin records, the recorded service's liveness, and the next commands for that state; for a registered project whose service runs, the count and two most urgent `problems` rows from the cached readings and whether outbound notification is off |
-| `cli` | Argument parsing and dispatch, plus the `Bridge` command object that joins the command groups below and keeps lane restore, pause, stop, restart, retirement, reclaim and pull requests |
+| `cli` | Argument parsing and dispatch, plus the `Bridge` command object that joins the command groups below and keeps lane restore, rewind, pause, stop, restart, retirement, reclaim and pull requests |
 | `core` | Base of the `Bridge` command object: the private state root and its configuration, the mail server's start, stop and readiness, the project manifest and the participant lanes it records |
 | `projects` | The registered projects listed most recently used first, resolution of a project name to its root for `run --project`, named workspaces grouping several project roots for `status --workspace` and `up --workspace`, and the detached resume of a workspace project's stopped lanes through the service wake's own launcher; a workspace only groups roots, so each project keeps its own manifest, claims, reservations and integration target |
 | `settings` | The per-project settings commands: verification and initialization commands, approval policy, branch naming, issue tracker, declared resources, lane budgets and the limits of the enforced run budget (`budget enforce`) |
@@ -24,8 +24,10 @@ when that policy records `auto`, and never on an agent's own authority.
 | `mail` | Operator mail: steering a lane, acknowledgements, the mailbox, and recorded decisions |
 | `reports` | Ready reports, their review, the event export, the state archive and ownership history |
 | `status` | The `status`, `problems` and `doctor` readings, lane liveness and the per-lane status rows |
+| `updates` | The once-a-day newer-release check `doctor` and `status` print on standard error: PyPI's `info.version` read in a daemon thread the caller waits on for at most 2 seconds in total, name resolution included, numeric release comparison, the upgrade command for the detected installer (uv tool, pipx or pip) and the `AGENT_PARLEY_NO_UPDATE_CHECK` opt-out; silent in a lane's own process (`AGENT_PARLEY_PARTICIPANT` set), so only the operator is told to upgrade; never called from a hook or the service poll |
 | `problems` | Every condition an operator should act on, derived from one status reading, each with a command to paste or the actor already handling it |
 | `launch` | Native launch of a lane: registration, the coordination protocol, the lane hooks and the supervised native client; with `run --issue`, the claim and the opening digest of that issue, its quoted text held to `ISSUE_BUDGET` (6000 bytes) from `forge.issue_details` |
+| `lanes_launch` | `run --lanes NAME,... --milestone TITLE`: registers each named lane as `run` does, claims one distinct open issue of the milestone per lane from its own `issue next` reading, and opens each lane's ordinary `run NAME --issue N` in its own detached tmux window of a session named after the project, or returns those commands for one terminal each when tmux is not on `PATH`; also the attach line `status` prints while that session runs |
 | `terminal` | The launcher-owned native pseudo-terminal, its private wake control socket, removal of wake sockets no launcher listens on, and the lane-first tab title |
 | `dialogs` | Recognition of the native dialogs held on that terminal, the answer the operator configured, capacity records and escalation, and the opt-in that carries approval of this bridge's own tools |
 | `worktrees` | Git in the base checkout, stashing its pending work before registration, lane initialization and the base verification gate |
@@ -36,23 +38,33 @@ when that policy records `auto`, and never on an agent's own authority.
 | `process` | Per-platform process identity, session liveness and shutdown, and the one-shot host load and available-memory reading `launch` refuses on and `supervision` defers a dispatch on |
 | `issues` | Claim and handoff state transitions, and resolution of the claim a lane holds |
 | `lifecycle` | Execution state an issue's owner still owes, stored in the issue ledger so an ownership transition and its claim generation publish together, and the dependency settlement completion triggers |
-| `recovery` | Capture and restore of an abandoned claim's work as recovery checkpoints, operator-authorized takeover, and the persisted capacity recovery candidates |
+| `recovery` | Capture and restore of an abandoned claim's work as recovery checkpoints, each lane's bounded checkpoint history, operator-authorized takeover, and the persisted capacity recovery candidates |
 | `lanes` | The one authoritative state record of each lane in the store (`starting`, `working`, `idle`, `blocked` with its cause, `stopped`, `dead`, `reclaimed`), its closed transition table, and the event every accepted or refused transition appends; the per-lane files are evidence it reads, never a second answer. Hooks (`checkpoints.record`) and the dialog watcher submit evidence to a per-project spool (`lane-evidence.jsonl`) instead of waiting on the store; each poll applies it in arrival order before its liveness sample, and keeps it for the next poll when the store is busy. Evidence observed before the lane entered its recorded state, such as a tool hook still spooled when the launcher recorded `stopped`, moves nothing and is recorded as a `superseded` event; queued evidence never moves a `reclaimed` lane, which only a launch leaves. A session change is a transition that records both session ids. Each poll also charges the time since the last one to idle lane-minutes and unaccountable claim-minutes by state and cause, which `status` reports. The `accounting` events those charges append and every other lane event are each kept to the latest `MAX_EVENTS` (2000) per project, so per-poll accounting never evicts the transition history. A host restart moves every recorded session's row to `stopped` with the restart named as its evidence, which `rebooted` reads to refuse a resume until a new session clears it. The wake budget (attempts, backlog, next attempt, exhaustion, escalation) lives in the same store, seeded once from a lane's published `-wake.json` on upgrade. A lane's own task plan is a capped `-plan.json` file, not a store row: the hook writes it from a Claude `TodoWrite` call and the `plan update` command from any other client, and only operator views read it (`lane_task_plan`, `plan_source`) |
 | `supervision` | The service's periodic poll: presence sampling, handoff reminders, bounded wakes and their backoff, capacity and work fitness, orphan marking, expired-lease reclaim, recorded operator deliveries, returning the claims and reservations of lanes proved dead past `orphan_retire_after`, the reclaim sweep, a project whose root checkout is gone, the open-issue catalog `status` reads, cached in `FORGE_ISSUES` (`forge-issues.json`) and refreshed once it is `FORGE_TTL` (300 s) old, a failed read retried no sooner than `FORGE_RETRY` (60 s) later while the last good reading is kept, and pull-request wakes: the forge is read at most once per `PULL_REQUEST_SECONDS` (60 s), each open pull request's last reading is kept in `PULL_REQUEST_RECORD` (`pull-requests.json`), and a change in its checks, reviews or merge state is mailed to the owning lane, as is, once, a head pending past `checks_ceiling`; a claimed issue still open on the forge that a pull request merged into the manifest's `integration_base` closes inside the claim's generation ends the claim like any merged pull request; symbol notices: a merged pull request's changed definitions (Python through `ast`, other extensions through one `TOP_LEVEL_DEFINITIONS` pattern, capped at `SYMBOL_FILES` and `SYMBOL_NAMES`) are matched against each other live lane's diff, and a hit is mailed once per pull request, symbol and lane as advisory |
 | `convergence` | Issue-level convergence accounting per claim generation, kept apart from wake and liveness accounting: verification outcomes and hashed failure signatures from report logs, the last verified milestone, and the bounded change-approach and operator-escalation responses the poll sends. Accounts are published per project in `convergence.json`; the thresholds are the supervision settings `convergence_repeats` (3 repeats of one failure by default) and `convergence_after` (14400 working seconds since the last milestone by default), and both responses are keyed mail, the escalation also notifying through `non_convergence` |
+| `collisions` | Flags pairs of live lanes converging on one branch name, one new file named in both task plans, or one reserved path set, which needs `MIN_SHARED_PATHS` (3) shared keys that are also at least half the smaller set. The flag is a reading that `status`, `top` and the web view show and that refuses nothing; the poll mails each lane of a new pair once under a keyed message and keeps the pairs it told in `collisions.json` |
+| `flaky` | Suspected-flaky tests from recorded occurrences: pytest node ids failing or passing on one Git tree, read from clean report evidence in each lane's report log and from the failed-step logs and green checks of a lane's pull request the poll already reads. A test that failed and passed on the same tree, or failed in two lanes whose diffs change neither it nor a module it imports, is suspected; each lane that is not retired is told once per suspicion under a keyed message, one `test:` follow-up is suggested through `followups.suggest`, and a later failure on a tree whose diff changes the test or its imports clears it. A label with evidence: no test is skipped or disabled |
 | `roster` | Providers, credential profiles and project participants |
 | `retirement` | The withdrawal of one lane at its own request: the work it returns, the worktree it leaves only when Git reports it clean, and the durable retirement mark the supervisor and the operator views read |
 | `reclaim` | The assessment of which lane worktrees and branches, and which worktrees lanes made themselves, a project may remove, each with the one condition that decided it, and Git's refusing removal of the lane-made worktrees: one holding ignored files is always kept, and a quiet one whose unpushed commits already landed through another branch is bundled into a recovery checkpoint and removed without force. Also the move of a lane-made worktree outside its lane into the lane's `<lane>-wt` directory with `git worktree move`, the re-resolution by branch of a recorded worktree path that no longer exists, so a moved worktree is never read as gone, and the pruning of files retired lanes no longer need and of wake logs past their retention |
 | `pool` | The spare worktrees a project keeps prepared from its base with `init` already run: their record and lock in the project state directory, the fill that prepares them, the hand-out to a new lane, and the condition that marks one stale for the fill or `gc` to remove |
 | `policy` | Attribution rules shared by the lane hook, integration and the repository gate |
 | `forge` | Optional best-effort issue lookups and mirrors on the selected forge: `github` through `gh`, `beads` through `bd`, or `null`, the ready-report comment posted there, and one bounded reading of the check, review and merge state of up to `MAX_PULL_REQUESTS` (30) open pull requests on GitHub, and of the issues the newest `MAX_LANDINGS` (100) pull requests merged into the recorded integration base close by keyword |
-| `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries |
+| `forecast` | Bounded co-change history of the base checkout, cached per base commit, and the advisory collision forecast a reservation or claim carries; the merge forecast that tests overlapping lane pairs with `git merge-tree --write-tree` and the landing order `merge plan` recommends, both reading Git objects only |
+| `critical` | Pure dependency graph of the open issues of a milestone from `Blocked by` and `Depends on` lines, forge relationships and the ledger: the issues each one transitively unblocks, the longest chain it starts, the critical path and the cycles whose edges are ignored |
 | `recommend` | Ranking of the unclaimed, unblocked issues a lane could take next, from the ledger, the recorded plan, the reservations peers hold and the collision forecast, with the reason for each place; it claims nothing |
 | `followups` | Follow-up work a lane suggests by mail to `@followup`: the bounded, expiring record in `followups.json`, its duplicate matching against live claims and the cached open forge issues, the pending reading `status` and the web view can render, and the operator's acceptance that files the forge issue in the active milestone and offers it to an idle lane; a lane's call files nothing |
+| `reviews` | Review rounds a builder requests by mail to `@review`: the record in `reviews.json`, the idle-lane ranking that prefers a provider other than the builder's, the three-round cap per claim, and the capped findings mailed back to the builder; nothing writes the issue ledger, so the claim never moves |
+| `rules` | The optional project policy file `policy.toml` in the private state directory: strict TOML parsing that refuses an unknown key, missing key or malformed file with its line, the `review`, `reviewer` and `test` rule kinds, the evidence they are judged on (the lane's diff since its fork from the base checkout's HEAD, its commit subjects, and returned review rounds), the gate `report` runs before a ready report and `issue resolve` before completing a claim, and the read-only `policy check`. A rule only refuses a coordination step; it never grants a permission, approves a native prompt or adds a bypass flag |
+| `trials` | Side-by-side trials of one issue across provider lanes: the running trial on the issue's ledger record, the one recorded exception to one owner per issue, its per-lane ready figures (diff since the recorded base, tests stated in the evidence, client-reported tokens, wall time), the comparison `trial show` prints, `trial keep` turning one lane into the ordinary owner and releasing the rest without touching a branch, and the ended-trial record `metrics trials` aggregates per provider |
+| `verification` | One outcome per returned review round and relayed child report, clean or a finding count, with the issue's cached forge labels and the verifying lane's provider and model, in `verification.jsonl`; the find rate per label and per provider and model that `metrics verification` prints and `issue next` cites; it reads no transcript and skips or adds no verification |
 | `checkpoints` | Lifecycle observations and bounded context delivery |
+| `symbols` | The Python definitions an `Edit`, `MultiEdit` or `Write` changes, read with the standard library `ast` before and after the call, so the lane hook compares `path::Name` reservations by symbol; text that does not parse names nothing and the hook falls back to the path. Reservations stay advisory |
+| `observed` | The Git worktrees a lane's native client works in beside the lane, recorded from hook events on the lane's roster entry and reserved for it; never created, moved or pruned, and flagged outside `<lane>/.claude/worktrees/` |
 | `delivery` | Launcher-owned polling that delivers coordination to a lane whose CLI raises no event able to carry it |
 | `hook` | The hook process: one loopback request to the running service for a decision, and the in-process `checkpoints` path when the service cannot answer |
 | `gemini` | Lane-private Gemini CLI system settings overlay and translation of its native hook events and results |
+| `criteria` | Acceptance criteria of a claimed issue: the list items of its `Boundaries and acceptance criteria` or `Expected and actual behavior` template section, read once at claim and kept as `criteria` on the issue record; the numbered dispatch lines; the match of `N: <evidence>` lines from a ready report or `issue resolve` against them, kept as `criteria_evidence` on the claim's execution; and the forge-outcome line recorded when a resolve has no lane evidence |
 | `copilot` | Translation of Copilot CLI's MCP tool names and flat hook result schema, and the lane hooks and MCP server merged into and removed from a Copilot profile |
 | `opencode` | Lane-private OpenCode configuration directory, the plugin that runs the hook command for each native plugin event, and translation of those events and results |
 | `amp` | Lane-private Amp settings file carrying the MCP server and one `amp.hooks` entry per tool event, and translation of those hook inputs and results |
@@ -63,13 +75,16 @@ when that policy records `auto`, and never on an agent's own authority.
 | `demo_scenario` | The coordination story, one function per chapter: the full recording (`record`) and the command's short cut (`tour`) of the same steps and captions |
 | `tables` | Column names, width rule, cell formats and markers shared by `status` and `top` |
 | `views` | Machine-readable rendering of read-only command results, as one JSON document or as Prometheus exposition text, and the one-line JSON `error` document a `--json` command prints on a runtime failure |
-| `metrics` | Durable report records, the peer verdicts recorded beside them, and idle intervals and waiting times derived from retained records; also the `metrics throughput` reading: merged issues, lane-hours, native input and output tokens, operator touches and waits per lane since an instant |
+| `metrics` | Durable report records, the peer verdicts recorded beside them, and idle intervals and waiting times derived from retained records; also the `metrics throughput` reading: merged issues, lane-hours, native input and output tokens, operator touches and waits per lane since an instant; the `metrics cost` reading prices those tokens with the operator's per-model rates and joins them with merged issues, merged pull requests and review findings |
+| `stagnation` | The stagnation signal: mail each lane sent against its progress events (commits past the base, reservations, reports, handoffs) over the last `WINDOW` and the one before, flagged at the fixed `THRESHOLD` while progress does not rise; read by `status`, `top` and `metrics throughput`, never sent to lanes |
 | `evidence` | Review evidence built from a claim window's retained coordination records |
 | `budgets` | A lane's consumption against its advisory budget, from recorded tokens, served calls and session hours; crossing a limit marks and notifies, never stops. Also the opt-in run budget: a durable per-project ledger, `run-budget.json`, of the same readings summed across lanes, restarts and retries. `supervision` admits every wake, work dispatch and capacity retry through it, `launch` refuses to launch or resume a lane while it is exhausted, and a `Stop` hook continuation (`checkpoints.continuation_refused`) is admitted through it like any other dispatch; exhaustion is recorded once and cleared only by the operator's `budget resume` |
 | `quota` | Per-credential quota parking for lanes that share one explicit credential profile on one adapter. A vendor rate-limit refusal that named a reset on any of them parks every lane on that credential until the reset; an optional window the operator records with `quota set` sums the lanes' native token counts and, past its threshold, parks every lane but the one holding the most unfinished claims, and all of them at the limit. Each poll rewrites `quota-ledger.json`; `supervision` defers wakes and fails the capacity fit check of a parked lane, and `checkpoints.continuation_refused` refuses its `Stop` hook continuation. Parking never moves a lane to another provider or credential and never touches its claims or reservations, and a park whose time passed reads as cleared. `headroom` derives remaining headroom per credential from the ledger, marked estimated when it comes from native counts rather than a vendor refusal |
+| `polling` | Flags a lane whose coordination reads, counted in the store's `events` table, reach `THRESHOLD` in `WINDOW` seconds with no claim, reservation, commit, report or handoff; marks it polling through `supervision.stall_marker`, sends it one notice, and if it goes on parks it through `quota.account`'s `parked` map until progress or an operator message. `wait_for_message` never counts |
 | `approvals` | Operator decisions bound to one report, commit, target and policy |
 | `timeouts` | The table of decision kinds with their reversibility and recommended default, every one of which waits for the operator, the decision deadline other modules measure against, and the project policy that can only make a kind more cautious |
 | `history` | Read-only ownership history across the ledger, reports and store |
+| `audit` | `audit export` and `audit verify`: one JSON bundle of a time window's lanes with provider and model, resolved issues, claims and handoffs (through `history`), ready reports with evidence (through `metrics`), review rounds (through `reviews`), pull requests from `pull-requests.json` and each lane's commits beyond the base, every record scrubbed of credential, token and transcript fields and chained by SHA-256 over canonical JSON; optional signing with the operator's SSH key through `ssh-keygen -Y sign`, checked with `ssh-keygen -Y check-novalidate`. It reads state only and writes the one file the operator names |
 | `watch` | Read-only stream of one lane's coordination events, tailed from the ledger, reports, store and hook event log |
 | `retries` | Idempotency key contracts shared by the store and the issue ledger |
 | `waits` | Bounded waits for a lane's next mail, served beside the store and woken by a delivery rather than by polling from a turn, and the `lane_waits` store record of a long wait a lane handed to the service, which the supervisor's ordinary wake path marks woken and the lane's next served call ends |
@@ -125,7 +140,8 @@ no webhook, and it carries two things. The `status` verb takes the filters
 answer to an open decision, given by a button tap, by `decide ID OPTION
 [NOTE]` or by a reply to a one-decision message, is written onto that
 decision's record and reaches the waiting lane as supervisor mail, which wakes
-it. An answer to a native dialog is not mailed: the launcher presses the
+it. `agent-parley decision answer` calls the same `inbound.decide` from the
+command line, so an operator without a chat answers through that one path. An answer to a native dialog is not mailed: the launcher presses the
 chosen option only while it still draws that same dialog. An irreversible
 option, or one that widens a permission, takes a confirming tap. No claim or
 handoff is made through it, a note reaches a lane only quoted, and no chat
@@ -313,6 +329,10 @@ without putting it in an inbox. An attachment a decision or a feed message
 spills is readable by every registered participant of the project and the
 operator, the same readers the log and the feed already have; any other
 attachment stays readable by its writer and its addressees alone.
+`participant rewind` marks the lane's decisions after a checkpoint superseded
+in two further message columns, a time and a reason, and never deletes them;
+`search_decisions` returns both, and the upgrade that adds them leaves every
+stored decision unmarked.
 
 The addressable roster omits the operator and revoked credentials before
 applying its 32-participant limit. Sending to either is refused with an
@@ -1039,31 +1059,40 @@ Files at the state root, grouped by the module that owns them:
 | `quota` | `quotas.json` (the quota window recorded per credential profile) under `quotas.lock` |
 | `supervision`, `terminal` | `supervision.json` (global supervision settings, including the wake opt-out) |
 | `terminal` | `wake-<digest>.sock`, one control socket per project lane |
+| `updates` | `update-check.json` (when the package index was last asked and its answer, empty after a failure) |
 
 Files in `projects/<key>/`, grouped the same way:
 
 | Module | Files |
 | --- | --- |
-| `core` | `project.json` (participant manifest); `setup.lock` |
+| `core` | `project.json` (participant manifest, with `links` naming each linked sibling repository and each participant's `linked` worktrees, branch and base by link name; a record without them reads as the primary repository only); `setup.lock` |
+| `claims` | `<lane>.links/<NAME>/`, the lane's worktree of linked repository `NAME`, registered with that repository's Git and removed by `link remove` or `participant retire` |
 | `issues` | `issues.json` under `issues.lock`; `supervision-error.json` |
 | `plan` | `plan.json` under `plan.lock` |
 | `decisions` | `decisions.json` under `decisions.lock` |
 | `followups` | `followups.json` under `followups.lock` |
+| `reviews` | `reviews.json` under `reviews.lock` |
+| `rules` | `policy.toml`, written by `policy import` and only read otherwise |
+| `trials` | the running trial on its issue's `issues.json` record; ended trials in `trials.json`, both under `issues.lock` |
+| `verification` | `verification.jsonl`, a line log bounded by `state.trim_log`, under `verification.lock` |
 | `recaps` | `<lane>-recap.json`, a record of at most `recaps.MAX_RECAP_BYTES` (2048) bytes when encoded as compact JSON |
 | `budgets` | `run-budget.json` under `run-budget.lock` |
 | `quota` | `quota-ledger.json` under `quota.lock` |
+| `polling` | `polling.json` under `polling.lock` |
 | `convergence` | `convergence.json` under `convergence.lock` |
+| `collisions` | `collisions.json`, written only by the supervision poll |
+| `flaky` | `flaky.json` under `flaky.lock`, written only by the supervision poll |
 | `claims` | `forge-assigned.json` under `forge-assigned.json.lock` |
 | `status` | `forge-issues.json` (forge issue cache) |
 | `blueprints` | `blueprint-runs.json` under `blueprint-runs.json.lock`; `blueprint-<issue>.lock` per running blueprint |
 | `merges`, `integration`, `unattended` | `integration.json`; `merge.lock` |
-| `forecast` | `cochanges.json` (co-change cache) |
+| `forecast` | `cochanges.json` (co-change cache), `merge-forecast.json` (merge forecast) |
 | `lanes` | `lane-evidence.jsonl`, drained through `lane-evidence.draining.jsonl`, under `lane-evidence.lock` |
 | `evidence` | `review-<head>.json`, naming its `review-<head>-events.jsonl` export by file and SHA-256, both written atomically with mode `0600`; each push keeps only the newest `REVIEW_RETAINED` (20) pairs |
 | `pool` | `spares.json` under `pool.lock`; `pool.log` |
 | `supervision` | `boot.json`, `capacity-candidates.json` under `capacity-candidates.lock`, `git-readings.json`, `key-holds.json` under `key-holds.lock`, `pull-requests.json`, `reclaim.json`, `root-missing.json`, `root-returned.json`, `supervision-poll.json` |
 | `attachments` | `attachments/`, with the allowance index `attachments/held.json` under `attachments.lock` |
-| `recovery` | `recovery/` (mode `0700`): capture records `<id>.json`, Git bundles `<id>.bundle`, their `-approval.json` and `-quiesce.json` records, and `issue-<n>-refusal.json` |
+| `recovery` | `recovery/` (mode `0700`): capture records `<id>.json`, Git bundles `<id>.bundle`, their `-approval.json` and `-quiesce.json` records, and `issue-<n>-refusal.json`; `<lane>-checkpoints.json`, the lane's checkpoint history read by `participant rewind` |
 
 Per-lane files sit in the same project directory, prefixed with the lane
 name:
@@ -1156,6 +1185,14 @@ after `TTL` (seven days). Only `followup accept`, or the decision's Telegram
 button with its confirming tap, files the issue through `forge.file_issue` and
 offers it through the operator `assign` transition of the issue ledger. A
 forge refusal leaves the suggestion pending and the decision open.
+
+Mail to `@review` records a review round in `reviews.json` and then sends
+ordinary mail through the same `store.call`: the offer to the reviewer, or
+the reviewer's findings, cut to `children.REPORT_BYTES`, back to the builder.
+The round is keyed by the builder's claim identifier and never touches the
+issue ledger, so a review is a recorded exchange, not a handoff. A claim gets
+at most `reviews.MAX_ROUNDS` (3) rounds and one open at a time; the cap is a
+constant, not a setting. An offer whose mail fails withdraws its round.
 
 No time-to-live applies to issue ownership, which changes hands through
 release, an explicit offer and acceptance, an orphan takeover, or the

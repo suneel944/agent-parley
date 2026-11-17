@@ -376,6 +376,16 @@ also shows a `last turn:` line from its stored turn recap: its last message,
 the failed commands and the changed files, each capped in bytes. `status
 --json` and the live view carry the recap as `recap`, and a lane without one
 shows nothing.
+Two live lanes that share a branch name, a new file named in both task plans,
+or at least three reserved paths that are also half of the smaller lane's set
+are converging on duplicate work. Both lanes read `needs input: converging
+with PEER on ITEM`, `status` prints one `Converging:` line per pair naming both
+lanes and the shared item, and the supervision poll mails each lane once while
+the overlap is unchanged. A plan names a new file only as a path with a
+directory and a letters-only extension that the base checkout lacks. A child
+lane is never paired with its parent, and a stopped, dead, reclaimed or
+retired lane is not compared. The flag clears when the overlap does; nothing
+is refused, renamed or released.
 `--columns all` adds PROVIDER, EVENT, REVIEW, CONTEXT, LOCATION, CALLS, UNUSED,
 FIT and PLAN. The web view shows every column. PLAN is the lane's own task
 list: steps done of all and the step in progress, `-` before the lane records
@@ -470,6 +480,73 @@ minutes between polls, a stopped service, is charged to nothing. `status
 --json` carries both per lane and per project under `accounting`, and each
 time a lane's total crosses a whole minute an `accounting` event is added to
 its lane history.
+
+## Converging lanes
+
+Two live lanes can drift onto the same work without either holding a
+conflicting reservation. Each supervision poll flags a pair that uses one
+branch name, names one new file in both task plans, or reserves path sets
+that share at least three keys (`collisions.MIN_SHARED_PATHS`) which are also
+at least half of the smaller set. `status`, `top` and the web view print one
+line per pair:
+
+```text
+Converging: lane-1 and lane-2 share branch feat/login; one of them should rename or re-plan. Nothing was refused.
+```
+
+The flag is a reading and refuses nothing. The poll mails each lane of a new
+pair once, under a keyed message, and keeps the pairs it told in
+`collisions.json`, so a pair that stays converged is not mailed again.
+`status --json` carries each lane's peers under `converging`.
+
+## Polling without progress
+
+A lane that calls `status`, `issue next`, `mail`, `next_issues` or
+`fetch_inbox` in a loop looks busy while it moves no work. Each supervision
+poll counts a lane's coordination reads from the store's `events` table over
+the last 300 seconds (`polling.WINDOW`). A lane at 30 reads or more
+(`polling.THRESHOLD`) with no claim, report, reservation, message, handoff or
+commit in that window is marked polling in `status` and `top`, and receives
+one message naming the pattern. If it makes 30 more reads in the window after
+that message, it is parked like a usage-limit park: wakes, Stop-hook
+continuations and work offers wait, and a running turn is never stopped.
+
+The flag and the park end at the lane's first progress, or at the first
+message the operator sends the lane after the notice. A flag that never became
+a park also ends once the lane's reads fall under the threshold. A lane
+blocked in `wait_for_message` is waiting, not polling, so that call never
+counts.
+
+## Stagnation: more mail than progress
+
+Lanes that talk instead of working keep sending mail while their commits stop.
+`status` and `top` compare each project's last hour with the hour before it.
+Mail is the messages each lane sent. Progress is the commits its branch adds
+past the project base, timed by author time so a rebase or amend does not
+read as new work; the reservations and reservation requests it made; the
+reports it filed; and the handoffs it offered, accepted or assigned. A
+declined, cancelled, refused or unassigned handoff is not progress. Only
+recorded events are counted; no message or commit text is read. A project with
+no progress counts as one event, so the ratio is never infinite. Each source
+is read once for both hours, and `top` reuses a reading for 60 seconds
+(`dashboard.STAGNATION_TTL`) rather than on every refresh.
+
+When mail per progress event reaches 10 and progress did not rise over the
+earlier hour, `status` prints one line at the top of the project and `top`
+prints it under its first summary line:
+
+```text
+Stagnation: last 60 min, 12 mail per 0 progress events (ratio 12, threshold 10; previous 60 min 0 events); most mail per progress: lane-1 2/0, lane-2 2/0, lane-3 2/0. Nothing was sent to lanes.
+```
+
+The line names at most the three lanes with the highest ratio, as mail/progress.
+The window and the threshold are fixed in code with their rationale
+(`stagnation.WINDOW`, `stagnation.THRESHOLD`), so every project is read the
+same way. The signal is for the operator only: nothing is sent to any lane. A
+retired lane is not counted. `status --json` carries the reading per project
+under `stagnation`. `metrics throughput` reports `mail_sent`, `progress` and
+`mail_ratio` per lane and in the project totals, over its own `--since`
+window, and its table ends each project with a `Lane mail:` line.
 
 ## `problems`
 
@@ -664,6 +741,24 @@ window, or the last 7 days when no window is given:
 | `agent_parley_lane_ci_rounds_median` | gauge | Median CI rounds over merged pull requests with a known count |
 | `agent_parley_lane_claim_to_merge_seconds_median` | gauge | Median seconds from the claim to the merge of its pull request |
 | `agent_parley_project_pull_requests_excluded` | gauge | Pull requests in the window that no lane owns, left out of every lane figure |
+| `agent_parley_lane_merge_fraction_ratio` | gauge | Share of pull requests opened in the window that merged, by a claim resolution or by the forge's answer when it left the open list |
+| `agent_parley_lane_pull_requests_abandoned_window` | gauge | Pull requests that left the open list in the window and that the forge reported `CLOSED` |
+| `agent_parley_lane_pull_requests_end_unknown_window` | gauge | Pull requests that left the open list in the window with no recorded merge and no forge answer, never counted as abandoned |
+| `agent_parley_lane_shared_file_degree_ratio` | gauge | Share of the files in the lane's diff that another lane's diff also touches |
+
+The four merge health families are also exported as
+`agent_parley_provider_*`, labelled by project and provider, and
+`agent_parley_project_*`, labelled by project, summed over the reported lanes:
+the fraction is merged over opened summed across them, and the shared-file
+degree is the share of every file those lanes touch that more than one lane of
+the project touches. With no `--provider` filter, the project sums also count
+the outcomes of lanes no longer in the project, so a removed lane's pull
+requests stay in the project's fraction. When supervision re-reads a pull
+request that left the open list, it stores the forge's answer on the archived reading as `ended`. A
+failed read keeps the pull request in the open list, and an archived reading
+with no answer, such as one archived before `ended` was stored, counts as
+unknown rather than abandoned. The file footprint is the diff `top` already reads, so it describes
+the lanes now rather than the window.
 
 Nothing here reads the forge. Supervision's pull request poll already keeps
 each open pull request in `pull-requests.json` with the lane it belongs to and
@@ -683,6 +778,83 @@ that leaves the window lowers them; read them as levels rather than through
 one `Pull requests` summary to its issues line and `status` one line per
 project over the last 7 days, each only when the window holds any, and `top --json` carries each lane's figures
 under `pull_requests`.
+
+### Verification find rate
+
+```bash
+agent-parley metrics verification
+agent-parley metrics verification --since 7d --json
+```
+
+Every review round whose findings come back and every child result relayed
+to its parent records one outcome in the project's `verification.jsonl`:
+clean, or findings with a count. The count is the one already taken from the
+capped report text, one finding per bulleted or numbered line; for a child it
+covers the report's summary only, because its remaining work lists what the
+child left undone rather than what it found. No transcript is read. Each
+outcome carries the issue's labels, copied from the cached forge reading when
+it is recorded, and the provider and model of the lane that verified: the
+reviewer of a round, or the child.
+
+`metrics verification` reads every project's outcomes over the window, 30 days
+by default, and prints two tables: one row per issue label, with `unlabelled`
+for issues that had none, and one row per `provider/model`, with `default` for
+a lane on its provider's default model. Each row counts the outcomes, those
+that found anything, and their findings. The find rate, the share of outcomes
+that found anything, is printed only for a group with at least five outcomes;
+smaller groups show `-`, and `--json` carries `null`. An empty store prints two
+lines: the header with a count of 0, then `No review round or child report
+recorded.`
+
+`issue next` adds one reason to a candidate whose labels reach five outcomes
+in its project over the last 30 days, such as `verification find rate bug 40%
+of 10`, so a lane can judge whether a review round is worth asking for. The
+reason moves no candidate, and the coordinator never skips or adds a review
+or a child report because of it.
+
+## Suspected flaky tests
+
+The supervision poll keeps the test failures and passes lanes record, and
+names a test suspected flaky only from those recorded occurrences. Two
+sources feed it:
+
+- report evidence (`agent-parley report --evidence ...`) recorded `clean`:
+  the worktree had no tracked change and no untracked file outside the
+  ignore rules, so the run tested exactly the reported commit; read from
+  the lane's report log;
+- a lane's pull request on the forge: the failed-step logs the poll already
+  quotes to the lane when checks fail, and checks that finish green, both
+  for the head commit the same reading names. Review bodies and inline
+  comments quoted beside the logs are never read.
+
+Test identifiers are pytest node ids (`tests/test_core.py::test_value`) read
+from `FAILED <id>`, `<id> FAILED`, the same forms with `ERROR`, and
+`PASSED <id>` or `<id> PASSED`. Report evidence passes only the tests it
+names as passed, since a report cannot show whether it ran the whole suite;
+a green forge run passes every test already tracked on that commit's tree.
+
+A test is suspected flaky when it:
+
+- failed and passed on the same Git tree, or
+- failed in two lanes forked from the same base commit whose diffs, each
+  against that fork from the base checkout's head, change neither the test
+  file nor a module it imports.
+
+A failure in a lane whose diff changes the test or one of its imports never
+counts towards two lanes, so a regression the change caused is not marked.
+Requiring one fork point means the two lanes ran the same base code: a
+regression merged into the base between their forks gives them different
+fork points and is not counted. A test the shared base itself breaks is
+still marked, which only labels it.
+Each lane that is not retired gets one update per suspicion, naming the test
+and up to six occurrences, and one `test:` issue is suggested to the
+operator, who sees it in `agent-parley followup list` and accepts it with
+`agent-parley followup accept`. The lanes file nothing, and no test is
+skipped or disabled: the flag is a label with evidence. More occurrences of
+a suspected test send nothing more. A later failure on a tree whose diff
+changes the test or its imports clears the suspicion; the test is suspected
+again only on new evidence, and then each lane is told again. The record is
+`flaky.json` in the project's state directory.
 
 ## Usage per issue
 
@@ -720,6 +892,11 @@ token count gains an `estimated_spend` and the totals gain a sum. The text
 output labels the total as an estimate from recorded prices, not a bill. A lane
 cannot set or change a price: the command refuses a lane worktree and any
 process holding a lane's `AGENT_PARLEY_TOKEN`.
+
+Per-model rates for input, output and cache-read tokens are set with
+`provider price NAME --model MODEL --input A --output B --cache-read C` and
+feed `metrics cost` ([Operations](operations.md#estimated-cost-per-shipped-unit)).
+Removing the blended price leaves those rows in place.
 
 ## `watch`
 

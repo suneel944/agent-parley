@@ -19,7 +19,7 @@ import tty
 from pathlib import Path
 from typing import NamedTuple
 
-from agent_parley import dialogs
+from agent_parley import dialogs, hook
 from agent_parley.state import BridgeError, lock
 
 PROMPT = "Review pending coordination messages and handoff reminders."
@@ -1012,6 +1012,13 @@ def _session(
     resolves, and the dismissed dialog is never judged again as the screen
     that replaces it.
 
+    The loop also asks for the coordination service through `hook.relaunch`
+    every `hook.RELAUNCH_INTERVAL` seconds. A native hook only asks when its
+    client makes a tool call, so a service that died while every lane sat
+    idle stayed down until an operator noticed, and an idle lane is the one
+    that needs the service to wake it. `hook.relaunch` starts nothing while
+    the recorded service is alive or after an operator stopped it.
+
     Args:
         pid: Native client process.
         master: Pseudo-terminal master descriptor, closed on return.
@@ -1057,6 +1064,7 @@ def _session(
     wake_retried = False
     submit_at = 0.0
     output_at = 0.0
+    relaunch_at = 0.0
     status = None
     watch = dialogs.watcher(lane.parent, name)
 
@@ -1077,6 +1085,9 @@ def _session(
         if titling:
             _relay(TITLE_SAVE, False)
         while not stopping:
+            if home and time.monotonic() >= relaunch_at:
+                relaunch_at = time.monotonic() + hook.RELAUNCH_INTERVAL
+                hook.relaunch(str(home))
             if titling:
                 observed = (
                     _changed_at(activity),
