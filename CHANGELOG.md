@@ -1,5 +1,104 @@
 # Changelog
 
+## [0.23.0](https://github.com/suneel944/agent-parley/compare/v0.22.0...v0.23.0) (2026-11-17)
+
+
+### Signals and metrics
+
+- Status flags two lanes converging on one branch name or path set (#1380).
+- A lane that polls the coordinator without progress is flagged and parked (#1382).
+- A stagnation signal fires when lanes message more than they commit (#1383).
+- Repeated reservation contention escalates once, with both claims (#1384).
+- A test that lanes see flip on unchanged code is flagged as flaky (#1392).
+- Metrics show where review and verification rounds find anything (#1379).
+- Metrics report merge fraction, abandoned pull requests and shared-file degree (#1381).
+- Metrics estimate cost per issue, merged pull request and review finding (#1391).
+
+### Planning and landing
+
+- Merge conflicts between lanes are forecast, with a recommended landing order (#1388).
+- `issue next` ranks issues by what they unblock (#1393).
+- Python symbols can be reserved as well as whole paths (#1387).
+- One issue can run as a side-by-side trial across provider lanes (#1390).
+- Dispatch carries acceptance criteria, and resolve requires evidence per criterion (#1386).
+- Builder-reviewer review rounds are recorded and return findings to the same builder (#1378).
+
+### Lanes and worktrees
+
+- Several lanes for a milestone start from one command (#1414).
+- A child lane can run on a different model and effort than its parent (#1377).
+- Worktrees the `claude` CLI creates are registered as children of the lane (#1385).
+- One lane can hold worktrees in linked repositories, with symbol reservations across them (#1394).
+- A lane can rewind to a recorded checkpoint on a new branch (#1395).
+
+### Policy and operator tools
+
+- A project policy file gates coordination steps (#1389).
+- Policy commands show the current setting when no action is given (#1416).
+- One command applies the safe remedies that `problems` lists (#1417).
+- The launcher warns when it is older than the latest release (#1415).
+- An audit bundle can be exported hash-chained and signable (#1396).
+- The operator can answer an open decision from the command line (#1459).
+
+### Fixes
+
+- Idle and recoverable lanes are offered work they can claim (#1399).
+- A lane parked on a usage limit or an open denial resumes once the cause clears (#1400).
+- Wake attempts, launcher exits and resumed transcripts are counted correctly (#1401).
+- Pull requests with no checks, a stale base, a conversation comment or a close reach their lane (#1402).
+- Unattended refusals expire, and the integration owner is no longer refused by its own record (#1403).
+- Operator decisions are applied instead of mailed, are not abandoned after eight attempts and are not re-raised once answered (#1404).
+- Orphaned claims, supervision failures, forge timeouts and blocked blueprints notify the operator (#1405).
+- A dead service or supervision thread is restarted, and health no longer reports ready while it is down (#1406).
+- A released claim's recovery checkpoint is kept until the next claimant can restore it (#1407).
+- Child lanes have a deadline, retire on delivery and run with a dialog watcher (#1408).
+- Hook notices name the full CLI command, and every provider gets a shell allow rule (#1409).
+- The dialog watcher no longer escalates answered repeats, keeps parked state across hook events and sees animated prompts (#1410).
+- Follow-ups no longer duplicate across lanes, wait when the forge is down and report expiry (#1411).
+- The operations, monitoring and coordination guides describe notification retries and the webhook transport as the code does, list `blueprint blocked` problems, and cover converging lanes, polling lanes and symbol reservations (#1465).
+
+Closes #1377
+Closes #1378
+Closes #1379
+Closes #1380
+Closes #1381
+Closes #1382
+Closes #1383
+Closes #1384
+Closes #1385
+Closes #1386
+Closes #1387
+Closes #1388
+Closes #1389
+Closes #1390
+Closes #1391
+Closes #1392
+Closes #1393
+Closes #1394
+Closes #1395
+Closes #1396
+Closes #1399
+Closes #1400
+Closes #1401
+Closes #1402
+Closes #1403
+Closes #1404
+Closes #1405
+Closes #1406
+Closes #1407
+Closes #1408
+Closes #1409
+Closes #1410
+Closes #1411
+Closes #1414
+Closes #1415
+Closes #1416
+Closes #1417
+Closes #1459
+Closes #1465
+
+Closed issues: [milestone 0.23.0](https://github.com/suneel944/agent-parley/issues?q=is%3Aissue%20is%3Aclosed%20milestone%3A0.23.0).
+
 ## [0.22.0](https://github.com/suneel944/agent-parley/compare/v0.21.0...v0.22.0) (2026-11-05)
 
 0.22.0 fixes the defects found by the audit of 0.21.0. It was planned as 0.21.1; its 18 issues measure a minor release, so it ships as 0.22.0.
