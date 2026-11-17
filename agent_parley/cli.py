@@ -1163,6 +1163,8 @@ def lane_detail(record: dict, data: dict) -> None:
         print("    " + forecast.marker(conflicts))
     if mail["named_resources"]:
         print("    Named resources held: " + ", ".join(mail["named_resources"]))
+    if mail.get("reserved_symbols"):
+        print("    Symbols reserved: " + ", ".join(mail["reserved_symbols"]))
     if topics := mail.get("unread_topics"):
         print(
             "    Unread by topic: "

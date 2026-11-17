@@ -1385,6 +1385,8 @@ def test_an_abandoned_stop_leaves_its_coordination_undelivered(
         {"offer": {"id": "offer-1", "text": "Take issue #9 next."}},
     )
     deciding = checkpoints.serve
+    deadline = server.DECISION_SECONDS
+    monkeypatch.setattr(server, "DECISION_SECONDS", 0.2)
     stalling(monkeypatch, server.DECISION_SECONDS + 0.5)
     stop = {**STOP, "cwd": str(lane), "session_id": "s1"}
     abandoned = run_hook(bridge, lane.parent, stop)
@@ -1395,6 +1397,7 @@ def test_an_abandoned_stop_leaves_its_coordination_undelivered(
     assert state["activity"] == "idle"
     assert state.get("cursor", 0) == 0
     assert "work_offer" not in state
+    monkeypatch.setattr(server, "DECISION_SECONDS", deadline)
     monkeypatch.setattr(server.checkpoints, "serve", deciding)
     served = run_hook(bridge, lane.parent, stop)
     reason = json.loads(served.stdout)["reason"]
