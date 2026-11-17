@@ -3654,6 +3654,26 @@ refuses when the current branch holds commits the bridge branch does not,
 printing the command that keeps them. It never resets, cleans, stashes, or
 force-switches, so no committed or uncommitted work is discarded.
 
+### Rewinding a lane to a checkpoint
+
+```sh
+agent-parley participant checkpoints claude-1
+agent-parley participant rewind claude-1 --to 3
+```
+
+While a lane holds a claim, each recovery capture that sees a new commit or
+branch appends a checkpoint to the lane's history, keeping the latest 50.
+`participant checkpoints` lists them with the decisions the lane recorded
+after each one. `participant rewind` creates a branch named
+`<branch>-rewind-<id>` at the checkpoint's commit and switches the lane to it;
+the manifest follows the new branch. The previous branch keeps its commits, so
+returning is one `git switch`. Decisions the lane recorded after the checkpoint
+are marked superseded in the decision log, and the lane receives one update
+saying so. The rewind refuses while the lane is in a turn, on any uncommitted
+change (listing the paths), and when the lane is off its bridge branch. It
+never resets, stashes or deletes a branch, and it leaves claims, reservations
+and holders as they were.
+
 ### Damaged state files
 
 ```sh

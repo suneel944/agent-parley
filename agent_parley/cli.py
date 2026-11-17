@@ -950,9 +950,85 @@ def decision_lines(page: dict) -> list[str]:
             f"Decision {row['id']}  {row['created_ts']}  "
             f"{row['sender']}  {subject}"
         )
+        if row.get("superseded_ts"):
+            lines.append(
+                f"  Superseded {row['superseded_ts']}: "
+                f"{row.get('superseded_reason') or 'no reason recorded'}"
+            )
         lines.append("  " + " ".join(str(row["body_md"]).split()))
     if page["has_more"]:
         lines.append("More decisions match; raise --limit or narrow the query.")
+    return lines
+
+
+def checkpoint_lines(listed: dict) -> list[str]:
+    """Formats a lane's recorded checkpoints as compact rows.
+
+    Args:
+        listed: Reading as ``Bridge.lane_checkpoints`` reports it.
+
+    Returns:
+        One row per checkpoint, newest first, each followed by the decisions
+        the lane recorded since, or one sentence saying none was recorded.
+    """
+    name = listed["participant"]
+    if not listed["checkpoints"]:
+        return [
+            f"{name} has no recorded checkpoint. A checkpoint is recorded "
+            "while the lane holds a claim."
+        ]
+    lines = [f"{name} is on {listed['branch']}."]
+    for entry in listed["checkpoints"]:
+        captured = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.gmtime(float(entry.get("captured_at") or 0)),
+        )
+        claimed = " ".join(f"#{number}" for number in entry.get("issues", []))
+        decisions = entry["decisions"]
+        lines.append(
+            f"Checkpoint {entry['id']}  {captured}  {entry['head'][:12]}  "
+            f"{entry.get('branch') or 'detached'}  {claimed or '-'}  "
+            f"{len(decisions)} decision(s) since"
+        )
+        for row in decisions:
+            state = " (superseded)" if row["superseded_ts"] else ""
+            lines.append(
+                f"  Decision {row['id']}  {row['created_ts']}  "
+                f"{row['subject']}{state}"
+            )
+    return lines
+
+
+def rewind_lines(rewound: dict) -> list[str]:
+    """Formats the account of one lane rewind.
+
+    Args:
+        rewound: Result as ``Bridge.rewind`` reports it.
+
+    Returns:
+        The new and kept branches, the superseded decisions and whether the
+        lane was told.
+    """
+    name = rewound["participant"]
+    entry = rewound["checkpoint"]
+    lines = [
+        f"{name} rewound to checkpoint {entry['id']} at "
+        f"{entry['head'][:12]} on new branch {rewound['branch']}.",
+        f"Previous branch {rewound['previous_branch']} kept at "
+        f"{rewound['previous_head'][:12]}; nothing was deleted.",
+    ]
+    superseded = rewound["superseded"]
+    lines.append(
+        "Superseded decisions: "
+        + ", ".join(str(row["id"]) for row in superseded)
+        + "."
+        if superseded
+        else "No decision was superseded."
+    )
+    if "update_error" in rewound:
+        lines.append(f"The lane was not told: {rewound['update_error']}")
+    else:
+        lines.append(f"{name} was sent one update naming the checkpoint.")
     return lines
 
 
@@ -2683,6 +2759,186 @@ class Bridge(
             git(lane, "switch", branch)
             return f"{name} restored to {branch} from {actual}."
 
+    def lane_checkpoints(self, repo: Path, name: str) -> dict:
+        """Lists the checkpoints a lane can be rewound to, newest first.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose checkpoints are listed.
+
+        Returns:
+            The lane's name and assigned branch, and each recorded
+            checkpoint with its commit, branch, capture time, the issues
+            the lane owned then and the decisions the lane recorded since.
+
+        Raises:
+            BridgeError: If the participant does not exist.
+        """
+        from agent_parley import recovery
+
+        directory, data, participant = self._lane(repo, name)
+        listed = [
+            {
+                **entry,
+                "decisions": store.lane_decisions(
+                    self.home,
+                    data["root"],
+                    participant["display"],
+                    float(entry.get("captured_at") or 0),
+                ),
+            }
+            for entry in reversed(recovery.history(directory, name))
+        ]
+        return {
+            "participant": name,
+            "branch": participant["branch"],
+            "checkpoints": listed,
+        }
+
+    def rewind(self, repo: Path, name: str, identifier: str) -> dict:
+        """Moves a lane onto a new branch at one of its recorded checkpoints.
+
+        Nothing is deleted or reset. The new branch starts at the
+        checkpoint's commit and becomes the lane's assigned branch; the
+        branch the lane was on keeps every commit and is named in the
+        update the lane receives. A worktree holding uncommitted or
+        untracked changes is refused with its paths and never stashed or
+        cleaned. A lane mid-turn is refused rather than stopped or waited
+        on: the rewind runs only when the lane's last native event says its
+        turn ended, or no session runs. The check is made under the lane's
+        checkpoint lock, which every native hook takes before it records a
+        new turn, so a turn cannot begin between the check and the switch.
+        Decisions the lane recorded after the checkpoint are marked
+        superseded and keep their text. Claims, reservations and the lane's
+        holder identity are left exactly as they were.
+
+        Args:
+            repo: Any checkout of the target repository.
+            name: Participant whose lane is rewound.
+            identifier: Checkpoint identifier `lane_checkpoints` lists.
+
+        Returns:
+            The checkpoint, the new and previous branches, the decisions
+            superseded and the update sent to the lane.
+
+        Raises:
+            BridgeError: If the participant or checkpoint is unknown, the
+                lane is mid-turn, off its assigned branch or dirty, or the
+                checkpoint's commit is no longer in the repository.
+        """
+        from agent_parley import recovery
+
+        directory, _, _ = self._lane(repo, name)
+        busy = f"{name} is recording a checkpoint; retry in a moment."
+        with (
+            lock(directory / "setup.lock"),
+            lock(directory / f"{name}-checkpoint.lock", busy, timeout=1),
+            lock(directory / f"{name}-capture.lock", busy, timeout=1),
+        ):
+            data = roster.read(directory)
+            participant = data["participants"].get(name)
+            if participant is None:
+                raise BridgeError(
+                    f"{name} was retired while this command ran; nothing "
+                    "changed."
+                )
+            entry = recovery.recorded(directory, name, identifier)
+            lane = Path(participant["lane"])
+            previous = participant["branch"]
+            published = activity(directory, name)
+            reading = supervision.lane_state(published)
+            if reading["state"] != supervision.STOPPED and not (
+                reading["state"] == supervision.IDLE
+                and published.get("activity") == "idle"
+            ):
+                raise BridgeError(
+                    f"{name} is not between turns ({reading['evidence']}); "
+                    "rewind never stops a running turn. Retry once the lane "
+                    "is idle; nothing changed."
+                )
+            if not lane.exists():
+                raise BridgeError(f"{name} has no worktree at {lane}.")
+            if lane_branch(lane) != previous:
+                raise BridgeError(
+                    f"{name} is not on its assigned branch {previous}; run "
+                    f"agent-parley participant restore {name} first.",
+                    next_command=f"agent-parley participant restore {name}",
+                )
+            changed = supervision.dirty_paths(str(lane))
+            if changed is None:
+                raise BridgeError(
+                    f"Git could not read {name}'s worktree; nothing changed."
+                )
+            if changed:
+                raise BridgeError(
+                    f"{name} has uncommitted changes: "
+                    f"{', '.join(shown_paths(changed))}. Commit or preserve "
+                    "them first; rewind never stashes or discards work.",
+                    next_command=worktrees.commit_all(lane),
+                )
+            head = str(entry["head"])
+            try:
+                git(lane, "cat-file", "-e", f"{head}^{{commit}}")
+            except BridgeError:
+                raise BridgeError(
+                    f"Checkpoint {identifier} names commit {head[:12]}, "
+                    "which the repository no longer holds; nothing changed."
+                ) from None
+            previous_head = git(lane, "rev-parse", "HEAD")
+            target = f"{previous}-rewind-{identifier}"
+            suffix = 1
+            while has_branch(lane, target):
+                suffix += 1
+                target = f"{previous}-rewind-{identifier}-{suffix}"
+            git(lane, "switch", "-c", target, head)
+            participant["branch"] = target
+            write_json(directory / "project.json", data)
+        captured = float(entry.get("captured_at") or 0)
+        superseded = store.supersede_decisions(
+            self.home,
+            data["root"],
+            participant["display"],
+            captured,
+            f"{name} was rewound to checkpoint {identifier}",
+        )
+        when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(captured))
+        dropped = (
+            "Decisions you recorded after it are superseded and stay in the "
+            "log for reference: "
+            + "; ".join(
+                f"decision {row['id']} {row['subject']!r}" for row in superseded
+            )
+            + "."
+            if superseded
+            else "No decision you recorded after it was superseded."
+        )
+        text = (
+            f"The operator rewound your lane to checkpoint {identifier}, "
+            f"commit {head[:12]} captured {when}. Your worktree is now on "
+            f"the new branch {target}. The previous branch {previous} is "
+            f"kept untouched at {previous_head[:12]}; nothing was deleted. "
+            f"{dropped} Your claims and reservations are unchanged. "
+            "Continue from this commit."
+        )
+        result = {
+            "participant": name,
+            "checkpoint": entry,
+            "branch": target,
+            "previous_branch": previous,
+            "previous_head": previous_head,
+            "superseded": superseded,
+        }
+        try:
+            result["update"] = self.say(
+                repo,
+                name,
+                text,
+                f"Rewound to checkpoint {identifier}",
+            )
+        except BridgeError as exc:
+            result["update_error"] = str(exc)
+        return result
+
     def retire(self, repo: Path, name: str, discard: Sequence[str] = ()) -> str:
         """Removes a participant's lane while preserving any work it holds.
 
@@ -2802,6 +3058,7 @@ class Bridge(
                 for suffix in (
                     "identity.json",
                     "activity.json",
+                    "checkpoints.json",
                     "mcp.json",
                     "events.jsonl",
                     "events.1.jsonl",
@@ -6094,6 +6351,38 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
     reporting_lane.add_argument("--json", action="store_true", help=JSON_HELP)
+    listing_checkpoints = roles.add_parser(
+        "checkpoints",
+        help=(
+            "List a lane's recorded checkpoints with their commit, time and "
+            "the decisions recorded since."
+        ),
+    )
+    listing_checkpoints.add_argument("name", help="Lane to list.")
+    listing_checkpoints.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    listing_checkpoints.add_argument(
+        "--json", action="store_true", help=JSON_HELP
+    )
+    rewinding = roles.add_parser(
+        "rewind",
+        help=(
+            "Move an idle, clean lane onto a new branch at a recorded "
+            "checkpoint; keep the old branch."
+        ),
+    )
+    rewinding.add_argument("name", help="Lane to rewind.")
+    rewinding.add_argument(
+        "--to",
+        required=True,
+        metavar="ID",
+        help="Checkpoint identifier `participant checkpoints` lists.",
+    )
+    rewinding.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    rewinding.add_argument("--json", action="store_true", help=JSON_HELP)
     joining = roles.add_parser(
         "add", help="Create a lane with an optional provider and credentials."
     )
@@ -8197,6 +8486,22 @@ def main() -> int:
                     lanes.lane_task_plan(directory, args.name)
                 ):
                     print(line)
+        elif args.command == "participant" and args.action == "checkpoints":
+            recorded_points = bridge.lane_checkpoints(
+                args.repo.resolve(), args.name
+            )
+            print(
+                views.render("participant_checkpoints", recorded_points)
+                if args.json
+                else "\n".join(checkpoint_lines(recorded_points))
+            )
+        elif args.command == "participant" and args.action == "rewind":
+            rewound = bridge.rewind(args.repo.resolve(), args.name, args.to)
+            print(
+                views.render("participant_rewind", rewound)
+                if args.json
+                else "\n".join(rewind_lines(rewound))
+            )
         elif args.command == "decide":
             recorded = bridge.decide(
                 args.repo.resolve(),

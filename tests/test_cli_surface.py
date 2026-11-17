@@ -14,6 +14,8 @@ NEW_COMMANDS = (
     ("version",),
     ("issue", "show", "--help"),
     ("participant", "show", "--help"),
+    ("participant", "checkpoints", "--help"),
+    ("participant", "rewind", "--help"),
     ("mail", "list", "--help"),
     ("mail", "send", "--help"),
     ("provider", "show", "--help"),
