@@ -3898,6 +3898,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "approval",
             "verify",
             "unattended",
+            "policy",
             "timeout",
             "init",
             "pool",
@@ -6676,6 +6677,31 @@ def declare(parser: argparse.ArgumentParser, commands: CommandIndex) -> None:
     standing_run.add_argument(
         "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
     )
+    gating = commands.add_parser(
+        "policy",
+        help="Import or check the project policy rules that gate steps.",
+    )
+    gatings = gating.add_subparsers(dest="action", required=True)
+    gating_check = gatings.add_parser(
+        "check",
+        help=(
+            "Judge every rule against every held claim; claims nothing "
+            "and changes nothing."
+        ),
+    )
+    gating_check.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
+    gating_import = gatings.add_parser(
+        "import",
+        help="Validate a TOML policy file and record it for the project.",
+    )
+    gating_import.add_argument(
+        "path", type=Path, help="Policy file the operator chose."
+    )
+    gating_import.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help=REPO_HELP
+    )
     waiting_kind = commands.add_parser(
         "timeout",
         help=(
@@ -8899,6 +8925,14 @@ def main() -> int:
                 )
             else:
                 print(unattended.describe(bridge, repository))
+        elif args.command == "policy":
+            from agent_parley import rules
+
+            repository = args.repo.resolve()
+            if args.action == "import":
+                print(rules.install(bridge, repository, args.path.resolve()))
+            else:
+                print(rules.check(bridge, repository))
         elif args.command == "pool":
             from agent_parley import pool
 

@@ -1324,6 +1324,10 @@ class ClaimsMixin(ReportsMixin):
         report evidence stands, and a claim with none records the forge
         outcome as the evidence of every criterion (`lifecycle.resolve`).
 
+        Completing the claim, but not releasing it, is refused while a
+        project policy rule that applies to ``resolve`` fails on the holder's
+        lane (`rules.gate`). A project without a policy is unaffected.
+
         Args:
             repo: Any checkout of the target repository.
             number: Repository issue number being resolved.
@@ -1448,6 +1452,18 @@ class ClaimsMixin(ReportsMixin):
                 )
         if repositories:
             evidence = {**evidence, "repositories": repositories}
+        if not release:
+            from agent_parley import rules
+
+            rules.gate(
+                directory,
+                Path(data["root"]),
+                Path(str(participant.get("lane", ""))),
+                event=rules.RESOLVE,
+                builder=holder,
+                issue=issue,
+                claim=str(record.get("claim_id") or ""),
+            )
         resolved = lifecycle.resolve(
             directory,
             issue,
